@@ -29,6 +29,7 @@ struct Commands {
     working: bool,
     finished: usize,
     malformed_config: bool,
+    initialization: Option<Value>,
     inference_error: bool,
     conversation: Vec<Value>,
     snapshots: Vec<Vec<Value>>,
@@ -118,7 +119,10 @@ impl Fixture {
                         state.malformed_config = false;
                         MclValue::Unit
                     } else {
-                        MclValue::Config(toml::from_str("sandbox='read_only'\n[compaction]\nthreshold=0.8\nkeep_messages=2\n").unwrap())
+                        let mut config:toml::Table=toml::from_str("sandbox='read_only'\n[compaction]\nthreshold=0.8\nkeep_messages=2\n").unwrap();
+                        let initialization=state.initialization.clone().unwrap_or_else(||toml::from_str::<Value>(include_str!("../../../../resources/agent-drivers/local/coder/latest/setting.toml")).unwrap()["initialization"].clone());
+                        config.insert("initialization".into(),toml::Value::try_from(initialization).unwrap());
+                        MclValue::Config(config)
                     }
                 } else if text=="EFFECT model_set ?"{MclValue::Config(toml::from_str("context_window_tokens=4096").unwrap())
                 } else if text == "GET session.conversation" {
@@ -471,6 +475,12 @@ end
                         !state
                             .calls
                             .iter()
+                            .any(|c| c == "INJECT soul TO msg.instructions")
+                    );
+                    assert!(
+                        !state
+                            .calls
+                            .iter()
                             .any(|call| call == "INJECT ? TO session.conversation")
                     );
                 }
@@ -516,7 +526,23 @@ end
                         .iter()
                         .position(|c| c == "INJECT ? TO session.conversation")
                         .unwrap();
-                    assert!(snap < replace);
+                    let refresh_compact = state
+                        .calls
+                        .iter()
+                        .position(|c| c == "INJECT compact TO msg.compact_prompt")
+                        .unwrap();
+                    let inference = state
+                        .calls
+                        .iter()
+                        .position(|c| c.starts_with("EFFECT inference "))
+                        .unwrap();
+                    let refresh_soul = state
+                        .calls
+                        .iter()
+                        .position(|c| c == "INJECT soul TO msg.instructions")
+                        .unwrap();
+                    assert!(refresh_compact < inference);
+                    assert!(snap < replace && replace < refresh_soul);
                 }
             }
             fixture.close(Some(instance)).await;
@@ -566,6 +592,23 @@ end
                 !state
                     .calls
                     .iter()
+                    .any(|c| c == "INJECT soul TO msg.instructions")
+            );
+            let refresh = state
+                .calls
+                .iter()
+                .position(|c| c == "INJECT compact TO msg.compact_prompt")
+                .unwrap();
+            let inference = state
+                .calls
+                .iter()
+                .position(|c| c.starts_with("EFFECT inference "))
+                .unwrap();
+            assert!(refresh < inference);
+            assert!(
+                !state
+                    .calls
+                    .iter()
                     .any(|call| call == "INJECT ? TO session.conversation")
             );
         }
@@ -604,6 +647,62 @@ end
             );
         }
         fixture.close(Some(instance)).await;
+    }
+}
+
+#[tokio::test]
+async fn configured_initialization_runs_defaults_before_custom_and_stops_on_custom_error() {
+    for source in [CODER, REVIEWER] {
+        for fail_custom in [false, true] {
+            let mut fixture = Fixture::new();
+            {
+                let mut state = fixture.commands.lock().unwrap();
+                state.initialization = Some(
+                    json!({"default":["CREATE TEMP BLOCK defaults (messages)","INJECT [] TO defaults.messages"],"custom":["CREATE TEMP BLOCK custom (messages)","INJECT [] TO custom.messages"]}),
+                );
+                if fail_custom {
+                    state.fail = Some("CREATE TEMP BLOCK custom (messages)".into());
+                }
+            }
+            let started = fixture.start(source).await;
+            if fail_custom {
+                assert!(
+                    started
+                        .as_ref()
+                        .unwrap_err()
+                        .to_string()
+                        .contains("injected CREATE TEMP BLOCK custom")
+                );
+            } else {
+                assert!(started.is_ok());
+            }
+            {
+                let state = fixture.commands.lock().unwrap();
+                let find = |text: &str| state.calls.iter().position(|command| command == text);
+                assert!(
+                    find("CREATE TEMP BLOCK defaults (messages)").unwrap()
+                        < find("INJECT [] TO defaults.messages").unwrap()
+                );
+                assert!(
+                    find("INJECT [] TO defaults.messages").unwrap()
+                        < find("CREATE TEMP BLOCK custom (messages)").unwrap()
+                );
+                if fail_custom {
+                    assert!(find("INJECT [] TO custom.messages").is_none());
+                    assert!(find("EFFECT ready").is_none());
+                } else {
+                    assert!(
+                        find("CREATE TEMP BLOCK custom (messages)").unwrap()
+                            < find("INJECT [] TO custom.messages").unwrap()
+                    );
+                    assert!(
+                        find("INJECT [] TO custom.messages").unwrap()
+                            < find("EFFECT ready").unwrap()
+                    );
+                }
+            }
+            fixture.close(started.ok()).await;
+        }
     }
 }
 

@@ -1811,19 +1811,26 @@ async fn bundled_drivers_record_inference_error_messages_and_keep_running_while_
                 .app
                 .world_mut()
                 .insert_component(workspace, executor);
-            // Use the bundled Driver unchanged; fake only resource imports and inference.
-            for line in source
-                .lines()
-                .map(str::trim_start)
-                .filter(|line| line.contains("\"IMPORT "))
+            // Run the bundled initialization list; fake only resource imports and inference.
+            let initial: Value = toml::from_str(include_str!(
+                "../../../../resources/agent-drivers/local/coder/latest/setting.toml"
+            ))
+            .unwrap();
+            fixture
+                .command(
+                    "CONFIG SET ? ?",
+                    vec![json!("initialization"), initial["initialization"].clone()],
+                )
+                .await
+                .unwrap();
+            for instruction in initial["initialization"]["default"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(Value::as_str)
+                .filter(|line| line.starts_with("IMPORT "))
             {
-                let address = line
-                    .split("\"IMPORT ")
-                    .nth(1)
-                    .unwrap()
-                    .split_whitespace()
-                    .nth(1)
-                    .unwrap();
+                let address = instruction.split_whitespace().nth(2).unwrap();
                 let (kind, rest) = address.split_once(':').unwrap();
                 let (name, version) = rest.rsplit_once(':').unwrap();
                 let root = match kind {

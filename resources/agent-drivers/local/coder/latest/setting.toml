@@ -7,3 +7,32 @@ keep_messages = 16
 [inference]
 model = "deepseek-v4.1-flash"
 temperature = 0.2
+
+[initialization]
+# Run defaults first, then user-defined commands.
+default = [
+    "IMPORT TOOL tool:local/skill-register:latest AS skill_register",
+    "IMPORT TOOL tool:local/mcp-register:latest AS mcp_register",
+    "IMPORT MESSAGE prompt:local/coder-soul:latest AS soul",
+    "IMPORT MESSAGE prompt:local/compact:latest AS compact",
+    "IMPORT TOOL tool:local/list-directory:latest AS list_dir",
+    "IMPORT TOOL tool:local/read-file:latest AS read_file",
+    "IMPORT TOOL tool:local/read-image:latest AS read_image",
+    "IMPORT TOOL tool:local/write-file:latest AS write_file",
+    "IMPORT TOOL tool:local/edit:latest AS edit",
+    "IMPORT TOOL tool:local/grep:latest AS grep",
+    "IMPORT TOOL tool:local/glob:latest AS glob",
+    "IMPORT TOOL tool:local/bash:latest AS bash",
+    "IMPORT TOOL tool:local/bash-exec:latest AS bash_exec",
+    "IMPORT TOOL tool:local/task-finish:latest AS task_finish",
+    "IMPORT TOOL tool:local/task-send:latest AS task_send",
+    "IMPORT TOOL tool:local/task-read:latest AS task_read",
+    "IMPORT SANDBOX sandbox:local/workspace-write:latest AS workspace_write",
+    "IMPORT SANDBOX sandbox:local/read-only:latest AS read_only",
+    "CREATE TEMP BLOCK msg (instructions, compact_prompt, compact_context)",
+    "CREATE TEMP BLOCK entry (pending)",
+    "CREATE BLOCK session (conversation)",
+    "INJECT soul TO msg.instructions",
+    "INJECT compact TO msg.compact_prompt",
+]
+custom = []

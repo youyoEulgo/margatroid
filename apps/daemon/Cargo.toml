@@ -16,6 +16,7 @@ tool_plugin = { path = "../../crates/margatroid/tool/plugin" }
 tokio = { workspace = true }
 
 [dev-dependencies]
+toml = { workspace = true }
 futures-util = { workspace = true }
 tokio-tungstenite = { workspace = true }
 agent_driver_core = { path = "../../crates/margatroid/agent_driver/core" }

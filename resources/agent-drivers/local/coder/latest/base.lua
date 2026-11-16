@@ -70,6 +70,7 @@ function execute(arguments, context)
             earlier[#earlier + 1] = conversation[index]
         end
         command("INJECT ? TO msg.compact_context", {earlier})
+        command("INJECT compact TO msg.compact_prompt")
         local response = command("EFFECT inference (msg.instructions, msg.compact_context, msg.compact_prompt)").Inference
         local message = response.message
         if message.type == "assistant" then message.type = "compact" end
@@ -94,34 +95,19 @@ function execute(arguments, context)
         end
         command("EFFECT block_snapshot ?", {"session"})
         command("INJECT ? TO session.conversation", {replacement})
+        command("INJECT soul TO msg.instructions")
     end
 
     local function initialize()
         local config = settings()
         active_model = command("EFFECT model_set ?", {config.inference}).Config
-        command("IMPORT TOOL tool:local/skill-register:latest AS skill_register")
-        command("IMPORT TOOL tool:local/mcp-register:latest AS mcp_register")
-        command("IMPORT MESSAGE prompt:local/coder-soul:latest AS soul")
-        command("IMPORT MESSAGE prompt:local/compact:latest AS compact")
-        command("IMPORT TOOL tool:local/list-directory:latest AS list_dir")
-        command("IMPORT TOOL tool:local/read-file:latest AS read_file")
-        command("IMPORT TOOL tool:local/read-image:latest AS read_image")
-        command("IMPORT TOOL tool:local/write-file:latest AS write_file")
-        command("IMPORT TOOL tool:local/edit:latest AS edit")
-        command("IMPORT TOOL tool:local/grep:latest AS grep")
-        command("IMPORT TOOL tool:local/glob:latest AS glob")
-        command("IMPORT TOOL tool:local/bash:latest AS bash")
-        command("IMPORT TOOL tool:local/bash-exec:latest AS bash_exec")
-        command("IMPORT TOOL tool:local/task-finish:latest AS task_finish")
-        command("IMPORT TOOL tool:local/task-send:latest AS task_send")
-        command("IMPORT TOOL tool:local/task-read:latest AS task_read")
-        command("IMPORT SANDBOX sandbox:local/workspace-write:latest AS workspace_write")
-        command("IMPORT SANDBOX sandbox:local/read-only:latest AS read_only")
-        command("CREATE TEMP BLOCK msg (instructions, compact_prompt, compact_context)")
-        command("CREATE TEMP BLOCK entry (pending)")
-        command("CREATE BLOCK session (conversation)")
-        command("INJECT soul TO msg.instructions")
-        command("INJECT compact TO msg.compact_prompt")
+        local initialization = config.initialization
+        if not initialization then
+            local initial = margatroid.data:decode("toml", margatroid.files:read(context.resource_dir .. "/setting.toml"))
+            initialization = initial.initialization
+        end
+        for _, instruction in ipairs(initialization.default) do command(instruction) end
+        for _, instruction in ipairs(initialization.custom or {}) do command(instruction) end
         command("EFFECT sandbox_use ?", {config.sandbox})
         command("CONFIG SET ? ?", {"driver_task", {agent = context.task_address, task_id = context.task_id}})
         command("EFFECT ready")

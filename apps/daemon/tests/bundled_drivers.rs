@@ -12,11 +12,22 @@ fn all_bundled_drivers_and_declared_resource_files_are_readable_with_the_new_con
             .load(&driver.program)
             .into_function()
             .unwrap();
-        for locator in driver.program.lines().filter_map(|line| {
-            line.split("\"IMPORT ")
-                .nth(1)
-                .and_then(|rest| rest.split_whitespace().nth(1))
-        }) {
+        let settings: serde_json::Value = toml::from_str(
+            &std::fs::read_to_string(manifest.with_file_name("setting.toml")).unwrap(),
+        )
+        .unwrap();
+        assert!(settings["initialization"]["custom"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+        for locator in settings["initialization"]["default"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .filter(|line| line.starts_with("IMPORT "))
+            .filter_map(|line| line.split_whitespace().nth(2))
+        {
             let parsed = address::ParsedAddress::parse(locator).unwrap();
             match parsed.kind.as_str() {
                 "tool" => {
@@ -103,7 +114,7 @@ mod mailbox_compaction {
             .join("../../resources")
             .canonicalize()
             .unwrap();
-        for name in ["coder", "reviewer"] {
+        for (name, legacy_config) in [("coder", false), ("reviewer", false), ("coder", true)] {
             let home = tempfile::tempdir().unwrap();
             let data = home.path().join(".margatroid");
             std::fs::create_dir(&data).unwrap();
@@ -169,7 +180,15 @@ mod mailbox_compaction {
                 driver.join("base.lua"),
             )
             .unwrap();
-            std::fs::write(driver.join("setting.toml"),"sandbox=[]\n[inference]\nmodel='offline'\n[compaction]\nthreshold=0.8\nkeep_messages=2\n").unwrap();
+            std::fs::write(driver.join("setting.toml"),format!("sandbox=[]\n[inference]\nmodel='offline'\n[compaction]\nthreshold=0.8\nkeep_messages=2\n[initialization]{}",std::fs::read_to_string(resources.join(format!("agent-drivers/local/{name}/latest/setting.toml"))).unwrap().split_once("[initialization]").unwrap().1)).unwrap();
+            let settings_file = driver.join("setting.toml");
+            let text=std::fs::read_to_string(&settings_file).unwrap().replace("custom = []","custom = ['CREATE TEMP BLOCK user_setup (messages)', 'INJECT soul TO user_setup.messages']");
+            std::fs::write(settings_file, text).unwrap();
+            if legacy_config {
+                let file = data.join(format!("workspaces/probe/agents/{name}/setting.toml"));
+                std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+                std::fs::write(file,"legacy_marker=true\nsandbox=[]\n[inference]\nmodel='offline'\n[compaction]\nthreshold=0.8\nkeep_messages=2\n").unwrap();
+            }
             let port = std::net::TcpListener::bind("127.0.0.1:0")
                 .unwrap()
                 .local_addr()
@@ -230,6 +249,19 @@ mod mailbox_compaction {
                 &mut seen,
             )
             .await;
+            if legacy_config {
+                assert_eq!(config["data"]["value"]["legacy_marker"], true);
+                assert!(config["data"]["value"]["initialization"].is_null());
+            }
+            let custom = request(
+                &mut socket,
+                "mcl.execute",
+                "custom-initialized",
+                json!({"address":address,"command":"GET user_setup.messages","arguments":[]}),
+                &mut seen,
+            )
+            .await;
+            assert!(!custom["data"]["value"].as_array().unwrap().is_empty());
             let target = config["data"]["value"]["driver_task"].clone();
             assert!(target["agent"].as_str().unwrap().starts_with("execution:"));
             assert!(!target["task_id"].as_str().unwrap().is_empty());

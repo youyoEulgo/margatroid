@@ -1430,6 +1430,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-tungstenite",
+ "toml",
  "tool_plugin",
  "tool_resource_core",
  "tracing",
