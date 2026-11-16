@@ -206,6 +206,7 @@ pub enum InferenceMessage {
         #[serde(default, rename = "data")]
         images: Vec<InferenceImage>,
     },
+    #[serde(alias = "compact")]
     Assistant {
         reasoning: Option<String>,
         content: Option<String>,

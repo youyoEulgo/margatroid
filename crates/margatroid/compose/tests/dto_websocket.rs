@@ -2694,3 +2694,49 @@ fn workspace_files_use_complete_addresses_when_display_names_are_equal() {
         405
     );
 }
+
+#[test]
+fn generated_error_history_is_queryable_without_a_second_full_and_independent_errors_still_sync() {
+    let mut h = Harness::new();
+    let mut socket = h.connect();
+    h.register(&mut socket, "webui", "error-once");
+    let storage = h
+        .app
+        .world()
+        .get_component::<AgentStorage>(h.agent)
+        .unwrap()
+        .clone();
+    let messages = json!([{"type":"error","message":"provider refused","request_id":"inference-failed"},{"type":"error","message":"independent error"},{"type":"compact","request_id":"summary-success","content":"summary","tool_calls":[]}]);
+    let saved =
+        storage_core::append_message_history(&storage, messages.as_array().unwrap(), None).unwrap();
+    let mut frames = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !frames
+        .iter()
+        .any(|v: &Value| v["message"]["type"] == "compact")
+    {
+        frames.extend(h.collect(&mut socket, 1));
+        assert!(Instant::now() < deadline);
+    }
+    frames.extend(h.collect(&mut socket, 10));
+    assert!(
+        !frames.iter().any(|v| v["type"] == "agent.message.full.sync"
+            && v["message"]["request_id"] == "inference-failed")
+    );
+    assert!(
+        frames
+            .iter()
+            .any(|v| v["message"]["message"] == "independent error")
+    );
+    assert!(frames.iter().any(|v| v["message"]["type"] == "compact"));
+    h.request(&mut socket, "agent.history.req", "history", h.target());
+    let history = h.next(&mut socket, |v| v["id"] == "history");
+    assert!(
+        history["records"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["payload"]["request_id"] == "inference-failed"
+                && row["sequence"] == saved[0]["sequence"])
+    );
+}

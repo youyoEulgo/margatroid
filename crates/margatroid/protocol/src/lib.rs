@@ -195,7 +195,13 @@ fn validate_value(
                 && values.get("type").and_then(Value::as_str).is_some_and(|t| {
                     matches!(
                         t,
-                        "system" | "user" | "assistant" | "tool_call" | "inject" | "error"
+                        "system"
+                            | "user"
+                            | "assistant"
+                            | "compact"
+                            | "tool_call"
+                            | "inject"
+                            | "error"
                     )
                 })
             {
@@ -593,7 +599,7 @@ fn validate_internal_message_fields(value: &Value) -> Result<(), ProtocolError> 
             if fields.get("type").and_then(Value::as_str).is_some_and(|t| {
                 matches!(
                     t,
-                    "system" | "user" | "assistant" | "tool_call" | "inject" | "error"
+                    "system" | "user" | "assistant" | "compact" | "tool_call" | "inject" | "error"
                 )
             }) {
                 if fields.contains_key("replay")

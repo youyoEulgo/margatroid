@@ -25,7 +25,7 @@ HTTP/SSE worker 只输出到容量 32 的 ProviderFragment 通道，不向前端
 
 接收循环使用 biased select 优先取消，每轮只取一个分片，进入 StreamGate 短锁后复检关闭状态。只有接受的片段才能更新正文并获得 sequence。stop_stream 同步关闭门，InferenceHandle.cancel 先冻结再发取消；receiver 随即关闭并丢弃未接受 backlog。中止回复使用completed，只保留已接受正文和思考，清除工具调用、usage，不填充取消文案。
 
-推流使用agent.message.chunk.sync，通道每取出一个片段先提交唯一累积器，再发送其完整content/reasoning及快照sequence。终态仅使用一次agent.message.full.sync，generation为推理关联、history_sequence=null，Inference不写历史也不伪造sequence。保存该assistant后记录监控不重发full，持久序号由history查询取得。已交付错误后的清理超预算只记结构化诊断并继续真实监督，不再次发终态或回复oneshot。发送在接受门锁外按当次共享Clients筛选webui，慢连接取消且不阻塞推理，后连接可以接收后续累计快照。
+推流使用agent.message.chunk.sync，通道每取出一个片段先提交唯一累积器，再发送其完整content/reasoning及快照sequence。终态仅使用一次agent.message.full.sync，generation为推理关联、history_sequence=null，Inference不写历史也不伪造sequence。保存带request_id的assistant/error后记录监控不重发full，持久序号由history查询取得。已交付错误后的清理超预算只记结构化诊断并继续真实监督，不再次发终态或回复oneshot。发送在接受门锁外按当次共享Clients筛选webui，慢连接取消且不阻塞推理，后连接可以接收后续累计快照。
 
 监督任务请求 HTTP worker 退出并等待真实 join 后才完成原 oneshot，不以冻结代替清理。清理超过预算仍等待真实结束并报告 CleanupFailed；Timeout、ReplyClosed、协议错误等保留各自分类。HTTP worker 退出后不能用独立正文补写结果。不改网络中止事件路径，不写历史，不执行工具或自动重试。
 

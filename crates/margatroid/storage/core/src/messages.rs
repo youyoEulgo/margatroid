@@ -52,7 +52,7 @@ pub(crate) fn split(message: &Value) -> Result<MessageRow, StorageError> {
                 .and_then(|v| v.as_str().map(str::to_owned))
                 .ok_or_else(|| err(K::InvalidRecord, "message content must be text"))?,
         ),
-        "assistant" => {
+        "assistant" | "compact" => {
             let mut text = Map::new();
             for key in ["reasoning", "content"] {
                 if let Some(value) = object.remove(key) {
@@ -112,7 +112,7 @@ pub(crate) fn join(row: MessageRow, with_sequence: bool) -> Result<Value, Storag
     let mut reserved = vec!["type", "sequence", "tool_calls", "data", "replay", "images"];
     match row.role.as_str() {
         "system" | "user" | "tool_call" => reserved.push("content"),
-        "assistant" => reserved.extend(["content", "reasoning"]),
+        "assistant" | "compact" => reserved.extend(["content", "reasoning"]),
         "inject" => reserved.push("messages"),
         "error" => reserved.push("message"),
         _ => return Err(schema_err("invalid message role")),
@@ -127,7 +127,7 @@ pub(crate) fn join(row: MessageRow, with_sequence: bool) -> Result<Value, Storag
         "system" | "user" | "tool_call" => {
             object.insert("content".into(), Value::String(content));
         }
-        "assistant" => {
+        "assistant" | "compact" => {
             let text: Map<String, Value> = serde_json::from_str(&content).map_err(schema_err)?;
             if text.keys().any(|k| k != "reasoning" && k != "content") {
                 return Err(schema_err("invalid assistant content"));

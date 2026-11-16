@@ -489,3 +489,13 @@ fn returned_turn_and_free_generation_chunk_preserve_explicit_optional_associatio
     let invalid = json!({"type":"mcl.execute.result","id":"turn-request","success":true,"data":{"kind":"turn","value":""}});
     assert!(serde_json::from_value::<ServerMessage>(invalid).is_err());
 }
+
+#[test]
+fn compact_message_roundtrips_with_assistant_fields_and_keeps_compact_type() {
+    let raw = json!({"type":"agent.message.full.sync","address":"agent:demo/coder:latest","turn":null,"generation":null,"history_sequence":7,"message":{"type":"compact","sequence":7,"request_id":"summary-request","content":"summary","reasoning":"reason","tool_calls":[],"stop_reason":"completed"},"error":null});
+    let message: ServerMessage = serde_json::from_value(raw).unwrap();
+    let wire: Value = serde_json::from_str(&encode_server_message(&message).unwrap()).unwrap();
+    assert_eq!(wire["message"]["type"], "compact");
+    assert_eq!(wire["message"]["sequence"], 7);
+    assert_eq!(wire["message"]["content"], "summary");
+}

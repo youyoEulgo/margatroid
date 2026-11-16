@@ -783,6 +783,10 @@ async fn execute_lua(
     if let Some(values) = execution_context.as_object_mut() {
         values.insert("project_root".into(), serde_json::json!(root));
         values.insert(
+            "task_address".into(),
+            serde_json::json!(context.source_address),
+        );
+        values.insert(
             "task_id".into(),
             serde_json::json!(context.instance.start_id),
         );

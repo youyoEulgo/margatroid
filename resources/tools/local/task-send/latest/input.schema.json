@@ -2,9 +2,31 @@
   "type": "object",
   "properties": {
     "task_id": {
-      "type": "string",
-      "minLength": 1,
-      "description": "Nonempty id of the target tool task."
+      "oneOf": [
+        {
+          "type": "string",
+          "minLength": 1
+        },
+        {
+          "type": "object",
+          "properties": {
+            "agent": {
+              "type": "string",
+              "minLength": 1
+            },
+            "task_id": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "required": [
+            "agent",
+            "task_id"
+          ],
+          "additionalProperties": false
+        }
+      ],
+      "description": "Task id in the current Agent, or an explicit same-Workspace Agent/execution address and task id."
     },
     "value": {
       "description": "Any JSON value, including null. The target task Lua decides how to interpret it."

@@ -717,6 +717,28 @@ test('an older live assistant stays above a later persisted user message', () =>
     e.cleanup();
   }
 });
+test('a persisted compact summary is decoded as a compact history row', () => {
+  const e = setup();
+  try {
+    e.receive({
+      ...full(31, null, 'Conversation summary'),
+      message: {
+        type: 'compact',
+        sequence: 31,
+        request_id: 'compact-request',
+        content: 'Conversation summary',
+        reasoning: null,
+        tool_calls: [],
+        stop_reason: 'completed',
+      },
+    });
+    assert.equal(e.store.visibleMessages.length, 1);
+    assert.equal(e.store.visibleMessages[0]?.role, 'compact');
+    assert.equal(e.store.visibleMessages[0]?.content, 'Conversation summary');
+  } finally {
+    e.cleanup();
+  }
+});
 test('history uses oldest persistent sequence as an exclusive cursor despite live arrivals', () => {
   const e = setup();
   try {

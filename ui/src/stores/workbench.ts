@@ -40,7 +40,7 @@ const COMMAND_RESULT: Partial<Record<ClientMessage['type'], ServerMessage['type'
   'agent.turn.abort': 'agent.turn.abort.result',
   'mcl.execute': 'mcl.execute.result',
 };
-export type MessageRole = 'system' | 'user' | 'assistant' | 'tool' | 'error' | 'record';
+export type MessageRole = 'system' | 'user' | 'assistant' | 'compact' | 'tool' | 'error' | 'record';
 export interface ToolResult {
   content: string;
   failed: boolean;
@@ -228,9 +228,10 @@ function decodeMessage(
         },
       ];
     case 'assistant':
+    case 'compact':
       return [
         {
-          role: 'assistant',
+          role: message.type,
           thinking: message.reasoning ?? '',
           content: message.content ?? '',
           toolCalls: message.tool_calls ?? [],
@@ -1041,6 +1042,32 @@ export const useWorkbenchStore = defineStore('workbench', () => {
       if (resourceWritePending.value === snapshot) resourceWritePending.value = '';
     }
   }
+  async function compactContext(): Promise<void> {
+    const target = currentTarget(false);
+    if (!target) throw new Error('Select a running agent explicitly');
+    const snapshot = resourceTargetSnapshot(target);
+    const config = await executeFor(target, 'CONFIG GET');
+    assertTarget(target, snapshot);
+    const settings = isRecord(config) && isRecord(config.Config) ? config.Config : null;
+    const driverTask = settings?.driver_task;
+    if (driverTask === undefined || driverTask === null)
+      throw new Error('The Driver task target is unavailable');
+    const calls = [
+      {
+        id: `compact-${randomId()}`,
+        tool_name: 'task_send',
+        arguments: JSON.stringify({ task_id: driverTask, value: { type: 'compact' } }),
+      },
+    ];
+    const result = await executeFor(target, 'EFFECT tool_call ?', [calls]);
+    const messages =
+      isRecord(result) && isRecord(result.Array) && Array.isArray(result.Array.Message)
+        ? result.Array.Message
+        : [];
+    if (messages.some((message) => isRecord(message) && message.failed === true))
+      throw new Error('Compaction task delivery failed');
+    assertTarget(target, snapshot);
+  }
   async function sendMessage(
     content: string,
     images: UserImage[] = [],
@@ -1733,6 +1760,7 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     selectedMclEntries,
     agentLogHistoryLoaded,
     loadLogHistory,
+    compactContext,
     selectedSessionLogs,
     selectedHistory,
     selectedHistoryEntries,

@@ -1599,12 +1599,17 @@ async fn inference_error_is_a_value_and_finish_turn_waits_for_cleanup() {
             .unwrap()
             .send(Err(InferenceError::new(kind, "safe failure")))
             .unwrap();
-        let MclValue::Error(message) = drive(&mut fixture.app, &mut reply).await.unwrap() else {
+        let MclValue::Inference {
+            message,
+            stop_reason,
+        } = drive(&mut fixture.app, &mut reply).await.unwrap()
+        else {
             panic!("inference value")
         };
+        assert_eq!(stop_reason, "error");
         assert_eq!(
             message,
-            json!({"type": "error", "message": format!("EffectFailed: {kind:?}: safe failure"), "request_id": request.id})
+            json!({"type": "error", "message": format!("{kind:?}: safe failure"), "request_id": request.id})
         );
         assert_eq!(
             fixture
@@ -1708,12 +1713,13 @@ async fn inference_error_does_not_finish_a_replacement_turn() {
             "safe failure",
         )))
         .unwrap();
-    let MclValue::Error(message) = drive(&mut fixture.app, &mut reply).await.unwrap() else {
+    let MclValue::Inference { message, .. } = drive(&mut fixture.app, &mut reply).await.unwrap()
+    else {
         panic!("inference value")
     };
     assert_eq!(
         message,
-        json!({"type":"error", "message":"EffectFailed: Timeout: safe failure", "request_id":request.id})
+        json!({"type":"error", "message":"Timeout: safe failure", "request_id":request.id})
     );
     let agent = fixture
         .app
@@ -1725,7 +1731,7 @@ async fn inference_error_does_not_finish_a_replacement_turn() {
 }
 
 #[tokio::test]
-async fn bundled_drivers_log_inference_mcl_errors_and_exit_without_faking_turn_cleanup() {
+async fn bundled_drivers_record_inference_error_messages_and_keep_running_while_cleanup_finishes() {
     for source in [
         include_str!("../../../../resources/agent-drivers/local/coder/latest/base.lua"),
         include_str!("../../../../resources/agent-drivers/local/reviewer/latest/base.lua"),
@@ -1869,7 +1875,7 @@ async fn bundled_drivers_log_inference_mcl_errors_and_exit_without_faking_turn_c
             owner: fixture.owner,
             workspace,
             program: LuaProgram {
-                source: source.replace("local agent = margatroid.agent:create({\n        owner = context.workspace.address,\n        name = context.name,\n        config_path = context.resource_dir .. \"/setting.toml\",\n        ui_path = context.resource_dir .. \"/ui\",\n    })", "local agent = {address='agent:local/test:latest'}"),
+                source: source.replace("task = function() return margatroid.task:receive() end,", "").replace("local agent = margatroid.agent:create({\n        owner = context.workspace.address,\n        name = context.name,\n        config_path = context.resource_dir .. \"/setting.toml\",\n        ui_path = context.resource_dir .. \"/ui\",\n    })", "local agent = {address='agent:local/test:latest'}"),
                 origin: "bundled-driver".into(),
 
             },
@@ -1934,15 +1940,20 @@ async fn bundled_drivers_log_inference_mcl_errors_and_exit_without_faking_turn_c
             let deadline = Instant::now() + Duration::from_secs(5);
             loop {
                 fixture.app.tick();
-                if exited.load(Ordering::Acquire) {
+                if fixture
+                    .history()
+                    .iter()
+                    .any(|record| record.kind == "message" && record.payload["type"] == "error")
+                {
                     break;
                 }
                 assert!(
                     Instant::now() < deadline,
-                    "Driver did not exit for {kind:?}"
+                    "Driver did not record inference error"
                 );
                 tokio::task::yield_now().await;
             }
+            assert!(!exited.load(Ordering::Acquire));
             assert_eq!(
                 fixture
                     .app
@@ -1952,31 +1963,17 @@ async fn bundled_drivers_log_inference_mcl_errors_and_exit_without_faking_turn_c
                     .state(),
                 AgentState::Running
             );
-            assert!(
-                !fixture
-                    .history()
-                    .iter()
-                    .any(|record| record.kind == "message" && record.payload["type"] == "error")
-            );
             let logs = storage_core::read_agent_logs(
                 fixture
                     .app
                     .world()
-                    .get_component::<storage_core::AgentStorage>(fixture.owner)
+                    .get_component::<AgentStorage>(fixture.owner)
                     .unwrap(),
                 None,
                 100,
             )
             .unwrap();
-            assert_eq!(logs.len(), 1);
-            assert!(
-                logs[0]
-                    .record
-                    .raw_error
-                    .as_deref()
-                    .unwrap()
-                    .contains("safe inference failure")
-            );
+            assert!(logs.is_empty());
             let active = fixture
                 .app
                 .world()
@@ -1990,7 +1987,20 @@ async fn bundled_drivers_log_inference_mcl_errors_and_exit_without_faking_turn_c
             assert!(!cancel.is_cancelled());
             release.send(()).unwrap();
             active.wait_finished().await.unwrap();
-            fixture.command("EFFECT finish_turn", vec![]).await.unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while fixture
+                .app
+                .world()
+                .get_component::<Agent>(fixture.owner)
+                .unwrap()
+                .turn()
+                .is_some()
+            {
+                fixture.app.tick();
+                assert!(Instant::now() < deadline);
+                tokio::task::yield_now().await;
+            }
+            assert!(!exited.load(Ordering::Acquire));
             let (sender, mut stopped) = oneshot::channel();
             fixture.app.world().send_event(StopDriverLuaVm {
                 instance,
@@ -3086,4 +3096,22 @@ async fn finishing_a_turn_does_not_wait_for_or_remove_unbound_inference() {
     );
     tx.send(()).unwrap();
     handle.wait_finished().await.unwrap();
+}
+
+#[tokio::test]
+async fn compact_history_messages_are_assistant_aliases_at_the_inference_boundary() {
+    let mut fixture = Fixture::new();
+    let original = json!({"type":"compact","reasoning":"summary reasoning","content":"compressed","tool_calls":[],"request_id":"summary-generation"});
+    fixture
+        .command("EFFECT history_append ?", vec![json!([original.clone()])])
+        .await
+        .unwrap();
+    fixture
+        .command("EFFECT inference ?", vec![json!([original])])
+        .await
+        .unwrap();
+    let requests = fixture.inference.lock().unwrap();
+    assert!(
+        matches!(&requests.last().unwrap().messages[0],InferenceMessage::Assistant{content:Some(text),..}if text=="compressed")
+    );
 }

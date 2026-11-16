@@ -69,3 +69,5 @@ DTO移除dto_sync_system以及WebSocketMessageSend、ConnState、SyncState的旧
 Workspace文件读取已实现：GET/HEAD /{workspace}/{*path}由本插件提供，workspace为单段编码的完整Workspace Address；通过原World闭包取得实际运行Workspace的project_root，再只读返回根内普通文件。遵守现有ingress和HTTP生命周期，不新增事件、System、注册表、数据库或磁盘目录。
 
 文件读取在Unix使用目录句柄及逐段no-follow打开，拒绝符号链接、目录和特殊文件；GET按已打开文件长度流式返回，HEAD只返对应头，未知类型为application/octet-stream。非Unix目标返回501，不使用不安全路径检查降级。现有45种WS消息不变，不需Agent、turn或WebSocket注册。
+
+推理终态中的assistant及error已由推理通道交付；带request_id的这两类消息写入历史后，记录监控只推进真实提交游标，不再发送第二条full。历史查询保留完整记录；不带推理request_id的独立error和compact历史仍按普通持久记录同步。

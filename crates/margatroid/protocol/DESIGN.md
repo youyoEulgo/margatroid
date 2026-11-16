@@ -226,11 +226,12 @@ AgentMessageDto：厂商无关消息枚举，各variant均有sequence:Option<u64
     System { sequence: Option<u64>, content: String }
     User { sequence: Option<u64>, content: String, data: Vec<UserImageDto> }
     Assistant { sequence: Option<u64>, request_id: Option<String>, reasoning: Option<String>, content: Option<String>, tool_calls: Vec<ToolCallDto>, usage: Option<TokenUsageDto>, stop_reason: Option<String> }
+    Compact { sequence: Option<u64>, request_id: Option<String>, reasoning: Option<String>, content: Option<String>, tool_calls: Vec<ToolCallDto>, usage: Option<TokenUsageDto>, stop_reason: Option<String> }--assistant同结构别名，wire保留compact
     ToolCall { sequence: Option<u64>, tool_call_id: String, tool_name: String, content: String, data: Vec<UserImageDto>, failed: bool }
     Inject { sequence: Option<u64>, messages: Vec<AgentMessageDto> }
     Error { sequence: Option<u64>, message: String, request_id: Option<String> }
     行为：
-        JSON type分别为system/user/assistant/tool_call/inject/error；缺省sequence不输出，存在时必须为真实持久历史正序号
+        JSON type分别为system/user/assistant/compact/tool_call/inject/error；缺省sequence不输出，存在时必须为真实持久历史正序号
         data数组可省略为空；reasoning和content各保存一份，禁止replay、api_format和images兼容字段
         数据库sequence/role/content/data/tool_call/payload由存储codec可逆重建本枚举；SQL payload只含剩余字段，不是wire完整消息
         inject是显式消息包装，其messages保持结构化数组；角色转换及解包不属于协议解析器
@@ -279,6 +280,7 @@ AgentMessageChunkSync累计文本约束
     sequence用于丢弃同generation迟到或重复快照，跳号不需要补拼前缀；不冒充持久消息sequence。
     chunk不承载工具参数增量、usage或stop_reason，完整生成结果仍由原AgentMessageFullSync交付。
 MclExecuteDataDto：按kind标记的公开枚举，各variant用value承载业务值
+    Turn { value: String }
     Messages { value: Vec<AgentMessageDto> }
     Config { value: serde_json::Value }
     Import { value: MclImportResultDto }

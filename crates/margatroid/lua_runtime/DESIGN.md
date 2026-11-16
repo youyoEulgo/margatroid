@@ -164,7 +164,7 @@ run_driver(context: RunContext) -> LocalFuture
 execute_lua(context, environment, logger, processes) -> Future<Output = Result<(), LuaRuntimeError>>
     行为：调用共享create_environment，安装取消hook后复用configuration_globals/load_program；configure返回ToolConfiguration，纯阶段能力未启用。
         enable_execution加载同一标准库并恢复保存全局，Margatroid.enable安装相同公共方法；读取execute并异步调用，配置超时同时约束CPU及等待。
-        source身份为执行Entity/实例，目标由方法显式指定；context包含workspace/name/resource_dir/task_id，不预造agent_info。
+        source身份为执行Entity/实例，目标由方法显式指定；context包含workspace/name/resource_dir/task_id/task_address，不预造agent_info。
         公共服务回调通过LuaServices，文件/data/text/process沿既有共享安装器；全程不按HostKind裁剪API。
 
 ```
@@ -274,6 +274,7 @@ LuaHostContext字段约定：JSON对象保存真实执行元数据
     project_root: Option<PathBuf>--只在当前环境确实提供时存在
     driver_instance: Option<String>
     task_id: String--实际执行任务id
+    task_address: String--自动执行任务所在完整execution Address，供同Workspace结构化任务引用
     call_id, alias: Option<String>--有模型调用时提供
     owner_task_id: Option<String>
     binding: Option<LuaValue>

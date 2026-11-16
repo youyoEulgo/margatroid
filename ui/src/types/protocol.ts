@@ -53,7 +53,7 @@ export type AgentMessage = { sequence?: number } & (
   | { type: 'system'; content: string }
   | { type: 'user'; content: string; data?: UserImage[] }
   | {
-      type: 'assistant';
+      type: 'assistant' | 'compact';
       request_id?: string;
       content?: string | null;
       reasoning?: string | null;
@@ -502,6 +502,7 @@ export function isAgentMessage(value: unknown): value is AgentMessage {
     case 'user':
       return string(value.content) && images(value.data);
     case 'assistant':
+    case 'compact':
       return (
         optionalNullableString(value.content) &&
         optionalNullableString(value.reasoning) &&

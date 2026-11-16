@@ -104,3 +104,5 @@ MCL状态门统一只允许Starting/Running，不根据effect判断回合。推�
 Agent创建注入接口为owner/name/config_path/ui_path，拒绝旧resource_dir创建参数。配置仅首次从config_path初始化至Agent持久setting.toml，后续重启保留已修改配置；ui_path始终直接引用与监控，不创建Agent本地UI，不复制、覆盖、删除已有UI副本，也不把旧副本作为回退来源。Lua程序加载只读取程序文件，不推导或读取同目录配置。
 
 显式可选turn契约：start_turn取得并返回当前turn，已有回合返回同一标识；推理和工具显式携带turn时严格校验，省略为None自由调用，不自动继承当前turn。自由调用仍受实际会话、权限、生命周期、取消及原有并发限制；Starting允许初始化所需自由调用，Error/Stopping拒绝。回合中止/收尾只作用于明确绑定该turn的请求，Agent关闭仍监督全部调用。详见本域DESIGN。运行中的旧进程仍需使用新构建。
+
+推理领域的连接失败、HTTP错误、超时等通过Inference.message返回type=error的AgentMessage，附原request_id及stop_reason=error；不再提升为顶层MCL Error导致Driver退出。执行通道错误、MCL受理/参数/权限错误及真正的清理失败仍按各自原契约收口。压缩消息的历史写入、快照及上下文替换由compact调用方处理。

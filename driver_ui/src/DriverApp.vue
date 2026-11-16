@@ -105,6 +105,8 @@ const imagePicker = ref<HTMLInputElement | null>(null);
 const uploadMenuOpen = ref(false);
 const composerError = ref("");
 const importingImages = ref(false);
+const compacting = ref(false);
+const compactNotice = ref("");
 let draftGeneration = 0;
 let pickerGeneration = 0;
 function openImagePicker() {
@@ -123,6 +125,7 @@ watch(
     draft.value = "";
     draftImages.value = [];
     composerError.value = "";
+    compactNotice.value = "";
     importingImages.value = false;
     submittingMessage.value = false;
     sendStage.value = null;
@@ -137,8 +140,24 @@ const canEditComposer = computed(
     connectionStatus.value === "online" &&
     stateReady.value &&
     selectedAgentIdle.value &&
-    !submittingMessage.value,
+    !submittingMessage.value &&
+    !compacting.value,
 );
+async function compactContext() {
+  if (!canEditComposer.value || compacting.value) return;
+  compacting.value = true;
+  compactNotice.value = "";
+  composerError.value = "";
+  try {
+    await store.compactContext();
+    compactNotice.value = "Compaction requested.";
+    uploadMenuOpen.value = false;
+  } catch {
+    composerError.value = "Compaction request failed — see Activity logs";
+  } finally {
+    compacting.value = false;
+  }
+}
 async function importFiles(files: File[]) {
   if (!canEditComposer.value || importingImages.value || !files.length) return;
   const generation = draftGeneration;
@@ -705,6 +724,7 @@ function showsMeta(index: number): boolean {
 // them never depends on which message they came from.
 type RowKind =
   | "images"
+  | "compact"
   | "thinking"
   | "content"
   | "error"
@@ -737,6 +757,10 @@ const conversationRows = computed<ConversationRow[]>(() => {
       if (message.images?.length) push("images");
       if (message.content) push("content");
       if (showsMeta(index)) push("meta");
+      return;
+    }
+    if (message.role === "compact") {
+      push("compact");
       return;
     }
     if (message.role === "assistant") {
@@ -913,8 +937,23 @@ const conversationRows = computed<ConversationRow[]>(() => {
               ]"
             >
               <div class="message-body">
+                <details
+                  v-if="row.kind === 'compact'"
+                  class="message-disclosure message-compact"
+                >
+                  <summary>Compacted context</summary>
+                  <div
+                    class="message-content message-compact-content"
+                    v-html="
+                      renderMarkdown(
+                        row.message.content,
+                        markdownContext(row.message),
+                      )
+                    "
+                  ></div>
+                </details>
                 <div
-                  v-if="row.kind === 'images'"
+                  v-else-if="row.kind === 'images'"
                   class="image-row history-image-row"
                   aria-label="Message images"
                 >
@@ -1153,11 +1192,23 @@ const conversationRows = computed<ConversationRow[]>(() => {
                 <button type="button" @click="openImagePicker">
                   Upload image
                 </button>
+                <button
+                  type="button"
+                  :disabled="compacting"
+                  @click="compactContext"
+                >
+                  {{
+                    compacting ? "Requesting compaction…" : "Compact context"
+                  }}
+                </button>
               </div>
             </div>
             <span v-if="importingImages" class="image-import-label"
               >Importing images…</span
             >
+            <span v-if="compactNotice" class="image-import-label" role="status">
+              {{ compactNotice }}
+            </span>
             <span
               v-if="submittingMessage"
               class="image-import-label"

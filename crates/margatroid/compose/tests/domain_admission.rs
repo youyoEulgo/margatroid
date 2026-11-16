@@ -205,6 +205,36 @@ end
                 .is_empty()
         );
     }
+    let result = command(
+        &mut app,
+        client,
+        agent,
+        "EFFECT inference ?",
+        vec![json!([{"type":"user","content":"connection refused must be an error message"}])],
+    );
+    let MclValue::Inference {
+        message,
+        stop_reason,
+    } = result
+    else {
+        panic!("provider failure must return an inference message");
+    };
+    assert_eq!(stop_reason, "error");
+    assert_eq!(message["type"], "error");
+    assert!(
+        message["message"]
+            .as_str()
+            .unwrap()
+            .contains("connection refused")
+    );
+    assert!(message["request_id"].as_str().is_some());
+    assert_eq!(
+        app.world()
+            .get_component::<agent_core::Agent>(agent)
+            .unwrap()
+            .state(),
+        agent_core::AgentState::Running
+    );
     let (tx, mut rx) = oneshot::channel();
     app.world().emit_event(StopWorkspace {
         id: "stop".into(),

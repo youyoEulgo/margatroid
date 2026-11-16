@@ -29,6 +29,7 @@ struct Commands {
     working: bool,
     finished: usize,
     malformed_config: bool,
+    inference_error: bool,
     conversation: Vec<Value>,
     snapshots: Vec<Vec<Value>>,
 }
@@ -91,6 +92,7 @@ impl Fixture {
             match method.as_str(){
                 "agent_create"=>Ok(json!({"address":"agent:local/driver-errors:latest"})),
                 "wait"=>{let(tx,rx)=oneshot::channel();closures.send(move|world|{let _=tx.send(world.get_component::<DriverLuaVm>(owner).unwrap().wake.clone());});let slot=rx.await.unwrap();tokio::select!{_=identity.cancel.cancelled()=>Err(LuaRuntimeError::new(LuaRuntimeErrorKind::Cancelled,"cancelled")),result=DriverWakeSlot::wait(slot)=>{result?;Ok(serde_json::Value::Null)}}},
+                "task_receive"=>std::future::pending::<Result<Value,LuaRuntimeError>>().await,
                 "mcl_execute"=>{let(tx,rx)=oneshot::channel();events.send_event(MclCommand{id:"fixture-mcl".into(),source:identity.source,source_address:identity.address,source_instance:Some(identity.instance),target:owner,instruction:mcl_core::MclInstruction{text:args["instruction"].as_str().unwrap().into(),arguments:serde_json::from_value(args["arguments"].clone()).unwrap()},cancel:identity.cancel,reply:Arc::new(Mutex::new(Some(tx)))});Ok(match rx.await.unwrap().unwrap(){MclValue::Unit=>json!({}),value=>serde_json::to_value(value).unwrap()})},
                 _=>Err(LuaRuntimeError::new(LuaRuntimeErrorKind::InvalidRequest,"unknown service")),
             }
@@ -147,6 +149,8 @@ impl Fixture {
                         recorded.push(message);
                     }
                     MclValue::Array(MessageArray::Message(recorded))
+                } else if text.starts_with("EFFECT inference ") && std::mem::take(&mut state.inference_error) {
+                    MclValue::Inference{message:json!({"type":"error","message":"provider connection refused","request_id":request.id}),stop_reason:"error".into()}
                 } else if text.starts_with("EFFECT inference ") {
                     MclValue::Inference {message:json!({"type":"assistant", "content":"done", "stop_reason":"completed"}), stop_reason:"completed".into()}
                 } else if text == "EFFECT start_turn" {
@@ -432,7 +436,18 @@ async fn compaction_snapshots_before_replacement_and_preserves_context_on_snapsh
             let program = format!(
                 r#"{prefix}
 active_model = {{context_window_tokens=4096}}
-maybe_compact_context({{usage = {{input_tokens = {tokens}, output_tokens = 0}}}})
+local before = #command("GET session.conversation").Array.Message
+assert(maybe_compact({{}}) == false)
+local needed = maybe_compact({{usage = {{input_tokens = {tokens}, output_tokens = 0}}}})
+assert(type(needed) == "boolean")
+assert(needed == ({tokens} >= 4096 * 0.8))
+assert(#command("GET session.conversation").Array.Message == before)
+if needed then
+    local result = compact()
+    assert(result.type == "compact" and result.content == "done")
+    assert(#command("GET session.conversation").Array.Message == before)
+    process_compaction(result)
+end
 local marker = {{type = "user", content = "probe-ok"}}
 command("EFFECT history_append ?", {{{{marker}}}})
 active_model = {{context_window_tokens=4096}}
@@ -481,6 +496,9 @@ end
                             .any(|c| c == "INJECT ? TO session.conversation")
                     );
                 } else {
+                    assert!(state.history.iter().any(
+                        |message| message["type"] == "compact" && message["content"] == "done"
+                    ));
                     assert_eq!(state.snapshots, vec![original.clone()]);
                     assert_eq!(state.conversation.len(), 3);
                     assert_eq!(
@@ -503,6 +521,89 @@ end
             }
             fixture.close(Some(instance)).await;
         }
+    }
+}
+
+#[tokio::test]
+async fn compact_returns_error_or_compact_without_history_or_context_updates_until_caller_records_it()
+ {
+    for source in [CODER, REVIEWER] {
+        let mut fixture = Fixture::new();
+        let original = vec![
+            json!({"type":"user","content":"old"}),
+            json!({"type":"assistant","content":"answer"}),
+            json!({"type":"user","content":"recent"}),
+            json!({"type":"assistant","content":"last"}),
+        ];
+        {
+            let mut state = fixture.commands.lock().unwrap();
+            state.conversation = original.clone();
+            state.inference_error = true;
+        }
+        let prefix = source.split("\n    initialize()\n").next().unwrap();
+        let program = format!(
+            r#"{prefix}
+active_model={{context_window_tokens=4096}}
+local failed=compact()
+assert(failed.type=="error" and failed.message=="provider connection refused")
+assert(#command("GET session.conversation").Array.Message==4)
+process_compaction(failed)
+assert(#command("GET session.conversation").Array.Message==4)
+command("EFFECT ready")
+margatroid:wait(agent.address)
+end
+"#
+        );
+        let instance = fixture.start(&program).await.unwrap();
+        {
+            let state = fixture.commands.lock().unwrap();
+            assert_eq!(state.conversation, original);
+            assert!(state.snapshots.is_empty());
+            assert_eq!(state.history.len(), 1);
+            assert_eq!(state.history[0]["type"], "error");
+            assert_eq!(state.history[0]["message"], "provider connection refused");
+            assert!(
+                !state
+                    .calls
+                    .iter()
+                    .any(|call| call == "INJECT ? TO session.conversation")
+            );
+        }
+        fixture.close(Some(instance)).await;
+    }
+}
+
+#[tokio::test]
+async fn manual_compaction_without_earlier_context_returns_and_records_error_without_inference() {
+    for source in [CODER, REVIEWER] {
+        let mut fixture = Fixture::new();
+        let prefix = source.split("\n    initialize()\n").next().unwrap();
+        let program = format!(
+            r#"{prefix}
+active_model={{context_window_tokens=4096}}
+local result=compact()
+assert(result.type=="error" and result.message=="No earlier context to compact")
+process_compaction(result)
+command("EFFECT ready")
+margatroid:wait(agent.address)
+end
+"#
+        );
+        let instance = fixture.start(&program).await.unwrap();
+        {
+            let state = fixture.commands.lock().unwrap();
+            assert_eq!(state.history.len(), 1);
+            assert_eq!(state.history[0]["type"], "error");
+            assert!(state.conversation.is_empty());
+            assert!(state.snapshots.is_empty());
+            assert!(
+                !state
+                    .calls
+                    .iter()
+                    .any(|call| call.starts_with("EFFECT inference"))
+            );
+        }
+        fixture.close(Some(instance)).await;
     }
 }
 

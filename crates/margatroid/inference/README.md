@@ -152,6 +152,8 @@ full不替代oneshot或真实退出证明。流/协议错误及时交付后仍�
 
 验证要求：思考与正文交错时每次含两侧累计值；拆分UTF-8不产生损坏字符；工具参数/usage不误发文本快照；丢失某个chunk后的更高sequence可直接恢复文本；重复/迟到chunk不回滚，full后chunk不能重开生成；正常、取消、错误及零文本结束沿原full；预算失败不影响后端最终结果。
 
-同一generation的full只由推理消费链路交付一次；后续历史持久化不重发该assistant，持久序号通过history查询取得。已交付生成错误后的清理超时只记诊断，继续保留真实监督，不发送第二条终态full。
+同一generation的full只由推理消费链路交付一次；后续历史持久化不重发带request_id的assistant/error，持久序号通过history查询取得。已交付生成错误后的清理超时只记诊断，继续保留真实监督，不发送第二条终态full。
 
 显式可选turn契约：start_turn取得并返回当前turn，已有回合返回同一标识；推理和工具显式携带turn时严格校验，省略为None自由调用，不自动继承当前turn。自由调用仍受实际会话、权限、生命周期、取消及原有并发限制；Starting允许初始化所需自由调用，Error/Stopping拒绝。回合中止/收尾只作用于明确绑定该turn的请求，Agent关闭仍监督全部调用。详见本域DESIGN。运行中的旧进程仍需使用新构建。
+
+MCL边界将推理领域Err转换为Inference结果内的error AgentMessage（stop_reason=error、原request_id），与顶层MCL执行错误区分；推理领域内部仍使用原Result/清理监督，不在失败时假造assistant或自动重试。

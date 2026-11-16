@@ -1236,6 +1236,22 @@ pub enum AgentMessageDto {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         stop_reason: Option<String>,
     },
+    Compact {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sequence: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        request_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reasoning: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        content: Option<String>,
+        #[serde(default)]
+        tool_calls: Vec<ToolCallDto>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        usage: Option<TokenUsageDto>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stop_reason: Option<String>,
+    },
     ToolCall {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         sequence: Option<u64>,
@@ -1265,7 +1281,7 @@ impl AgentMessageDto {
         match self {
             Self::System { sequence, .. } => *sequence,
             Self::User { sequence, .. } => *sequence,
-            Self::Assistant { sequence, .. } => *sequence,
+            Self::Assistant { sequence, .. } | Self::Compact { sequence, .. } => *sequence,
             Self::ToolCall { sequence, .. } => *sequence,
             Self::Inject { sequence, .. } => *sequence,
             Self::Error { sequence, .. } => *sequence,

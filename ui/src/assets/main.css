@@ -730,11 +730,20 @@ textarea:focus-visible {
 }
 
 /* Assistant: no avatar bubble — plain narration, 16px/28px. */
-.message-row--assistant {
+.message-row--assistant,
+.message-row--compact {
   display: block;
 }
 
-.message-row--assistant .message-avatar {
+.message-compact > .message-compact-content {
+  padding-left: 22px;
+  color: var(--mg-text-tertiary);
+  font-size: 14px;
+  line-height: 24px;
+}
+
+.message-row--assistant .message-avatar,
+.message-row--compact .message-avatar {
   display: none;
 }
 

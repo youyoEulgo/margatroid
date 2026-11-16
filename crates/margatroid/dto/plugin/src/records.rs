@@ -145,15 +145,17 @@ fn encode_batch(
 ) -> Result<Vec<std::sync::Arc<client_core::ClientFrame>>, DtoAsyncError> {
     let mut frames = vec![];
     for row in &batch.messages {
-        // Generated assistant messages already finish on the inference channel.
+        // Generated assistant/error messages already finish on the inference channel.
         // Persistence is available through history queries, not another full frame.
-        if row.record.payload.get("type").and_then(Value::as_str) == Some("assistant")
-            && row
-                .record
-                .payload
-                .get("request_id")
-                .and_then(Value::as_str)
-                .is_some()
+        if matches!(
+            row.record.payload.get("type").and_then(Value::as_str),
+            Some("assistant" | "error")
+        ) && row
+            .record
+            .payload
+            .get("request_id")
+            .and_then(Value::as_str)
+            .is_some()
         {
             continue;
         }

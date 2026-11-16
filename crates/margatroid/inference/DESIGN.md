@@ -384,7 +384,7 @@ DomainRequest：拥有所有权的纯领域输入，不承载厂商或API协议�
 InferenceMessage：推理自身的厂商无关消息契约，公开枚举；不含replay、api_format、签名块或加密重放载荷
     System { content: String }
     User { content: String, images: Vec<InferenceImage> }--JSON字段名为data，无images别名
-    Assistant { reasoning: Option<String>, content: Option<String>, tool_calls: Vec<InferenceToolCall> }
+    Assistant { reasoning: Option<String>, content: Option<String>, tool_calls: Vec<InferenceToolCall> }--反序列化接受compact别名，厂商转换统一assistant
     Tool { call_id: String, content: String, images: Vec<InferenceImage>, failed: bool }--JSON字段名为data
 
 InferenceToolDefinition：本次工具定义--name、description、input_schema

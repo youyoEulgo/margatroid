@@ -34,51 +34,66 @@ function execute(arguments, context)
         command("INJECT ? TO entry.pending[-1]", {{message}})
     end
 
-    local function maybe_compact_context(message)
-        local config = settings()
-        local threshold = active_model.context_window_tokens * config.compaction.threshold
-        if not message.usage
-            or message.usage.input_tokens + message.usage.output_tokens < threshold then
-            return
-        end
-        local conversation = command("GET session.conversation").Array.Message
+    local function compaction_split(conversation, keep_messages)
         local count = 0
-        local split = 1
         for index = #conversation, 1, -1 do
             local kind = conversation[index].type
             if kind == "user" or kind == "assistant" then
                 count = count + 1
-                if count == config.compaction.keep_messages then
-                    split = index
-                    break
-                end
+                if count == keep_messages then return index end
             end
         end
-        if split == 1 then return end
+        return 1
+    end
+
+    local function maybe_compact(message)
+        local config = settings()
+        local threshold = active_model.context_window_tokens * config.compaction.threshold
+        if not message.usage then return false end
+        if message.usage.input_tokens + message.usage.output_tokens < threshold then
+            return false
+        end
+        local conversation = command("GET session.conversation").Array.Message
+        return compaction_split(conversation, config.compaction.keep_messages) > 1
+    end
+
+    local function compact()
+        local config = settings()
+        local conversation = command("GET session.conversation").Array.Message
+        local split = compaction_split(conversation, config.compaction.keep_messages)
+        if split == 1 then
+            return {type = "error", message = "No earlier context to compact"}
+        end
 
         local earlier = {}
-        local recent = {}
-        for index, item in ipairs(conversation) do
-            if index < split then
-                earlier[#earlier + 1] = item
-            else
-                recent[#recent + 1] = item
-            end
+        for index = 1, split - 1 do
+            earlier[#earlier + 1] = conversation[index]
         end
         command("INJECT ? TO msg.compact_context", {earlier})
-        local summary = command("EFFECT inference (msg.instructions, msg.compact_context, msg.compact_prompt)").Inference
-        summary.message = append_history(summary.message)
-        if summary.stop_reason == "completed" and summary.message.type == "assistant"
-            and summary.message.content and summary.message.content ~= "" then
-            local replacement = {
-                {type = "user", content = "Conversation checkpoint:\n" .. summary.message.content}
-            }
-            for _, item in ipairs(recent) do
-                replacement[#replacement + 1] = item
-            end
-            command("EFFECT block_snapshot ?", {"session"})
-            command("INJECT ? TO session.conversation", {replacement})
+        local response = command("EFFECT inference (msg.instructions, msg.compact_context, msg.compact_prompt)").Inference
+        local message = response.message
+        if message.type == "assistant" then message.type = "compact" end
+        return message
+    end
+
+    local function process_compaction(message)
+        message = append_history(message)
+        if message.type == "error" then return end
+        if message.type ~= "compact" or message.stop_reason ~= "completed"
+            or not message.content or message.content == "" then return end
+
+        local config = settings()
+        local conversation = command("GET session.conversation").Array.Message
+        local split = compaction_split(conversation, config.compaction.keep_messages)
+        if split == 1 then return end
+        local replacement = {
+            {type = "user", content = "Conversation checkpoint:\n" .. message.content}
+        }
+        for index = split, #conversation do
+            replacement[#replacement + 1] = conversation[index]
         end
+        command("EFFECT block_snapshot ?", {"session"})
+        command("INJECT ? TO session.conversation", {replacement})
     end
 
     local function initialize()
@@ -108,6 +123,7 @@ function execute(arguments, context)
         command("INJECT soul TO msg.instructions")
         command("INJECT compact TO msg.compact_prompt")
         command("EFFECT sandbox_use ?", {config.sandbox})
+        command("CONFIG SET ? ?", {"driver_task", {agent = context.task_address, task_id = context.task_id}})
         command("EFFECT ready")
     end
 
@@ -127,7 +143,13 @@ function execute(arguments, context)
     local function process_next()
         local message = command("GET entry.pending[0]").Array.Message[1]
         if not message then
-            margatroid:wait(agent.address)
+            local source, value = margatroid:wait_any({
+                wake = function() return margatroid:wait(agent.address) end,
+                task = function() return margatroid.task:receive() end,
+            })
+            if source == "task" and type(value) == "table" and value.type == "compact" then
+                process_compaction(compact())
+            end
             return
         end
         command("INJECT [] TO entry.pending[0,1]")
@@ -146,13 +168,13 @@ function execute(arguments, context)
                 command("INJECT ? TO session.conversation[-1]", {{message}})
             end
             if #(message.tool_calls or {}) == 0 then
-                maybe_compact_context(message)
+                if maybe_compact(message) then process_compaction(compact()) end
                 command("EFFECT finish_turn")
             else
                 local results = command("EFFECT tool_call (session.conversation[-1].tool_calls) ?", {turn}).Array.Message
                 pending_tool_results = #results
                 command("INJECT ? TO entry.pending[-1]", {results})
-                maybe_compact_context(message)
+                if maybe_compact(message) then process_compaction(compact()) end
             end
         elseif message.type == "error" then
             pending_tool_results = 0

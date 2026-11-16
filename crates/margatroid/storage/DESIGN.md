@@ -218,7 +218,7 @@ page<T>(db: &Connection, table: &str, query: RecordRange, decode: impl Fn(&Conne
     Block文件：<管理库完整路径>.blocks/<Block逻辑名>/timeline.sqlite及snapshot_<id>.sqlite
         一个Block固定一个可写timeline数据库；每次快照从当前工作库完整复制一个只读数据库，不轮换工作文件
         一张子项表对应一个Block子项，每条消息为position INTEGER PRIMARY KEY、sequence可空、role、content、data可空、tool_call可空、payload
-        role保存内部type；system/user/tool_call结果content为原文本；assistant content为{reasoning,content}JSON；inject content为messages数组JSON；error message映射content
+        role保存内部type；system/user/tool_call结果content为原文本；assistant/compact content为{reasoning,content}JSON，role保留原assistant或compact标签；inject content为messages数组JSON；error message映射content
         data及tool_calls分别存JSON到data与tool_call列，其他字段进payload；sequence仅引用真实历史，不新建Block局部序号；读取重建完整内部消息
         快照及恢复均按完整数据库文件操作，所有子项表与库内状态自然一起保留，不逐子项重建或按当前定义补表
         position表达当前数组顺序，不充当跨快照稳定消息ID；负索引和范围仍按既有数组语义计算

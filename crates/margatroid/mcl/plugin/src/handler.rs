@@ -1158,11 +1158,16 @@ async fn execute_inference(
         Ok(receiver)
     })
     .await?;
-    let response = receiver
+    match receiver
         .await
         .map_err(|_| error(MclErrorKind::CleanupFailed, "inference reply was lost"))?
-        .map_err(|failed| error(MclErrorKind::EffectFailed, failed.to_string()))?;
-    inference_result(response, &context.request.id)
+    {
+        Ok(response) => inference_result(response, &context.request.id),
+        Err(failed) => Ok(MclValue::Inference {
+            message: json!({"type":"error","message":failed.to_string(),"request_id":context.request.id}),
+            stop_reason: "error".into(),
+        }),
+    }
 }
 
 fn inference_result(response: InferenceResponse, request_id: &str) -> Result<MclValue, MclError> {
@@ -1369,7 +1374,8 @@ fn inference_message(mut message: Value) -> Result<InferenceMessage, MclError> {
         .and_then(Value::as_str)
         .ok_or_else(|| error(MclErrorKind::InvalidMessage, "message type is missing"))?
         .to_owned();
-    if kind == "assistant" {
+    if matches!(kind.as_str(), "assistant" | "compact") {
+        message["type"] = json!("assistant");
         let calls = assistant_calls(&message)?;
         message.as_object_mut().unwrap().insert(
             "tool_calls".into(),

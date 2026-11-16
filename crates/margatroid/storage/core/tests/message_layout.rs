@@ -270,3 +270,40 @@ fn temp_create_opens_existing_content_and_payload_duplicates_are_rejected() {
         );
     }
 }
+
+#[test]
+fn compact_preserves_assistant_fields_and_its_distinct_history_role_without_schema_changes() {
+    let d = tempfile::tempdir().unwrap();
+    let storage = open(d.path());
+    let message = json!({"type":"compact","content":"compressed context","reasoning":"summary reasoning","request_id":"compact-generation","stop_reason":"completed","tool_calls":[],"usage":{"input_tokens":20,"output_tokens":3}});
+    let saved = append_message_history(&storage, std::slice::from_ref(&message), None).unwrap();
+    let mut expected = message;
+    expected["sequence"] = json!(1);
+    assert_eq!(saved, vec![expected.clone()]);
+    let db = Connection::open(d.path().join("state.sqlite")).unwrap();
+    let (role, text, payload): (String, String, String) = db
+        .query_row(
+            "SELECT role,content,payload FROM agent_messages WHERE sequence=1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(role, "compact");
+    assert_eq!(
+        serde_json::from_str::<Value>(&text).unwrap(),
+        json!({"content":"compressed context","reasoning":"summary reasoning"})
+    );
+    assert!(serde_json::from_str::<Value>(&payload)
+        .unwrap()
+        .get("content")
+        .is_none());
+    drop(db);
+    drop(storage);
+    let reopened = open(d.path());
+    let StorageValue::HistoryEntries(rows) =
+        execute_storage(&reopened, StorageOperation::ReadAgentMessages).unwrap()
+    else {
+        panic!("history");
+    };
+    assert_eq!(rows[0].record.payload, expected);
+}
