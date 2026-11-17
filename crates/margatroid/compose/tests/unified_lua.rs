@@ -119,11 +119,7 @@ fn messages(
 }
 fn identical_lua_programs_create_independent_agents_and_stop_without_owning_the_vm() {
     let root = tempfile::tempdir().unwrap();
-    write(
-        root.path(),
-        "config.toml",
-        "[server]\nbind='127.0.0.1:0'\n[outbound]\nlogs=['type:none']\nbackend_state=['type:none']\n",
-    );
+    write(root.path(), "config.toml", "[server]\nbind='127.0.0.1:0'\n");
     write(
         root.path(),
         "models.toml",

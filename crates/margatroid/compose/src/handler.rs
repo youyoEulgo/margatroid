@@ -50,13 +50,11 @@ pub(crate) fn install(app: &mut App, parts: ApplicationParts) -> Result<(), Comp
         workspace,
     } = parts;
     let clients = client_core::Clients::default();
-    let workspace_sync =
-        dto_plugin::workspace_sync_binding(clients.clone(), config.config().backend_state());
+    let workspace_sync = dto_plugin::workspace_sync_binding(clients.clone());
     app.world_mut()
         .insert_resource(workspace_sync.updates.clone());
     app.world_mut().insert_resource(workspace_sync);
-    let agent_sync =
-        dto_plugin::agent_sync_context(clients.clone(), config.config().backend_state());
+    let agent_sync = dto_plugin::agent_sync_context(clients.clone());
     app.world_mut().insert_resource(agent_sync.clone());
     app.world_mut()
         .insert_resource(dto_plugin::model_sync_binding(agent_sync.clone()));
@@ -64,7 +62,7 @@ pub(crate) fn install(app: &mut App, parts: ApplicationParts) -> Result<(), Comp
     app.world_mut().insert_resource(tools);
     app.world_mut().insert_resource(sandboxes);
     app.world_mut().insert_resource(selection);
-    let task_sync = dto_plugin::task_sync_binding(clients.clone(), config.config().backend_state());
+    let task_sync = dto_plugin::task_sync_binding(clients.clone());
     app.world_mut().insert_resource(clients);
     let bind = config.config().server_bind();
     let level = match config.config().log_level() {
@@ -252,7 +250,7 @@ mod tool_limit_tests {
     #[test]
     fn file_budget_overrides_reach_effective_tool_limits() {
         let root = tempfile::tempdir().unwrap();
-        let source = "[server]\nbind = '127.0.0.1:0'\n[outbound]\nlogs = ['broadcast']\nbackend_state = ['broadcast']\n[tools]\nlua_vm_memory_limit = '106B'\ntask_output_buffer_window = '108B'\n";
+        let source = "[server]\nbind = '127.0.0.1:0'\n[tools]\nlua_vm_memory_limit = '106B'\ntask_output_buffer_window = '108B'\n";
         let path = root.path().join("config.toml");
         std::fs::write(&path, source).unwrap();
         let config = config_plugin::ConfigPlugin::open(path).unwrap();
@@ -266,7 +264,11 @@ mod tool_limit_tests {
         for field in ["lua_vm_memory_limit", "task_output_buffer_window"] {
             let root = tempfile::tempdir().unwrap();
             let path = root.path().join("config.toml");
-            std::fs::write(&path, format!("[server]\nbind = '127.0.0.1:0'\n[outbound]\nlogs = ['broadcast']\nbackend_state = ['broadcast']\n[tools]\n{field} = '0'\n")).unwrap();
+            std::fs::write(
+                &path,
+                format!("[server]\nbind = '127.0.0.1:0'\n[tools]\n{field} = '0'\n"),
+            )
+            .unwrap();
             let error = crate::build_app(ApplicationOptions {
                 data_root: root.path().to_owned(),
                 runner_path: std::env::current_exe().unwrap(),

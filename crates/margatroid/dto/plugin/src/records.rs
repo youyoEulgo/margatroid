@@ -60,12 +60,7 @@ pub(crate) fn refresh_record_watch(
         storage: storage.clone(),
         address,
         clients: state.clients.clone(),
-        targets: crate::sync_selectors(
-            world
-                .get_resource::<config_core::MargatroidConfig>()
-                .unwrap()
-                .backend_state(),
-        ),
+        targets: crate::sync_selectors(),
         active: active.clone(),
         cancel: cancel.clone(),
         lifetime: state.lifetime.clone(),

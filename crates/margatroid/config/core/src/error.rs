@@ -10,8 +10,6 @@ pub enum ConfigError {
     InvalidIngress,
     InvalidLogLevel,
     InvalidLogFilter,
-    InvalidTarget,
-    DuplicateTarget,
     InvalidToolLimit { field: &'static str, reason: String },
 }
 
@@ -25,9 +23,7 @@ impl fmt::Display for ConfigError {
             Self::InvalidIngress => formatter.write_str("server.allow is invalid or admits non-loopback peers while server.bind is loopback"),
             Self::InvalidLogLevel => formatter.write_str("log.level must be off, error, warn, info, debug or trace"),
             Self::InvalidLogFilter => formatter.write_str("log.filter must not be empty"),
-            Self::InvalidTarget => formatter.write_str("outbound groups must be nonempty and contain valid broadcast, type or name targets"),
             Self::InvalidToolLimit { field, reason } => write!(formatter, "{field}: {reason}"),
-            Self::DuplicateTarget => formatter.write_str("outbound group contains a duplicate target"),
         }
     }
 }

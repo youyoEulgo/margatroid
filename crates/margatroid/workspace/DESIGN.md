@@ -153,11 +153,11 @@ stop_workspace_system(world: &mut World)
 
 restart_workspace_system(world: &mut World)
     处理事件：RestartWorkspace
-    接收闭包结果：Result<RestartOutput, RestartError>
-    提交闭包：restart_flow(WorkspaceFlowContext) -> Future<Output = Result<RestartOutput, RestartError>>
-    产出事件：None
-    oneshot回复：Result<WorkspaceOperationOutput, WorkspaceError>
-    行为：RestartWorkspace -> handle_restart_workspace；Result<RestartOutput, RestartError> -> handle_restart_result。
+    接收闭包结果：None
+    提交闭包：等待StopWorkspace原oneshot的普通异步闭包，返回Result<(),AsyncTaskError>
+    闭包产出事件：停止成功后一次StartWorkspace
+    oneshot回复：停止失败直接回复原RestartWorkspace，成功由普通StartWorkspace完成原reply
+    行为：仅路由RestartWorkspace -> handle_restart_workspace，不接收独立RestartOutput或执行第二套生命周期。
 
 start_workspace_system(world: &mut World)
     处理事件：StartWorkspace
@@ -189,12 +189,13 @@ handle_stop_workspace(world: &mut World, request: StopWorkspace)
         stop_flow仍等待StartupBarrier真实完成，再按原路径停止Lua、Agent和线程；已Stopping拒绝重复提交，由原监督者等待收口。
 
 handle_restart_workspace(world: &mut World, request: RestartWorkspace)
-    行为：按request.path定位运行Entity；仅Running/Error且所有成员均无未完成工具任务时同步转Stopping并提交重启闭包；存在未完成任务则拒绝，不先关闭成员；否则拒绝。
+    行为：按request.path定位运行Entity，直接调用handle_stop_workspace，使用普通StopWorkspace的受理/取消/初始化等待及真实清理。
+        仅await StopWorkspace.reply；成功后提交普通StartWorkspace，携带原path、id和原reply。停止失败/回执丢失不启动；不查询ToolTasks、不提前reload定义、不额外改状态/装Barrier、不保留旧Entity。
+        定义全量reload及新Entity/线程/Driver创建仅发生在普通StartWorkspace路径。
 
 handle_start_result(world: &mut World, result: Result<StartOutput, StartError>)
 handle_stop_result(world: &mut World, result: Result<StopOutput, StopError>)
-handle_restart_result(world: &mut World, result: Result<RestartOutput, RestartError>)
-    行为：核对完整Entity和对应状态；启动或重启成功转Running，关闭成功销毁Entity；失败清理完整时销毁，否则保留宿主并转Error；mount_executor将本次定义保存到Workspace.definition；失败时保存WorkspaceFailure；成员Lua启动失败先发布Error并通过原reply返回聚合MemberFailed，不发布Running；全成功才清除旧故障并Running。
+    行为：核对完整Entity和对应状态；启动成功转Running，关闭成功销毁Entity；失败清理完整时销毁，否则保留宿主并转Error；mount_executor将本次定义保存到Workspace.definition；失败时保存WorkspaceFailure；成员Lua启动失败先发布Error并通过原reply返回聚合MemberFailed，不发布Running；全成功才清除旧故障并Running。
 
 ```
 
@@ -218,10 +219,6 @@ stop_flow(context: WorkspaceFlowContext) -> Future<Output = Result<StopOutput, S
     行为：等待已受理创建收口，先关闭新提交并逐个停止WorkspaceLuaTask对应实际执行，等待StopDriverLuaVm原oneshot及ended；移除独立执行Entity。
         再对直接归属Workspace的Agent发送StopAgent并等待reply，子Agent由父Agent递归清理；最后执行线程退出并在线程外join，不销毁协调Entity。
 
-restart_flow(context: WorkspaceFlowContext) -> Future<Output = Result<RestartOutput, RestartError>>
-    行为：先在Stopping下stop_members_and_join，旧Agent、Lua和线程真实退出，清空成员目录；转Starting后fresh_definition全量重载，mount_executor并start_members。
-        新启动失败如实记录Error，不复活旧实例或还原Running；保留协调Entity，运行资源已全部换新；不存在Restarting。
-
 
 ```
 
@@ -243,13 +240,13 @@ WorkspaceFlowContext：生命周期闭包材料
     reply: WorkspaceOperationReply
     world: WorldClosureSender
 
-StartOutput / StopOutput / RestartOutput：成功载荷
+StartOutput / StopOutput：成功载荷
     workspace: Entity
     members: Vec<Entity>
     member_errors: Vec<MemberDiagnostic>
     reply: WorkspaceOperationReply
 
-StartError / StopError / RestartError = FlowError
+StartError / StopError = FlowError
     workspace: Option<Entity>
     error: WorkspaceError
     cleanup_completed: bool
@@ -259,10 +256,10 @@ StartError / StopError / RestartError = FlowError
 StartupCompletion：私有共享启动完成证明
     done: AtomicBool
     changed: tokio::sync::Notify
-    finish(&self)：真实启动/重启Future完成后发布并通知
+    finish(&self)：真实启动Future完成后发布并通知
     wait(&self)：先注册后检查done，停止先等待所有启动工作真实收口
 StartupBarrier(Arc<StartupCompletion>)：Component
-    行为：初始创建和重启受理安装，guarded_start/guarded_restart完成后finish；stop_flow先wait，避免晚到程序创建落在关闭快照之后。
+    行为：仅初始创建安装，guarded_start完成后finish；stop_flow先wait，避免晚到程序创建落在关闭快照之后。
 MemberDiagnostic：成员诊断
 ```
 

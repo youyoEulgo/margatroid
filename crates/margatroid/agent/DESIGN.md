@@ -165,14 +165,11 @@ stop_agent_system(world: &mut World)
 
 restart_agent_system(world: &mut World)
     处理事件：RestartAgent
-    接收闭包结果：Result<RestartOutput, RestartError>
-    提交闭包：restart_flow(FlowContext) -> Future<Output = Result<RestartOutput, RestartError>>
-    闭包产出事件：InitToolTasks、InitInference、StopAgent（所属子Agent）
-    产出事件：None
-    oneshot回复：Result<Entity, AgentError>
-    行为：
-        RestartAgent -> handle_restart_agent；
-        Result<RestartOutput, RestartError> -> handle_restart_result。
+    接收闭包结果：None
+    提交闭包：等待StopAgent原oneshot的普通异步闭包，返回Result<(),AsyncTaskError>
+    闭包产出事件：停止成功后一次StartAgent
+    oneshot回复：停止失败直接回复原RestartAgent，成功由普通StartAgent完成原reply
+    行为：仅路由RestartAgent -> handle_restart_agent，不接收独立RestartOutput或运行第二套生命周期。
 
 start_agent_system(world: &mut World)
     处理事件：StartAgent
@@ -226,11 +223,9 @@ handle_stop_agent(world: &mut World, request: StopAgent)
         拒绝时发送关闭错误。
 
 handle_restart_agent(world: &mut World, request: RestartAgent)
-    行为：
-        在request.workspace内按name定位成员Entity，先检查ToolTasks，存在尚未finish的活任务条目直接拒绝；
-        通过update_agent按白名单转Stopping，关闭新请求受理并同步公共状态；
-        使用request.parameters提交restart_flow；
-        失败通过原reply回复。
+    行为：按workspace/name定位既有Agent，捕获实际AgentOwner和请求parameters；直接调用handle_stop_agent，停止使用普通StopAgent的状态/取消/清理规则。
+        仅await真正StopAgent.reply；成功后提交普通StartAgent，携带原owner/workspace/name/parameters及原重启reply；新Agent Entity和Session由StartAgent创建。
+        停止失败或回执丢失立即回复，不提交StartAgent；不检查ToolTasks是否非空、不提前校验启动参数、不额外改状态/装Barrier/重载定义、不保留旧Entity。
 
 handle_agent_exception(world: &mut World, event: AgentException)
     行为：
@@ -254,14 +249,6 @@ handle_stop_result(world: &mut World, result: Result<StopOutput, StopError>)
             有完整清理证明则经update_agent(Remove)移出公共目录再销毁Entity，否则保留宿主并将匹配本次FlowError.state的运行转Error，关闭普通受理。
             通过原reply回复错误。
 
-handle_restart_result(world: &mut World, result: Result<RestartOutput, RestartError>)
-    行为：
-        核对Entity及对应生命周期状态；
-        忽略失效结果。
-        重启挂载成功：保留Starting，通过原RestartAgent.reply回复Entity，等待初始化者显式ready。
-        失败：
-            有完整清理证明则经update_agent(Remove)移出公共目录再销毁Entity，否则保留宿主并将匹配本次FlowError.state的运行转Error，关闭普通受理。
-            通过原reply回复错误。
 
 ```
 
@@ -280,10 +267,7 @@ stop_runtime(context: &FlowContext, _require_vm: bool) -> Future<Output = Result
     行为：关闭Agent受理、等待槽、推理及工具；按AgentOwner精确找到直接子Agent并通过原StopAgent逐个等待其递归清理。
         复用原tasks.finish、inference.wait_finished及MclDrain真实等待；之后按AgentSession调用DropTemporaryBlocks，保留持久Block和历史。
         移除AgentResources并等待实际UI/记录监控收口；不读取或终止创建者VM，不销毁协调Entity。
-restart_flow(context: FlowContext) -> Future<Output = Result<RestartOutput, RestartError>>
-    行为：
-        先在Stopping下await stop_runtime，真实清理完成后经World入口转Starting，更新context.state，再使用请求parameters执行startup。
-        保留协调Entity及Address，运行组件和AgentSession重新建立；不存在Restarting，不在旧资源未退出时启动新资源。
+
 ```
 
 # types
@@ -298,20 +282,20 @@ StartupCompletion：私有共享启动完成证明
     finish(&self)：Release发布真实启动Future完成并notify_waiters
     wait(&self)：先注册通知后检查done，避免丢失唤醒
 StartupBarrier(Arc<StartupCompletion>)：私有Component
-    行为：StartAgent创建、RestartAgent受理时安装；guarded_start/guarded_restart在含panic收口后finish；stop_flow先wait，不能先销毁仍被初始化worker使用的宿主。
+    行为：仅StartAgent创建时安装；guarded_start在含panic收口后finish；stop_flow先wait，不能先销毁仍被初始化worker使用的宿主。
 FlowContext：闭包上下文
     id: String--原请求ID
     agent: Entity
     events: RuntimeEventSender
-    parameters: Option<AgentStartParameters>--启动与重启为Some，关闭为None
+    parameters: Option<AgentStartParameters>--启动为Some，关闭为None
     reply: Option<oneshot::Sender<Result<Entity, AgentError>>>--原请求回复端
     startup: Arc<StartupCompletion>--同一实际启动工作完成屏障
 
-StartOutput / StopOutput / RestartOutput：对应闭包的成功载荷
+StartOutput / StopOutput：对应闭包的成功载荷
     id: String--原请求ID
     agent: Entity
 
-StartError / StopError / RestartError：对应闭包的失败载荷
+StartError / StopError：对应闭包的失败载荷
     id: String--原请求ID
     agent: Entity
     error: AgentError

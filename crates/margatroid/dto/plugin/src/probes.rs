@@ -75,11 +75,8 @@ impl Drop for AgentViews {
     }
 }
 
-pub fn agent_sync_context(
-    clients: Clients,
-    targets: &[config_core::OutboundTarget],
-) -> AgentUpdateContext {
-    let targets = crate::sync_selectors(targets);
+pub fn agent_sync_context(clients: Clients) -> AgentUpdateContext {
+    let targets = crate::sync_selectors();
     let view = Arc::new(Mutex::new((0, Vec::<AgentStateDto>::new())));
     let sync = state_source(
         clients.clone(),
@@ -233,13 +230,7 @@ pub(crate) fn get_or_create_agent_context(world: &mut World) -> AgentUpdateConte
         .get_resource::<Clients>()
         .expect("Clients required")
         .clone();
-    let context = agent_sync_context(
-        clients,
-        world
-            .get_resource::<config_core::MargatroidConfig>()
-            .expect("configuration required")
-            .backend_state(),
-    );
+    let context = agent_sync_context(clients);
     world.insert_resource(context.clone());
     context
 }
@@ -426,12 +417,7 @@ pub(crate) fn install_model_config_monitor(world: &mut World) {
             error: None,
         },
     )));
-    let targets = crate::sync_selectors(
-        world
-            .get_resource::<config_core::MargatroidConfig>()
-            .unwrap()
-            .backend_state(),
-    );
+    let targets = crate::sync_selectors();
     let sync = state_source(
         state.clients.clone(),
         targets,

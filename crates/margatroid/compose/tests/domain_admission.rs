@@ -58,11 +58,7 @@ fn command(
 #[test]
 fn starting_and_running_mcl_reach_real_domains_which_reject_explicit_stale_turns() {
     let root = tempfile::tempdir().unwrap();
-    write(
-        root.path(),
-        "config.toml",
-        "[server]\nbind='127.0.0.1:0'\n[outbound]\nlogs=['type:none']\nbackend_state=['type:none']\n",
-    );
+    write(root.path(), "config.toml", "[server]\nbind='127.0.0.1:0'\n");
     write(
         root.path(),
         "models.toml",

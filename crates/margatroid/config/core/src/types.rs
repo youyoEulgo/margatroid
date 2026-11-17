@@ -1,13 +1,6 @@
 use std::fmt;
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub enum OutboundTarget {
-    Broadcast,
-    Type(String),
-    Name(String),
-}
-
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum LogLevel {
     Off,

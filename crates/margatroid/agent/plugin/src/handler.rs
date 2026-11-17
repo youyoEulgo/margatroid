@@ -385,84 +385,64 @@ pub(crate) fn handle_restart_agent(world: &mut World, request: RestartAgent) {
     let Some(reply) = claim(&request.reply) else {
         return;
     };
-    let prepared = (|| {
-        validate_request(&request.id, &request.name)?;
-        validate_parameters(
-            world,
-            request.workspace,
-            request.workspace,
-            &request.name,
-            &request.parameters,
-        )?;
-        let matches: Vec<_> = world
-            .query_with::<Agent>()
-            .result()
-            .into_iter()
-            .filter(|entity| {
-                world.get_component::<Agent>(*entity).is_some_and(|agent| {
-                    agent.workspace() == request.workspace && agent.name() == &request.name
-                })
+    let Some(agent) = world
+        .query_with::<Agent>()
+        .result()
+        .into_iter()
+        .find(|entity| {
+            world.get_component::<Agent>(*entity).is_some_and(|agent| {
+                agent.workspace() == request.workspace && agent.name() == &request.name
             })
-            .collect();
-        let agent = match matches.as_slice() {
-            [agent] => *agent,
-            [] => {
-                return Err(error(
-                    AgentErrorKind::AgentMissing,
-                    "Agent member is missing",
-                ));
-            }
-            _ => {
-                return Err(error(
-                    AgentErrorKind::InvalidRequest,
-                    "Agent member name is ambiguous",
-                ));
-            }
-        };
-        if world
-            .get_component::<ToolTasks>(agent)
-            .is_some_and(|tasks| !tasks.list().is_empty())
-        {
-            return Err(error(
-                AgentErrorKind::UnfinishedTasks,
-                "Agent has unfinished tool tasks",
-            ));
-        }
-        if !matches!(
-            world.get_component::<Agent>(agent).unwrap().state(),
-            AgentState::Running | AgentState::Starting | AgentState::Error
-        ) {
-            return Err(error(
-                AgentErrorKind::StateRejected,
-                "Agent is not Idle or Working",
-            ));
-        }
-        world.insert_component(
-            agent,
-            StartupBarrier(Arc::new(StartupCompletion::default())),
+        })
+    else {
+        deliver(
+            &reply,
+            Err(error(
+                AgentErrorKind::AgentMissing,
+                "Agent member is missing",
+            )),
         );
-        world.agent_transition(agent, AgentState::Stopping, None)?;
-        cancel_runtime(world, agent);
-        Ok(context(
-            world,
-            request.id.clone(),
+        return;
+    };
+    let owner = world
+        .get_component::<agent_core::AgentOwner>(agent)
+        .map_or(request.workspace, |owner| owner.0);
+    let (sender, receiver) = oneshot::channel();
+    handle_stop_agent(
+        world,
+        StopAgent {
+            id: request.id.clone(),
             agent,
-            AgentState::Stopping,
-            Some(request.parameters.clone()),
-            reply.clone(),
-        ))
-    })();
-    match prepared {
-        Err(error) => deliver(&reply, Err(error)),
-        Ok(context) => {
-            let schedule = world
-                .get_resource::<AgentInstalled>()
-                .unwrap()
-                .schedule
-                .clone();
-            world.send_async_closure(&schedule, move || guarded_restart(context));
+            reply: Arc::new(Mutex::new(Some(sender))),
+        },
+    );
+    let events = world.event_sender();
+    let schedule = world
+        .get_resource::<AgentInstalled>()
+        .unwrap()
+        .schedule
+        .clone();
+    world.send_async_closure(&schedule, move || async move {
+        match receiver.await {
+            Ok(Ok(_)) => events.send_event(StartAgent {
+                owner,
+                id: request.id,
+                workspace: request.workspace,
+                name: request.name,
+                parameters: request.parameters,
+                reply,
+            }),
+            Ok(Err(failure)) => deliver(&reply, Err(failure)),
+            Err(_) => deliver(
+                &reply,
+                Err(error(
+                    AgentErrorKind::CleanupFailed,
+                    "Agent stop reply was lost; restart cannot start",
+                )),
+            ),
         }
-    }
+        Ok::<_, async_runtime_plugin::AsyncTaskError>(())
+    });
 }
 pub(crate) fn handle_agent_exception(world: &mut World, event: AgentException) {
     if let Some(agent) = world.get_component::<Agent>(event.agent) {
@@ -558,20 +538,6 @@ pub(crate) fn handle_stop_result(world: &mut World, result: Result<StopOutput, S
             deliver(&output.reply, result);
         }
         Err(error) => failed_result(world, error, AgentState::Stopping),
-    }
-}
-pub(crate) fn handle_restart_result(
-    world: &mut World,
-    result: Result<RestartOutput, RestartError>,
-) {
-    match result {
-        Ok(output) => {
-            let result =
-                finish_result(world, output.agent, AgentState::Starting).map(|()| output.agent);
-            tracing::debug!(request=%output.id,"Agent restart finished");
-            deliver(&output.reply, result);
-        }
-        Err(error) => failed_result(world, error, AgentState::Starting),
     }
 }
 async fn with_world<T: Send + 'static>(
@@ -1006,26 +972,6 @@ async fn stop_flow(context: FlowContext) -> Result<StopOutput, StopError> {
         reply: context.reply,
     })
 }
-async fn restart_flow(mut context: FlowContext) -> Result<RestartOutput, RestartError> {
-    stop_runtime(&context, true)
-        .await
-        .map_err(|e| failed(&context, e, false))?;
-    let agent = context.agent;
-    let workspace = context.workspace;
-    with_world(&context, move |world| {
-        check_agent(world, agent, workspace, AgentState::Stopping)?;
-        world.agent_transition(agent, AgentState::Starting, None)
-    })
-    .await
-    .map_err(|e| failed(&context, e, false))?;
-    context.state = AgentState::Starting;
-    startup(&context).await?;
-    Ok(RestartOutput {
-        id: context.id,
-        agent: context.agent,
-        reply: context.reply,
-    })
-}
 async fn guarded_start(context: FlowContext) -> Result<StartOutput, StartError> {
     let retained = context.clone();
     let result = AssertUnwindSafe(start_flow(context))
@@ -1060,25 +1006,6 @@ async fn guarded_stop(context: FlowContext) -> Result<StopOutput, StopError> {
             ))
         })
 }
-async fn guarded_restart(context: FlowContext) -> Result<RestartOutput, RestartError> {
-    let retained = context.clone();
-    let result = AssertUnwindSafe(restart_flow(context))
-        .catch_unwind()
-        .await
-        .unwrap_or_else(|_| {
-            Err(failed(
-                &retained,
-                error(
-                    AgentErrorKind::CleanupFailed,
-                    "Agent restart flow panicked; cleanup is not confirmed",
-                ),
-                false,
-            ))
-        });
-    retained.startup.finish();
-    result
-}
-
 async fn wait_observers(
     observers: Vec<agent_core::AgentObservationWait>,
 ) -> Result<(), AgentError> {

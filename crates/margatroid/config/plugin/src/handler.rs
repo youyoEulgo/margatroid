@@ -1,6 +1,5 @@
 use config_core::{
     CidrBlock, ConfigError, FileToolConfig, IngressPolicy, LogLevel, MargatroidConfig,
-    OutboundTarget,
 };
 use serde::Deserialize;
 use std::fs::File;
@@ -52,15 +51,9 @@ pub(crate) fn read_config(path: &Path) -> Result<MargatroidConfig, ConfigError> 
             log.filter,
         ),
     };
-    MargatroidConfig::new(
-        bind,
-        log_level,
-        log_filter,
-        decode_targets(document.outbound.logs)?,
-        decode_targets(document.outbound.backend_state)?,
-    )?
-    .with_ingress(ingress)?
-    .with_tools(document.tools)
+    MargatroidConfig::new(bind, log_level, log_filter)?
+        .with_ingress(ingress)?
+        .with_tools(document.tools)
 }
 
 #[derive(Deserialize)]
@@ -68,7 +61,6 @@ pub(crate) fn read_config(path: &Path) -> Result<MargatroidConfig, ConfigError> 
 struct ConfigDocument {
     server: ServerDocument,
     log: Option<LogDocument>,
-    outbound: OutboundDocument,
     #[serde(default)]
     tools: FileToolConfig,
 }
@@ -85,13 +77,6 @@ struct ServerDocument {
 struct LogDocument {
     level: Option<String>,
     filter: Option<String>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct OutboundDocument {
-    logs: Vec<String>,
-    backend_state: Vec<String>,
 }
 
 fn decode_ingress(allow: Option<&toml::Value>) -> Result<IngressPolicy, ConfigError> {
@@ -116,18 +101,4 @@ fn decode_ingress(allow: Option<&toml::Value>) -> Result<IngressPolicy, ConfigEr
         }
         Some(_) => Err(ConfigError::InvalidIngress),
     }
-}
-
-fn decode_targets(targets: Vec<String>) -> Result<Vec<OutboundTarget>, ConfigError> {
-    targets
-        .into_iter()
-        .map(|target| match target.as_str() {
-            "broadcast" => Ok(OutboundTarget::Broadcast),
-            _ => match target.split_once(':') {
-                Some(("type", value)) => Ok(OutboundTarget::Type(value.into())),
-                Some(("name", value)) => Ok(OutboundTarget::Name(value.into())),
-                _ => Err(ConfigError::InvalidTarget),
-            },
-        })
-        .collect()
 }

@@ -1,10 +1,10 @@
 [package]
-name = "margatroid_daemon"
+name = "margatroid"
 version = "0.1.0"
 edition = "2021"
 
 [[bin]]
-name = "margatroid-daemon"
+name = "margatroid"
 path = "src/main.rs"
 
 [dependencies]

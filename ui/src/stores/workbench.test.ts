@@ -621,7 +621,7 @@ test('command results for a removed Agent cannot complete as success', async () 
     e.cleanup();
   }
 });
-test('workspace errors expose only a summary while Activity keeps the detail', async () => {
+test('workspace errors expose only a summary while local logs keep the detail', async () => {
   const e = setup([{ ...ws, address: null, status: 'inactive' }], []);
   try {
     const pending = e.store.startWorkspace(path);
@@ -636,7 +636,7 @@ test('workspace errors expose only a summary while Activity keeps the detail', a
       },
     });
     await assert.rejects(pending, /MemberFailed/);
-    assert.equal(e.store.workspaceNotice, 'Workspace operation failed — see Activity logs');
+    assert.equal(e.store.workspaceNotice, 'Workspace operation failed');
     assert.ok(e.store.logs.some((log) => log.message.includes('Lua task start failed')));
   } finally {
     e.cleanup();
@@ -1425,9 +1425,9 @@ test('an unpaired tool result stays as a standalone tool row', () => {
 });
 
 test('tool payloads render as readable TOML-like text', () => {
-  const value = { cmd: 'time sleep 9; echo "9 秒结束"', nested: { retry: 2 } };
+  const value = { cmd: 'time sleep 9; echo "9 seconds left"', nested: { retry: 2 } };
   const text = formatToolPayload(value);
-  assert.ok(text.includes(`cmd = 'time sleep 9; echo "9 秒结束"'`));
+  assert.ok(text.includes(`cmd = 'time sleep 9; echo "9 seconds left"'`));
   assert.ok(text.includes('[nested]'));
   assert.ok(text.includes('retry = 2'));
   assert.equal(formatToolPayload(JSON.stringify(value)), text);

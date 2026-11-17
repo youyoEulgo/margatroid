@@ -1779,7 +1779,7 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     } catch (error) {
       const detail = error instanceof Error ? error.message : String(error);
       addLog('ERROR', detail, 'ui.workspace');
-      workspaceNotice.value = 'Workspace operation failed — see Activity logs';
+      workspaceNotice.value = 'Workspace operation failed';
       throw error;
     } finally {
       workspaceOperationPending.value = false;

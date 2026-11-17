@@ -3,7 +3,7 @@ use std::process::Command;
 fn daemon_reports_missing_startup_configuration_without_creating_workspaces() {
     let home = tempfile::tempdir().unwrap();
     std::fs::create_dir(home.path().join(".margatroid")).unwrap();
-    let result = Command::new(env!("CARGO_BIN_EXE_margatroid-daemon"))
+    let result = Command::new(env!("CARGO_BIN_EXE_margatroid"))
         .env("HOME", home.path())
         .output()
         .unwrap();

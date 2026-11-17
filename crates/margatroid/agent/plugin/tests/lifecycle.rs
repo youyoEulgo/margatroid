@@ -523,60 +523,65 @@ fn stopping_agent_does_not_cancel_or_stop_an_independent_workspace_vm() {
         .is_empty());
 }
 #[test]
-fn restart_with_unfinished_tools_rejects_without_cancellation_or_vm_stop() {
-    let mut fixture = Fixture::new();
-    let agent = fixture.start();
-    let (task, _input) = new_tool_task(
-        fixture
+fn restart_stops_pending_and_returned_tasks_and_waits_for_real_cleanup_before_start() {
+    for returned in [false, true] {
+        let mut fixture = Fixture::new();
+        let agent = fixture.start();
+        let tasks = fixture
             .app
             .world()
             .get_component::<ToolTasks>(agent)
-            .unwrap(),
-    );
-    fixture
-        .app
-        .world()
-        .get_component::<ToolTasks>(agent)
-        .unwrap()
-        .register("unfinished".into(), task.clone())
+            .unwrap()
+            .clone();
+        let (task, _input) = new_tool_task(&tasks);
+        if returned {
+            task.return_result(Ok(tool_core::ToolExecuteResponse {
+                call_id: "call".into(),
+                alias: "tool".into(),
+                content: "registered".into(),
+                images: vec![],
+                failed: false,
+            }))
+            .unwrap();
+        }
+        tasks.register("persistent".into(), task.clone()).unwrap();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let (release, waiting) = oneshot::channel();
+        let cleanup = tasks.clone();
+        let handle = task.clone();
+        task.attach_task(runtime.spawn(async move {
+            waiting.await.unwrap();
+            cleanup.complete_cleanup("persistent", &handle, None);
+        }))
         .unwrap();
-    let mut reply = fixture.request_restart("restart", fixture.parameters.clone());
-    fixture.app.tick();
-    assert_eq!(
-        reply.try_recv().unwrap().unwrap_err().kind,
-        AgentErrorKind::UnfinishedTasks
-    );
-    assert!(!task.cancel_token().is_cancelled());
-    assert_eq!(
-        *fixture.app.world().agent_state(agent).unwrap(),
-        AgentState::Starting
-    );
-    assert!(
-        fixture
+        let mut response = fixture.request_restart("restart", fixture.parameters.clone());
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !task.cancel_token().is_cancelled() {
+            fixture.app.tick();
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        assert!(response.try_recv().is_err());
+        assert_eq!(
+            *fixture.app.world().agent_state(agent).unwrap(),
+            AgentState::Stopping
+        );
+        assert!(fixture
             .app
             .world()
-            .get_component::<MclQueue>(agent)
-            .unwrap()
-            .accepting
-    );
-    assert!(fixture
-        .app
-        .world()
-        .get_resource::<FakeDomains>()
-        .unwrap()
-        .vm_stops
-        .is_empty());
-    fixture
-        .app
-        .world()
-        .get_component::<ToolTasks>(agent)
-        .unwrap()
-        .complete_cleanup("unfinished", &task, None);
-    let mut stop = fixture.request_stop(agent, "stop");
-    wait(&mut fixture.app, &mut stop).unwrap();
+            .get_component::<AgentSession>(agent)
+            .is_some());
+        release.send(()).unwrap();
+        let new_agent = wait(&mut fixture.app, &mut response).unwrap();
+        assert_ne!(agent, new_agent);
+        assert!(!fixture.app.world().is_alive(agent));
+        assert!(task.is_cleanup_complete());
+        let mut stop = fixture.request_stop(new_agent, "stop");
+        wait(&mut fixture.app, &mut stop).unwrap();
+    }
 }
 #[test]
-fn restart_uses_new_driver_same_entity_and_preserves_database_settings_without_finished_tasks() {
+fn restart_creates_new_entity_and_preserves_database_settings() {
     let mut fixture = Fixture::new();
     let agent = fixture.start();
     let storage = fixture
@@ -644,7 +649,10 @@ fn restart_uses_new_driver_same_entity_and_preserves_database_settings_without_f
         .path()
         .join("agent-drivers/local/second/latest/ui");
     let mut reply = fixture.request_restart("restart", parameters);
-    assert_eq!(wait(&mut fixture.app, &mut reply).unwrap(), agent);
+    let previous = agent;
+    let agent = wait(&mut fixture.app, &mut reply).unwrap();
+    assert_ne!(agent, previous);
+    assert!(!fixture.app.world().is_alive(previous));
     assert_ne!(
         fixture
             .app
@@ -818,7 +826,7 @@ fn same_frame_stop_precedes_restart_and_duplicate_stop_is_rejected() {
         AgentState::Stopping
     );
     assert_eq!(
-        restart.try_recv().unwrap().unwrap_err().kind,
+        wait(&mut fixture.app, &mut restart).unwrap_err().kind,
         AgentErrorKind::StateRejected
     );
     let mut duplicate = fixture.request_stop(agent, "duplicate");

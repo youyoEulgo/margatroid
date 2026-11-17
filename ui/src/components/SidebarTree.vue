@@ -72,7 +72,7 @@ function stopWorkspace(workspace: SidebarWorkspace) {
           <button
             class="tree-main"
             type="button"
-            :title="`${workspace.path} · ${workspace.lifecycle}${workspace.reason ? ' · error (see Activity logs)' : ''}`"
+            :title="`${workspace.path} · ${workspace.lifecycle}${workspace.reason ? ' · error' : ''}`"
             @click="emit('toggleWorkspace', workspace.path)"
           >
             <FolderKanban class="tree-icon" :size="15" />
@@ -142,9 +142,7 @@ function stopWorkspace(workspace: SidebarWorkspace) {
               type="button"
               :disabled="!agent.id"
               :title="
-                agent.reason
-                  ? 'Agent error — see Activity logs'
-                  : agent.id || `${agent.name}: workspace is not running`
+                agent.reason ? 'Agent error' : agent.id || `${agent.name}: workspace is not running`
               "
               @click="agent.id && emit('selectAgent', agent.id, workspace.path)"
             >

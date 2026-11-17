@@ -36,13 +36,6 @@ pub(crate) struct StopOutput {
     pub member_errors: Vec<MemberDiagnostic>,
 }
 #[derive(Clone)]
-pub(crate) struct RestartOutput {
-    pub reply: WorkspaceOperationReply,
-    pub workspace: Entity,
-    pub members: Vec<Entity>,
-    pub member_errors: Vec<MemberDiagnostic>,
-}
-#[derive(Clone)]
 pub(crate) struct FlowError {
     pub reply: WorkspaceOperationReply,
     pub workspace: Option<Entity>,
@@ -52,7 +45,6 @@ pub(crate) struct FlowError {
 }
 pub(crate) type StartError = FlowError;
 pub(crate) type StopError = FlowError;
-pub(crate) type RestartError = FlowError;
 impl From<AsyncTaskError> for FlowError {
     fn from(error: AsyncTaskError) -> Self {
         Self {

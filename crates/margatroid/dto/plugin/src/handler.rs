@@ -521,30 +521,18 @@ converter!(
         })
     }
 );
-#[derive(Clone)]
-struct RestartInput {
-    target: AgentTargetDto,
-    snapshot: WorkspaceDefinitionSnapshot,
-}
 converter!(
     RestartAgentDto,
-    RestartInput,
+    AgentTargetDto,
     Entity,
     agent_core::AgentError,
     agent_core::RestartAgent,
-    |world: &World, r: &Prepared<RestartInput, Entity, agent_core::AgentError>| {
+    |world: &World, r: &Prepared<AgentTargetDto, Entity, agent_core::AgentError>| {
         client(world, r.ticket.connection)?;
-        let entity = agent(world, &r.input.target.address)?;
+        let entity = agent(world, &r.input.address)?;
         let a = world.get_component::<Agent>(entity).unwrap();
         let workspace = a.workspace();
         let name = a.name().clone();
-        let definition = world
-            .get_component::<Workspace>(workspace)
-            .ok_or_else(|| error("WorkspaceMissing", "Workspace missing"))?;
-        r.input
-            .snapshot
-            .get(&definition.definition_path)
-            .ok_or_else(|| error("DefinitionMissing", "Workspace definition is absent"))?;
         let parameters = world
             .get_component::<agent_core::AgentResources>(entity)
             .ok_or_else(|| error("ResourcesMissing", "Agent creation parameters are missing"))?
@@ -890,26 +878,7 @@ async fn prepare_request(
             )
         }
         ClientMessage::AgentRestart { message, .. } => {
-            let definitions = state.definitions.clone();
-            let snapshot = tokio::task::spawn_blocking(move || definitions.reload())
-                .await
-                .map_err(|_| {
-                    frame(
-                        &response,
-                        &id,
-                        Err(error("ReloadFailed", "definition worker failed")),
-                    )
-                })?
-                .map_err(|e| frame(&response, &id, Err(e.external())))?;
-            build!(
-                RestartInput {
-                    target: message,
-                    snapshot
-                },
-                Entity,
-                agent_core::AgentError,
-                minimal
-            )
+            build!(message, Entity, agent_core::AgentError, minimal)
         }
         ClientMessage::AgentStop { message, .. } => {
             build!(message, Entity, agent_core::AgentError, minimal)

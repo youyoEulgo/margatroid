@@ -81,7 +81,7 @@ agent.task.req/res/sync读取状态不消费task_read游标、不清除replaced�
 
 连接注册每个新WebSocket执行一次，成功返回实际Client地址及client_type，不把注册类别当认证。注册成功不隐含下载所有Workspace/Agent历史。断线不证明原命令未执行，具体在途收口与数据投递归公共连接及DTO职责，不在Protocol引入额外执行事件。
 
-Workspace与Agent启动/重启的定义来源统一为“全量重载 → 发布缓存 → 从本次缓存快照启动”。workspace.reload只重载，不启动；没有针对单个Workspace独立回源的启动路径。任何全量加载失败都不使用旧缓存继续启动，重启在新缓存目标校验成功后才关闭原实例。网络字段不因此新增配置正文或缓存版本参数。
+Workspace与Agent启动/重启的定义来源统一为“全量重载 → 发布缓存 → 从本次缓存快照启动”。workspace.reload只重载，不启动；没有针对单个Workspace独立回源的启动路径。任何全量加载失败都不使用旧缓存继续启动，重启先完整关闭旧实例，再由普通启动执行其校验与加载；不在关闭前预检新定义。网络字段不因此新增配置正文或缓存版本参数。
 
 ServerMessage的Serialize与Deserialize共同校验成功/失败分支；成功分页两个游标始终输出、空值为null，失败省略游标和成功数据。ClientMessage::id返回&str，ServerMessage::id返回Option<&str>，sync始终为None。纯协议类型不会创建领域事件。
 
@@ -110,4 +110,6 @@ Rust类型、机器Schema和可执行样例已同步，AsyncAPI引用新Schema�
 推理失败的mcl.execute.result为success=true、data.kind=inference，其value.message是error AgentMessage且value.stop_reason=error；原请求id保留。success仅表示MCL成功交付领域结果，不表示模型推理成功。compact()由调用方把成功compact或失败error写入历史，前端可查询并展示二者。
 
 models.toml现支持每次推理前有界重读并按id选择，文件损坏/删除或id缺失均失败，不回退启动快照。既有ModelRoutes只服务最近安全公共投影；有效文件改动刷新Agent安全model信息，无效文件清空投影。
-model.config.req/res/sync及model.config.update/update.result已实现，读取/同步原始TOML供编辑，修改完整校验后原子覆盖同一文件并保留权限；外部编辑/原子替换/删除也触发同一来源监控。无需Workspace、Agent或turn，不接收客户端文件路径，不新增持久目录/数据库或领域System/事件。接口遵循原注册、ingress、backend_state目标和id关联规则；前端源码未改。
+model.config.req/res/sync及model.config.update/update.result已实现，读取/同步原始TOML供编辑，修改完整校验后原子覆盖同一文件并保留权限；外部编辑/原子替换/删除也触发同一来源监控。无需Workspace、Agent或turn，不接收客户端文件路径，不新增持久目录/数据库或领域System/事件。接口遵循原注册、ingress、固定webui目标和id关联规则；前端源码未改。
+
+Workspace/Agent重启是原停止和启动请求的顺序封装：停止成功后才启动，任一步失败原样回复；不因ToolTasks非空拒绝、不单独保留Entity、不提前reload或创建特殊重启状态。新实例重新创建Entity/Session，Address由普通启动规则产生，前端应按新目录同步处理旧来源退出和新来源出现。

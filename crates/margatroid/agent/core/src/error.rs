@@ -5,7 +5,6 @@ pub enum AgentErrorKind {
     InvalidRequest,
     AgentMissing,
     StateRejected,
-    UnfinishedTasks,
     StartFailed,
     StopFailed,
     RestartFailed,

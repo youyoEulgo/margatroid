@@ -106,8 +106,11 @@ fn original_websocket_can_query_inactive_workspaces_and_no_agents_after_last_sto
     std::fs::write(&definition, format!(
         "name: post-stop\nproject_root: {}\nmembers:\n  - name: coder\n    driver: driver:local/coder:latest\n    home_root: {}\n",
         project.display(), root.path().display())).unwrap();
-    std::fs::write(root.path().join("config.toml"),
-        "[server]\nbind='127.0.0.1:0'\n[outbound]\nlogs=['type:unmatched']\nbackend_state=['type:webui']\n").unwrap();
+    std::fs::write(
+        root.path().join("config.toml"),
+        "[server]\nbind='127.0.0.1:0'\n",
+    )
+    .unwrap();
     // The route is configuration only. No user messages or inference effects
     // are submitted, and this test does not need a provider or external network.
     let driver_settings = agent_driver_core::read_initial_settings(

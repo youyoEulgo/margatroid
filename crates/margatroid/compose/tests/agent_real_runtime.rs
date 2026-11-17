@@ -269,7 +269,7 @@ fn mcl(
     receiver
 }
 #[test]
-fn real_agent_restart_replaces_only_its_session_and_preserves_persistent_blocks() {
+fn real_agent_restart_recreates_entity_and_session_and_preserves_persistent_blocks() {
     let root = tempfile::tempdir().unwrap();
     seed(root.path());
     let mut fixture = Fixture::open(root.path());
@@ -328,7 +328,10 @@ fn real_agent_restart_replaces_only_its_session_and_preserves_persistent_blocks(
         parameters: fixture.parameters.clone(),
         reply: Arc::new(Mutex::new(Some(tx))),
     });
-    assert_eq!(wait(&mut fixture.app, &mut rx).unwrap(), agent);
+    let previous = agent;
+    let agent = wait(&mut fixture.app, &mut rx).unwrap();
+    assert_ne!(previous, agent);
+    assert!(!fixture.app.world().is_alive(previous));
     let current = fixture
         .app
         .world()

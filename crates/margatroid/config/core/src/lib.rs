@@ -2,12 +2,9 @@ mod error;
 pub mod types;
 
 pub use error::ConfigError;
-pub use types::{
-    CidrBlock, FileToolConfig, IngressPolicy, IngressRequest, LogLevel, OutboundTarget,
-};
+pub use types::{CidrBlock, FileToolConfig, IngressPolicy, IngressRequest, LogLevel};
 
 use core_plugin::Resource;
-use std::collections::HashSet;
 use std::net::SocketAddr;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -16,8 +13,6 @@ pub struct MargatroidConfig {
     ingress: IngressPolicy,
     log_level: LogLevel,
     log_filter: Option<String>,
-    logs: Vec<OutboundTarget>,
-    backend_state: Vec<OutboundTarget>,
     tools: FileToolConfig,
 }
 
@@ -26,11 +21,7 @@ impl MargatroidConfig {
         server_bind: SocketAddr,
         log_level: LogLevel,
         log_filter: Option<String>,
-        logs: Vec<OutboundTarget>,
-        backend_state: Vec<OutboundTarget>,
     ) -> Result<Self, ConfigError> {
-        validate_targets(&logs)?;
-        validate_targets(&backend_state)?;
         if log_filter
             .as_deref()
             .is_some_and(|filter| filter.trim().is_empty())
@@ -42,8 +33,6 @@ impl MargatroidConfig {
             ingress: IngressPolicy::Localhost,
             log_level,
             log_filter,
-            logs,
-            backend_state,
             tools: FileToolConfig::default(),
         })
     }
@@ -88,35 +77,6 @@ impl MargatroidConfig {
     pub fn log_filter(&self) -> Option<&str> {
         self.log_filter.as_deref()
     }
-
-    pub fn logs(&self) -> &[OutboundTarget] {
-        &self.logs
-    }
-
-    pub fn backend_state(&self) -> &[OutboundTarget] {
-        &self.backend_state
-    }
 }
 
 impl Resource for MargatroidConfig {}
-
-fn validate_targets(targets: &[OutboundTarget]) -> Result<(), ConfigError> {
-    if targets.is_empty() {
-        return Err(ConfigError::InvalidTarget);
-    }
-    let mut unique = HashSet::new();
-    for target in targets {
-        match target {
-            OutboundTarget::Broadcast => (),
-            OutboundTarget::Type(value) | OutboundTarget::Name(value) => {
-                if value.trim().is_empty() || value.chars().any(char::is_control) {
-                    return Err(ConfigError::InvalidTarget);
-                }
-            }
-        }
-        if !unique.insert(target) {
-            return Err(ConfigError::DuplicateTarget);
-        }
-    }
-    Ok(())
-}

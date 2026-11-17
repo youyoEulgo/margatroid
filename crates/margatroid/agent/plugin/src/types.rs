@@ -32,12 +32,6 @@ pub(crate) struct StopOutput {
     pub reply: Reply,
 }
 #[derive(Clone)]
-pub(crate) struct RestartOutput {
-    pub id: String,
-    pub agent: Entity,
-    pub reply: Reply,
-}
-#[derive(Clone)]
 pub(crate) struct FlowError {
     pub id: String,
     pub agent: Option<Entity>,
@@ -48,7 +42,6 @@ pub(crate) struct FlowError {
 }
 pub(crate) type StartError = FlowError;
 pub(crate) type StopError = FlowError;
-pub(crate) type RestartError = FlowError;
 impl From<AsyncTaskError> for FlowError {
     fn from(error: AsyncTaskError) -> Self {
         Self {

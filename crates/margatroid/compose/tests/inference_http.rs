@@ -180,8 +180,6 @@ impl Fixture {
                     "127.0.0.1:0".parse().unwrap(),
                     config_core::LogLevel::Info,
                     None,
-                    vec![config_core::OutboundTarget::Broadcast],
-                    vec![config_core::OutboundTarget::Broadcast],
                 )
                 .unwrap(),
             );

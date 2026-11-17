@@ -14,7 +14,11 @@ fn assembly_reports_domain_and_path_before_starting_services() {
         .expect("missing config should fail");
     assert_eq!(error.domain, "config");
     assert_eq!(error.path, root.path().join("config.toml"));
-    fs::write(root.path().join("config.toml"),"[server]\nbind='127.0.0.1:0'\n[outbound]\nlogs=['broadcast']\nbackend_state=['broadcast']\n").unwrap();
+    fs::write(
+        root.path().join("config.toml"),
+        "[server]\nbind='127.0.0.1:0'\n",
+    )
+    .unwrap();
     let error = build_app(options)
         .err()
         .expect("missing model routes should fail");

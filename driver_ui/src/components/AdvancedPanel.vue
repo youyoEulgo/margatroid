@@ -6,6 +6,7 @@ import { useWorkbenchStore } from "@/stores/workbench";
 import { imageSource } from "@/lib/images";
 import { X } from "lucide-vue-next";
 import FormSelect from "@/components/FormSelect.vue";
+import ToolSchemaField from "@/components/ToolSchemaField.vue";
 
 interface SchemaField {
   key: string;
@@ -13,21 +14,23 @@ interface SchemaField {
   required: boolean;
 }
 
-interface InitField {
-  key: string;
+interface InitArg {
+  kind: "json" | "text" | "number" | "select";
   label: string;
+  inline?: boolean;
   placeholder?: string;
-  type?: "text" | "json" | "boolean";
-  wide?: boolean;
+  options?: { value: string; label: string }[];
 }
 interface InitTemplate {
   id: string;
   label: string;
-  fields: InitField[];
+  template: string;
+  args: InitArg[];
 }
 interface CustomInit {
   template: string;
-  fields: Record<string, string | boolean>;
+  values: string[];
+  active: number | null;
   command: string;
   argumentsText: string;
 }
@@ -36,323 +39,168 @@ const INIT_TEMPLATES: InitTemplate[] = [
   {
     id: "import_tool",
     label: "IMPORT TOOL",
-    fields: [
+    template: "IMPORT TOOL <arg1> AS <arg2>",
+    args: [
       {
-        key: "resource",
-        label: "Tool resource",
+        kind: "text",
+        label: "resource",
+        inline: true,
         placeholder: "tool:local/read-file:latest",
       },
-      { key: "alias", label: "Alias", placeholder: "read_file" },
+      { kind: "text", label: "alias", inline: true, placeholder: "read_file" },
     ],
   },
   {
     id: "import_message",
     label: "IMPORT MESSAGE",
-    fields: [
+    template: "IMPORT MESSAGE <arg1> AS <arg2>",
+    args: [
       {
-        key: "resource",
-        label: "Message resource",
+        kind: "text",
+        label: "resource",
+        inline: true,
         placeholder: "prompt:local/coder-soul:latest",
       },
-      { key: "alias", label: "Alias", placeholder: "soul" },
+      { kind: "text", label: "alias", inline: true, placeholder: "soul" },
     ],
   },
   {
     id: "import_sandbox",
     label: "IMPORT SANDBOX",
-    fields: [
+    template: "IMPORT SANDBOX <arg1> AS <arg2>",
+    args: [
       {
-        key: "resource",
-        label: "Sandbox resource",
+        kind: "text",
+        label: "resource",
+        inline: true,
         placeholder: "sandbox:local/read-only:latest",
       },
-      { key: "alias", label: "Alias", placeholder: "read_only" },
+      { kind: "text", label: "alias", inline: true, placeholder: "read_only" },
     ],
   },
   {
     id: "inject",
     label: "INJECT messages",
-    fields: [
+    template: "INJECT <arg1> TO <arg2>",
+    args: [
       {
-        key: "target",
-        label: "Target",
-        placeholder: "session.conversation[-1]",
+        kind: "json",
+        label: "messages",
+        placeholder: '[{"type":"system","content":""}]',
       },
       {
-        key: "messages",
-        label: "Messages (JSON array)",
-        type: "json",
-        wide: true,
-        placeholder: '[{"type":"system","content":""}]',
+        kind: "text",
+        label: "target",
+        inline: true,
+        placeholder: "session.conversation[-1]",
       },
     ],
   },
   {
     id: "config_set",
     label: "CONFIG SET",
-    fields: [
-      {
-        key: "path",
-        label: "Dotted path",
-        placeholder: "compaction.threshold",
-      },
-      { key: "value", label: "Value (JSON)", type: "json", placeholder: "0.8" },
+    template: "CONFIG SET <arg1> <arg2>",
+    args: [
+      { kind: "text", label: "path", placeholder: "compaction.threshold" },
+      { kind: "json", label: "value", placeholder: "0.8" },
     ],
   },
   {
     id: "config_delete",
     label: "CONFIG DELETE",
-    fields: [
-      { key: "path", label: "Dotted path", placeholder: "custom.option" },
-    ],
+    template: "CONFIG DELETE <arg1>",
+    args: [{ kind: "text", label: "path", placeholder: "custom.option" }],
   },
   {
     id: "create_block",
     label: "CREATE BLOCK",
-    fields: [
-      { key: "name", label: "Block name", placeholder: "session" },
-      { key: "fields", label: "Fields", placeholder: "conversation" },
-      { key: "temp", label: "Temporary", type: "boolean" },
+    template: "CREATE BLOCK <arg1> (<arg2>)",
+    args: [
+      { kind: "text", label: "name", inline: true, placeholder: "session" },
+      {
+        kind: "text",
+        label: "fields",
+        inline: true,
+        placeholder: "conversation",
+      },
+    ],
+  },
+  {
+    id: "create_temp_block",
+    label: "CREATE TEMP BLOCK",
+    template: "CREATE TEMP BLOCK <arg1> (<arg2>)",
+    args: [
+      { kind: "text", label: "name", inline: true, placeholder: "entry" },
+      { kind: "text", label: "fields", inline: true, placeholder: "pending" },
     ],
   },
   {
     id: "snapshot",
     label: "EFFECT block_snapshot",
-    fields: [{ key: "block", label: "Block", placeholder: "session" }],
+    template: "EFFECT block_snapshot <arg1>",
+    args: [
+      {
+        kind: "select",
+        label: "block",
+        options: [{ value: "session", label: "session" }],
+      },
+    ],
   },
   {
     id: "restore",
     label: "EFFECT block_restore",
-    fields: [
-      { key: "block", label: "Block", placeholder: "session" },
-      { key: "snapshot", label: "Snapshot id", placeholder: "1" },
+    template: "EFFECT block_restore <arg1> <arg2>",
+    args: [
+      {
+        kind: "select",
+        label: "block",
+        options: [{ value: "session", label: "session" }],
+      },
+      { kind: "number", label: "snapshot id", placeholder: "1" },
     ],
   },
   {
     id: "sandbox_use",
     label: "EFFECT sandbox_use",
-    fields: [
-      {
-        key: "aliases",
-        label: "Aliases (JSON array)",
-        type: "json",
-        wide: true,
-        placeholder: '["read_only"]',
-      },
-    ],
+    template: "EFFECT sandbox_use <arg1>",
+    args: [{ kind: "json", label: "aliases", placeholder: '["read_only"]' }],
   },
   {
     id: "tool_call",
     label: "EFFECT tool_call",
-    fields: [
-      {
-        key: "calls",
-        label: "Tool calls (JSON array)",
-        type: "json",
-        wide: true,
-        placeholder: '[{"id":"call","tool_name":"read_file","arguments":"{}"}]',
-      },
-    ],
+    template: "EFFECT tool_call <arg1>",
+    args: [{ kind: "json", label: "tool calls", placeholder: "[]" }],
   },
   {
     id: "effect",
-    label: "EFFECT (no arguments)",
-    fields: [
+    label: "EFFECT",
+    template: "EFFECT <arg1>",
+    args: [
       {
-        key: "effect",
-        label: "Effect",
-        placeholder: "wake / start_turn / finish_turn / ready",
+        kind: "select",
+        label: "effect",
+        inline: true,
+        options: ["wake", "start_turn", "finish_turn", "ready"].map(
+          (value) => ({ value, label: value }),
+        ),
       },
     ],
   },
   {
     id: "custom",
     label: "Custom command",
-    fields: [
+    template: "<arg1>",
+    args: [
       {
-        key: "command",
-        label: "MCL command",
-        wide: true,
+        kind: "text",
+        label: "command",
+        inline: true,
         placeholder: "GET session.conversation",
       },
-      {
-        key: "arguments",
-        label: "Arguments (JSON array)",
-        type: "json",
-        wide: true,
-        placeholder: "[]",
-      },
+      { kind: "json", label: "arguments", placeholder: "[]" },
     ],
   },
 ];
-
-function templateById(id: string): InitTemplate {
-  return (
-    INIT_TEMPLATES.find((template) => template.id === id) ?? INIT_TEMPLATES[0]!
-  );
-}
-
-function templateFields(id: string): InitField[] {
-  return templateById(id).fields;
-}
-
-function initFields(id: string): Record<string, string | boolean> {
-  const fields: Record<string, string | boolean> = {};
-  for (const field of templateFields(id))
-    fields[field.key] = field.type === "boolean" ? false : "";
-  return fields;
-}
-
-function jsonField(value: string): unknown {
-  try {
-    return JSON.parse(value);
-  } catch {
-    return undefined;
-  }
-}
-
-function storedArguments(item: Record<string, unknown>): unknown[] {
-  return Array.isArray(item.arguments) ? item.arguments : [];
-}
-
-function inferTemplate(
-  command: string,
-  args: unknown[],
-): { template: string; fields: Record<string, string | boolean> } {
-  const value = (index: number) => JSON.stringify(args[index] ?? null);
-  let match = /^IMPORT (TOOL|MESSAGE|SANDBOX)\s+(\S+)\s+AS\s+(\S+)/u.exec(
-    command,
-  );
-  if (match)
-    return {
-      template:
-        match[1] === "TOOL"
-          ? "import_tool"
-          : match[1] === "MESSAGE"
-            ? "import_message"
-            : "import_sandbox",
-      fields: { resource: match[2] ?? "", alias: match[3] ?? "" },
-    };
-  match = /^INJECT \? TO (.+)$/u.exec(command);
-  if (match)
-    return {
-      template: "inject",
-      fields: { target: match[1] ?? "", messages: value(0) },
-    };
-  if (command === "CONFIG SET ? ?")
-    return {
-      template: "config_set",
-      fields: { path: String(args[0] ?? ""), value: value(1) },
-    };
-  if (command === "CONFIG DELETE ?")
-    return {
-      template: "config_delete",
-      fields: { path: String(args[0] ?? "") },
-    };
-  match = /^CREATE (TEMP )?BLOCK (\S+) \((.+)\)$/u.exec(command);
-  if (match)
-    return {
-      template: "create_block",
-      fields: {
-        temp: !!match[1],
-        name: match[2] ?? "",
-        fields: match[3] ?? "",
-      },
-    };
-  if (command === "EFFECT block_snapshot ?")
-    return { template: "snapshot", fields: { block: String(args[0] ?? "") } };
-  if (command === "EFFECT block_restore ? ?")
-    return {
-      template: "restore",
-      fields: { block: String(args[0] ?? ""), snapshot: String(args[1] ?? "") },
-    };
-  if (command === "EFFECT sandbox_use ?")
-    return { template: "sandbox_use", fields: { aliases: value(0) } };
-  if (command === "EFFECT tool_call ?")
-    return { template: "tool_call", fields: { calls: value(0) } };
-  match = /^EFFECT (wake|start_turn|finish_turn|ready)$/u.exec(command);
-  if (match) return { template: "effect", fields: { effect: match[1] ?? "" } };
-  return {
-    template: "custom",
-    fields: { command, arguments: JSON.stringify(args, null, 2) },
-  };
-}
-
-function applyTemplate(item: CustomInit) {
-  const f = item.fields;
-  const text = (key: string) => String(f[key] ?? "").trim();
-  const json = (key: string) => jsonField(String(f[key] ?? ""));
-  let command = "";
-  let args: unknown[] = [];
-  switch (item.template) {
-    case "import_tool":
-    case "import_message":
-    case "import_sandbox":
-      command = `IMPORT ${item.template === "import_tool" ? "TOOL" : item.template === "import_message" ? "MESSAGE" : "SANDBOX"} ${text("resource")} AS ${text("alias")}`;
-      break;
-    case "inject":
-      command = `INJECT ? TO ${text("target")}`;
-      args = [json("messages")];
-      break;
-    case "config_set":
-      command = "CONFIG SET ? ?";
-      args = [text("path"), json("value")];
-      break;
-    case "config_delete":
-      command = "CONFIG DELETE ?";
-      args = [text("path")];
-      break;
-    case "create_block":
-      command = `CREATE ${f.temp ? "TEMP " : ""}BLOCK ${text("name")} (${text("fields")})`;
-      break;
-    case "snapshot":
-      command = "EFFECT block_snapshot ?";
-      args = [text("block")];
-      break;
-    case "restore":
-      command = "EFFECT block_restore ? ?";
-      args = [
-        text("block"),
-        /^\d+$/u.test(text("snapshot"))
-          ? Number(text("snapshot"))
-          : text("snapshot"),
-      ];
-      break;
-    case "sandbox_use":
-      command = "EFFECT sandbox_use ?";
-      args = [json("aliases")];
-      break;
-    case "tool_call":
-      command = "EFFECT tool_call ?";
-      args = [json("calls")];
-      break;
-    case "effect":
-      command = `EFFECT ${text("effect")}`;
-      break;
-    default:
-      command = text("command");
-      args = json("arguments") as unknown[];
-  }
-  item.command = command;
-  item.argumentsText =
-    args === undefined || args.some((value) => value === undefined)
-      ? ""
-      : JSON.stringify(args, null, 2);
-}
-
-function itemForStored(item: Record<string, unknown>): CustomInit {
-  const command = typeof item.command === "string" ? item.command : "";
-  const args = storedArguments(item);
-  const inferred = inferTemplate(command, args);
-  const custom: CustomInit = {
-    template: inferred.template,
-    fields: inferred.fields,
-    command,
-    argumentsText: JSON.stringify(args, null, 2),
-  };
-  applyTemplate(custom);
-  return custom;
-}
 
 const emit = defineEmits<{ close: [] }>();
 const store = useWorkbenchStore();
@@ -414,22 +262,52 @@ function fieldEnum(field: SchemaField): unknown[] | null {
   return Array.isArray(field.schema.enum) ? field.schema.enum : null;
 }
 
-function isComplex(field: SchemaField): boolean {
-  return ["array", "object"].includes(fieldType(field));
+function itemsSchema(field: SchemaField): Record<string, unknown> | null {
+  return isRecord(field.schema.items) ? field.schema.items : null;
 }
 
-function defaultValue(field: SchemaField): unknown {
-  if ("default" in field.schema) return field.schema.default;
-  switch (fieldType(field)) {
+function itemType(field: SchemaField): string {
+  const type = itemsSchema(field)?.type;
+  return typeof type === "string" ? type : "string";
+}
+
+function itemEnum(field: SchemaField): unknown[] | null {
+  const items = itemsSchema(field);
+  return items && Array.isArray(items.enum) ? items.enum : null;
+}
+
+function itemIsJson(field: SchemaField): boolean {
+  return ["array", "object"].includes(itemType(field));
+}
+
+function schemaDefault(schema: Record<string, unknown>): unknown {
+  if ("default" in schema) return schema.default;
+  if ("const" in schema) return schema.const;
+  if (Array.isArray(schema.oneOf) && isRecord(schema.oneOf[0])) {
+    const variant = schema.oneOf[0];
+    const value: Record<string, unknown> = {};
+    if (
+      isRecord(variant.properties) &&
+      isRecord(variant.properties.transport) &&
+      "const" in variant.properties.transport
+    )
+      value.transport = variant.properties.transport.const;
+    return value;
+  }
+  switch (typeof schema.type === "string" ? schema.type : "") {
     case "boolean":
       return false;
     case "array":
-      return "[]";
+      return [];
     case "object":
-      return "{}";
+      return {};
     default:
       return "";
   }
+}
+
+function defaultValue(field: SchemaField): unknown {
+  return schemaDefault(field.schema);
 }
 
 function resetTool() {
@@ -451,8 +329,65 @@ function valueOf(field: SchemaField): string {
       : String(value);
 }
 
-function setValue(field: SchemaField, value: string | boolean) {
+function setValue(field: SchemaField, value: unknown) {
   toolValues.value[field.key] = value;
+}
+
+function enumOptions(values: unknown[]) {
+  return values.map((value) => ({
+    value: String(value),
+    label: String(value),
+  }));
+}
+
+function setEnumValue(field: SchemaField, value: string) {
+  toolValues.value[field.key] =
+    fieldEnum(field)?.find((option) => String(option) === value) ?? value;
+}
+
+function arrayValue(field: SchemaField): unknown[] {
+  const value = toolValues.value[field.key];
+  return Array.isArray(value) ? value : [];
+}
+
+function arrayItemValue(field: SchemaField, index: number): string {
+  const value = arrayValue(field)[index];
+  return typeof value === "string"
+    ? value
+    : value === undefined || value === null
+      ? ""
+      : String(value);
+}
+
+function setArrayItem(field: SchemaField, index: number, value: unknown) {
+  const values = [...arrayValue(field)];
+  values[index] = value;
+  toolValues.value[field.key] = values;
+}
+
+function addArrayItem(field: SchemaField) {
+  const values = [...arrayValue(field)];
+  const enumValue = itemEnum(field)?.[0];
+  if (enumValue !== undefined) values.push(enumValue);
+  else if (itemType(field) === "boolean") values.push(false);
+  else if (itemIsJson(field))
+    values.push(itemType(field) === "array" ? "[]" : "{}");
+  else values.push("");
+  toolValues.value[field.key] = values;
+}
+
+function removeArrayItem(field: SchemaField, index: number) {
+  const values = [...arrayValue(field)];
+  values.splice(index, 1);
+  toolValues.value[field.key] = values;
+}
+
+function enumArrayItem(field: SchemaField, index: number, value: string) {
+  setArrayItem(
+    field,
+    index,
+    itemEnum(field)?.find((option) => String(option) === value) ?? value,
+  );
 }
 
 function visibleToolResult(result: unknown): AgentMessage[] {
@@ -464,6 +399,75 @@ function visibleToolResult(result: unknown): AgentMessage[] {
     return [];
   return result.Array.Message.filter(isAgentMessage);
 }
+
+function validateSchemaValue(
+  schema: Record<string, unknown>,
+  value: unknown,
+  path: string,
+): string | null {
+  if (Array.isArray(schema.oneOf) && isRecord(value)) {
+    const variant = schema.oneOf.find(
+      (item) =>
+        isRecord(item) &&
+        (!isRecord(item.properties) ||
+          !isRecord(item.properties.transport) ||
+          !("const" in item.properties.transport) ||
+          value.transport === item.properties.transport.const),
+    );
+    if (isRecord(variant)) return validateSchemaValue(variant, value, path);
+  }
+  if (
+    typeof schema.type === "string" &&
+    schema.type !== typeof value &&
+    !(schema.type === "integer" && typeof value === "number")
+  ) {
+    return `${path} has the wrong type`;
+  }
+  if (typeof value === "string") {
+    if (typeof schema.minLength === "number" && value.length < schema.minLength)
+      return `${path} is too short`;
+    if (typeof schema.maxLength === "number" && value.length > schema.maxLength)
+      return `${path} is too long`;
+    if (
+      typeof schema.pattern === "string" &&
+      !new RegExp(schema.pattern).test(value)
+    )
+      return `${path} does not match the required pattern`;
+  }
+  if (Array.isArray(value) && isRecord(schema.items)) {
+    for (const [index, item] of value.entries()) {
+      const issue = validateSchemaValue(
+        schema.items,
+        item,
+        `${path}[${index}]`,
+      );
+      if (issue) return issue;
+    }
+  }
+  if (isRecord(value) && isRecord(schema.properties)) {
+    const required = Array.isArray(schema.required)
+      ? schema.required.filter((key): key is string => typeof key === "string")
+      : [];
+    for (const key of required) {
+      const child = value[key];
+      if (child === undefined || child === null || child === "")
+        return `${path}.${key} is required`;
+    }
+    for (const [key, child] of Object.entries(schema.properties)) {
+      if (!isRecord(child) || !(key in value)) continue;
+      const issue = validateSchemaValue(child, value[key], `${path}.${key}`);
+      if (issue) return issue;
+    }
+  }
+  return null;
+}
+
+const toolArgumentsPreview = computed(() => {
+  const args: Record<string, unknown> = {};
+  for (const field of schemaFields.value)
+    args[field.key] = toolValues.value[field.key] ?? null;
+  return JSON.stringify(args, null, 2);
+});
 
 async function invokeTool() {
   if (!selectedTool.value || !selectedAgentReady.value || busy.value) return;
@@ -477,23 +481,12 @@ async function invokeTool() {
       return;
     }
     if (raw === undefined || raw === null || raw === "") continue;
-    if (isComplex(field)) {
-      try {
-        args[field.key] = JSON.parse(String(raw));
-      } catch {
-        toolError.value = `${field.key} must be valid JSON`;
-        return;
-      }
-    } else if (fieldType(field) === "boolean") args[field.key] = raw === true;
-    else if (["number", "integer"].includes(fieldType(field))) {
-      const number = Number(raw);
-      if (!Number.isFinite(number)) {
-        toolError.value = `${field.key} must be a number`;
-        return;
-      }
-      args[field.key] =
-        fieldType(field) === "integer" ? Math.trunc(number) : number;
-    } else args[field.key] = raw;
+    const issue = validateSchemaValue(field.schema, raw, field.key);
+    if (issue) {
+      toolError.value = issue;
+      return;
+    }
+    args[field.key] = raw;
   }
   busy.value = true;
   try {
@@ -511,7 +504,7 @@ async function invokeTool() {
         { type: "system", content: JSON.stringify(result, null, 2) },
       ];
   } catch {
-    toolError.value = "Tool call failed — see Activity logs";
+    toolError.value = "Tool call failed";
   } finally {
     busy.value = false;
   }
@@ -548,7 +541,7 @@ async function loadSession() {
       sessionDraft.value = '{\n  "type": "user",\n  "content": ""\n}';
     }
   } catch {
-    sessionNotice.value = "Could not load session — see Activity logs";
+    sessionNotice.value = "Could not load session";
   } finally {
     sessionLoading.value = false;
   }
@@ -573,7 +566,7 @@ async function sessionCommand(command: string, args: unknown[]) {
     await store.executeMclCommand(command, args);
     await loadSession();
   } catch {
-    sessionNotice.value = "Session update failed — see Activity logs";
+    sessionNotice.value = "Session update failed";
   } finally {
     busy.value = false;
   }
@@ -617,12 +610,173 @@ async function snapshotSession() {
   sessionNotice.value = "Session snapshot requested.";
 }
 
+function tryParseJson(value: string): unknown {
+  try {
+    return JSON.parse(value);
+  } catch {
+    return undefined;
+  }
+}
+
+function readableValue(value: unknown, depth = 0): string {
+  const indent = "  ".repeat(depth);
+  if (Array.isArray(value)) {
+    if (!value.length) return "[]";
+    return `[\n${value
+      .map(
+        (item) => `${"  ".repeat(depth + 1)}${readableValue(item, depth + 1)}`,
+      )
+      .join(",\n")}\n${indent}]`;
+  }
+  if (isRecord(value)) {
+    const entries = Object.entries(value);
+    if (!entries.length) return "{}";
+    return `{\n${entries
+      .map(
+        ([key, item]) =>
+          `${"  ".repeat(depth + 1)}${key}: ${readableValue(item, depth + 1)}`,
+      )
+      .join(",\n")}\n${indent}}`;
+  }
+  if (typeof value === "string") return value;
+  return String(value);
+}
+
+function readableArguments(value: string): string {
+  const parsed = tryParseJson(value);
+  return parsed === undefined ? value : readableValue(parsed);
+}
+
+const sessionPreview = computed<AgentMessage | null>(() => {
+  const parsed = tryParseJson(sessionDraft.value);
+  if (isAgentMessage(parsed)) return parsed;
+  if (sessionIndex.value !== null)
+    return sessionMessages.value[sessionIndex.value] ?? null;
+  return null;
+});
+
 const customItems = ref<CustomInit[]>([]);
 const initializationNotice = ref("");
 const templateOptions = INIT_TEMPLATES.map((template) => ({
   value: template.id,
   label: template.label,
 }));
+
+function templateById(id: string): InitTemplate {
+  return (
+    INIT_TEMPLATES.find((template) => template.id === id) ?? INIT_TEMPLATES[0]!
+  );
+}
+
+function defaultValues(template: InitTemplate): string[] {
+  return template.args.map((arg) => {
+    if (arg.kind === "select") return arg.options?.[0]?.value ?? "";
+    if (arg.kind === "json")
+      return ["inject", "sandbox_use", "tool_call", "custom"].includes(
+        template.id,
+      )
+        ? "[]"
+        : "null";
+    return "";
+  });
+}
+
+function buildInit(item: CustomInit) {
+  const template = templateById(item.template);
+  if (template.id === "custom") {
+    item.command = String(item.values[0] ?? "").trim();
+    try {
+      const parsed = JSON.parse(String(item.values[1] ?? "[]"));
+      item.argumentsText = Array.isArray(parsed)
+        ? JSON.stringify(parsed, null, 2)
+        : "";
+    } catch {
+      item.argumentsText = "";
+    }
+    return;
+  }
+  const args: unknown[] = [];
+  let command = template.template;
+  let valid = true;
+  template.args.forEach((arg, index) => {
+    const raw = String(item.values[index] ?? "");
+    if (arg.inline) {
+      command = command.replace(`<arg${index + 1}>`, raw);
+      return;
+    }
+    command = command.replace(`<arg${index + 1}>`, "?");
+    try {
+      if (arg.kind === "json") args.push(JSON.parse(raw));
+      else if (arg.kind === "number") {
+        const number = Number(raw);
+        if (!Number.isFinite(number)) throw new Error("not a number");
+        args.push(number);
+      } else args.push(raw);
+    } catch {
+      valid = false;
+      args.push(undefined);
+    }
+  });
+  item.command = command.trim();
+  item.argumentsText = valid ? JSON.stringify(args, null, 2) : "";
+}
+
+function itemForStored(item: Record<string, unknown>): CustomInit {
+  const command = typeof item.command === "string" ? item.command : "";
+  const args = Array.isArray(item.arguments) ? item.arguments : [];
+  let template = "custom";
+  let values = [command, JSON.stringify(args, null, 2)];
+  let match = /^IMPORT (TOOL|MESSAGE|SANDBOX)\s+(\S+)\s+AS\s+(\S+)/u.exec(
+    command,
+  );
+  if (match) {
+    template =
+      match[1] === "TOOL"
+        ? "import_tool"
+        : match[1] === "MESSAGE"
+          ? "import_message"
+          : "import_sandbox";
+    values = [match[2] ?? "", match[3] ?? ""];
+  } else if ((match = /^INJECT \? TO (.+)$/u.exec(command))) {
+    template = "inject";
+    values = [JSON.stringify(args[0] ?? [], null, 2), match[1] ?? ""];
+  } else if (command === "CONFIG SET ? ?") {
+    template = "config_set";
+    values = [String(args[0] ?? ""), JSON.stringify(args[1] ?? null, null, 2)];
+  } else if (command === "CONFIG DELETE ?") {
+    template = "config_delete";
+    values = [String(args[0] ?? "")];
+  } else if ((match = /^CREATE (TEMP )?BLOCK (\S+) \((.+)\)$/u.exec(command))) {
+    template = match[1] ? "create_temp_block" : "create_block";
+    values = [match[2] ?? "", match[3] ?? ""];
+  } else if (command === "EFFECT block_snapshot ?") {
+    template = "snapshot";
+    values = [String(args[0] ?? "session")];
+  } else if (command === "EFFECT block_restore ? ?") {
+    template = "restore";
+    values = [String(args[0] ?? "session"), String(args[1] ?? "")];
+  } else if (command === "EFFECT sandbox_use ?") {
+    template = "sandbox_use";
+    values = [JSON.stringify(args[0] ?? [], null, 2)];
+  } else if (command === "EFFECT tool_call ?") {
+    template = "tool_call";
+    values = [JSON.stringify(args[0] ?? [], null, 2)];
+  } else if (
+    (match = /^EFFECT (wake|start_turn|finish_turn|ready)$/u.exec(command))
+  ) {
+    template = "effect";
+    values = [match[1] ?? "wake"];
+  }
+  const custom: CustomInit = {
+    template,
+    values,
+    active: null,
+    command,
+    argumentsText: JSON.stringify(args, null, 2),
+  };
+  buildInit(custom);
+  return custom;
+}
 
 async function loadInitialization() {
   if (!selectedAgentReady.value || busy.value) return;
@@ -640,61 +794,76 @@ async function loadInitialization() {
       : [];
     customItems.value = custom.filter(isRecord).map(itemForStored);
   } catch {
-    initializationNotice.value =
-      "Could not load initialization — see Activity logs";
+    initializationNotice.value = "Could not load initialization";
   } finally {
     busy.value = false;
   }
 }
 
 function addCustom() {
+  const template = templateById("import_tool");
   const item: CustomInit = {
-    template: "import_tool",
-    fields: initFields("import_tool"),
+    template: template.id,
+    values: defaultValues(template),
+    active: null,
     command: "",
     argumentsText: "",
   };
-  applyTemplate(item);
+  buildInit(item);
   customItems.value.push(item);
 }
 
 function changeTemplate(item: CustomInit) {
-  item.fields = initFields(item.template);
-  applyTemplate(item);
+  const template = templateById(item.template);
+  item.values = defaultValues(template);
+  item.active = null;
+  buildInit(item);
 }
 
-function updateItem(item: CustomInit) {
-  applyTemplate(item);
+function toggleArg(item: CustomInit, index: number) {
+  item.active = item.active === index ? null : index;
+}
+
+function setArgValue(item: CustomInit, index: number, value: string) {
+  item.values[index] = value;
+  buildInit(item);
 }
 
 function removeCustom(index: number) {
   customItems.value.splice(index, 1);
 }
 
+function commandSegments(item: CustomInit) {
+  return templateById(item.template)
+    .template.split(/(<arg\d+>)/u)
+    .filter((part) => part.length > 0)
+    .map((part) => {
+      const match = /^<arg(\d+)>$/u.exec(part);
+      return match
+        ? { text: "", arg: Number(match[1]) }
+        : { text: part, arg: null };
+    });
+}
+
 async function saveInitialization() {
   if (!selectedAgentReady.value || busy.value) return;
   const custom: { command: string; arguments: unknown[] }[] = [];
   for (const [index, item] of customItems.value.entries()) {
-    for (const field of templateFields(item.template)) {
-      if (field.type === "boolean") continue;
-      if (!String(item.fields[field.key] ?? "").trim()) {
-        initializationNotice.value = `Command ${index + 1}: ${field.label} is required`;
+    const template = templateById(item.template);
+    for (const [argIndex, arg] of template.args.entries()) {
+      if (!String(item.values[argIndex] ?? "").trim()) {
+        initializationNotice.value = `Command ${index + 1}: arg${argIndex + 1} (${arg.label}) is required`;
         return;
       }
     }
-    if (!item.command.trim()) {
+    buildInit(item);
+    if (!item.argumentsText) {
+      initializationNotice.value = `Command ${index + 1} has an invalid JSON argument`;
+      return;
+    }
+    const args = JSON.parse(item.argumentsText) as unknown[];
+    if (!item.command) {
       initializationNotice.value = `Command ${index + 1} is incomplete`;
-      return;
-    }
-    let args: unknown;
-    try {
-      args = JSON.parse(item.argumentsText);
-    } catch {
-      initializationNotice.value = `Command ${index + 1} has invalid JSON arguments`;
-      return;
-    }
-    if (!Array.isArray(args)) {
-      initializationNotice.value = `Command ${index + 1} arguments must be a JSON array`;
       return;
     }
     const slots = [...item.command].filter((char) => char === "?").length;
@@ -702,7 +871,7 @@ async function saveInitialization() {
       initializationNotice.value = `Command ${index + 1} needs ${slots} argument(s) for its ? slots`;
       return;
     }
-    custom.push({ command: item.command.trim(), arguments: args });
+    custom.push({ command: item.command, arguments: args });
   }
   busy.value = true;
   initializationNotice.value = "";
@@ -714,8 +883,7 @@ async function saveInitialization() {
     initializationNotice.value =
       "Custom initialization saved; it applies on the next Driver start.";
   } catch {
-    initializationNotice.value =
-      "Initialization was not saved — see Activity logs";
+    initializationNotice.value = "Initialization was not saved";
   } finally {
     busy.value = false;
   }
@@ -818,61 +986,22 @@ onMounted(() => {
                 {{ field.key }}
                 <em v-if="field.required">required</em>
               </span>
-              <select
-                v-if="fieldEnum(field)"
-                class="field-input"
-                :value="valueOf(field)"
-                @change="
-                  setValue(field, ($event.target as HTMLSelectElement).value)
-                "
-              >
-                <option
-                  v-for="value in fieldEnum(field)!"
-                  :key="String(value)"
-                  :value="String(value)"
-                >
-                  {{ value }}
-                </option>
-              </select>
-              <input
-                v-else-if="fieldType(field) === 'boolean'"
-                type="checkbox"
-                :checked="toolValues[field.key] === true"
-                @change="
-                  setValue(field, ($event.target as HTMLInputElement).checked)
-                "
-              />
-              <textarea
-                v-else-if="isComplex(field)"
-                class="field-input schema-json"
-                :value="valueOf(field)"
-                spellcheck="false"
-                @input="
-                  setValue(field, ($event.target as HTMLTextAreaElement).value)
-                "
-              ></textarea>
-              <input
-                v-else
-                class="field-input"
-                :type="
-                  ['number', 'integer'].includes(fieldType(field))
-                    ? 'number'
-                    : 'text'
-                "
-                :value="valueOf(field)"
-                :placeholder="
-                  typeof field.schema.description === 'string'
-                    ? field.schema.description
-                    : ''
-                "
-                @input="
-                  setValue(field, ($event.target as HTMLInputElement).value)
-                "
+              <ToolSchemaField
+                :schema="field.schema"
+                :model-value="toolValues[field.key]"
+                @update:model-value="setValue(field, $event)"
               />
               <small v-if="typeof field.schema.description === 'string'">{{
                 field.schema.description
               }}</small>
             </label>
+          </div>
+          <div v-if="schemaFields.length" class="tool-args-preview">
+            <div class="tool-args-preview-head">
+              <span>Arguments JSON</span>
+              <span>live</span>
+            </div>
+            <pre>{{ toolArgumentsPreview }}</pre>
           </div>
           <p v-if="!schemaFields.length" class="advanced-empty">
             This tool has no input schema; call it without arguments.
@@ -960,12 +1089,49 @@ onMounted(() => {
             </p>
           </aside>
           <div class="advanced-editor">
-            <textarea
-              v-model="sessionDraft"
-              class="field-input schema-json advanced-session-json"
-              spellcheck="false"
-              aria-label="Selected session message JSON"
-            ></textarea>
+            <div v-if="sessionPreview" class="session-preview">
+              <div class="session-preview-meta">
+                <span>{{ sessionPreview.type }}</span>
+                <span
+                  v-if="
+                    'request_id' in sessionPreview && sessionPreview.request_id
+                  "
+                >
+                  {{ sessionPreview.request_id }}
+                </span>
+              </div>
+              <template
+                v-if="'reasoning' in sessionPreview && sessionPreview.reasoning"
+              >
+                <span class="session-preview-label">reasoning</span>
+                <pre class="session-preview-text">{{
+                  sessionPreview.reasoning
+                }}</pre>
+              </template>
+              <template
+                v-if="'content' in sessionPreview && sessionPreview.content"
+              >
+                <span class="session-preview-label">content</span>
+                <pre class="session-preview-text">{{
+                  sessionPreview.content
+                }}</pre>
+              </template>
+              <template v-if="sessionPreview.type === 'inject'">
+                <span class="session-preview-label">messages</span>
+                <pre class="session-preview-text">{{
+                  readableValue(sessionPreview.messages)
+                }}</pre>
+              </template>
+            </div>
+            <details class="session-raw">
+              <summary>Raw JSON</summary>
+              <textarea
+                v-model="sessionDraft"
+                class="field-input schema-json advanced-session-json"
+                spellcheck="false"
+                aria-label="Selected session message JSON"
+              ></textarea>
+            </details>
             <div class="advanced-actions">
               <button
                 type="button"
@@ -1056,54 +1222,83 @@ onMounted(() => {
                 Remove
               </button>
             </div>
-            <div class="init-fields">
-              <label
-                v-for="field in templateFields(item.template)"
-                :key="field.key"
-                :class="{ 'init-wide': field.wide }"
+            <div class="init-template">
+              <template
+                v-for="(segment, segmentIndex) in commandSegments(item)"
+                :key="segmentIndex"
               >
-                <span>{{ field.label }}</span>
-                <input
-                  v-if="field.type === 'boolean'"
-                  type="checkbox"
-                  :checked="item.fields[field.key] === true"
-                  @change="
-                    item.fields[field.key] = (
-                      $event.target as HTMLInputElement
-                    ).checked;
-                    updateItem(item);
-                  "
-                />
-                <textarea
-                  v-else-if="field.type === 'json'"
-                  class="field-input schema-json"
-                  :value="String(item.fields[field.key] ?? '')"
-                  :placeholder="field.placeholder"
-                  spellcheck="false"
-                  @input="
-                    item.fields[field.key] = (
-                      $event.target as HTMLTextAreaElement
-                    ).value;
-                    updateItem(item);
-                  "
-                ></textarea>
-                <input
-                  v-else
-                  class="field-input"
-                  :value="String(item.fields[field.key] ?? '')"
-                  :placeholder="field.placeholder"
-                  @input="
-                    item.fields[field.key] = (
-                      $event.target as HTMLInputElement
-                    ).value;
-                    updateItem(item);
-                  "
-                />
-              </label>
+                <span>{{ segment.text }}</span>
+                <button
+                  v-if="segment.arg"
+                  type="button"
+                  class="init-arg-chip"
+                  :class="{ active: item.active === segment.arg - 1 }"
+                  @click="toggleArg(item, segment.arg - 1)"
+                >
+                  arg{{ segment.arg }}
+                </button>
+              </template>
             </div>
-            <code class="init-preview"
-              >{{ item.command }} {{ item.argumentsText }}</code
-            >
+            <div class="init-args">
+              <div
+                v-for="(arg, argIndex) in templateById(item.template).args"
+                :key="argIndex"
+                class="init-arg"
+                :class="{ active: item.active === argIndex }"
+              >
+                <button
+                  type="button"
+                  class="init-arg-trigger"
+                  @click="toggleArg(item, argIndex)"
+                >
+                  <span class="init-arg-chip">arg{{ argIndex + 1 }}</span>
+                  <span>{{ arg.label }}</span>
+                  <span class="init-arg-chevron">{{
+                    item.active === argIndex ? "−" : "+"
+                  }}</span>
+                </button>
+                <div v-if="item.active === argIndex" class="init-arg-editor">
+                  <FormSelect
+                    v-if="arg.kind === 'select'"
+                    :model-value="item.values[argIndex] ?? ''"
+                    :options="arg.options ?? []"
+                    @change="setArgValue(item, argIndex, $event)"
+                  />
+                  <textarea
+                    v-else-if="arg.kind === 'json'"
+                    class="field-input schema-json init-arg-json"
+                    :value="item.values[argIndex]"
+                    :placeholder="arg.placeholder"
+                    spellcheck="false"
+                    @input="
+                      setArgValue(
+                        item,
+                        argIndex,
+                        ($event.target as HTMLTextAreaElement).value,
+                      )
+                    "
+                  ></textarea>
+                  <input
+                    v-else
+                    class="field-input"
+                    :type="arg.kind === 'number' ? 'number' : 'text'"
+                    :value="item.values[argIndex]"
+                    :placeholder="arg.placeholder"
+                    @input="
+                      setArgValue(
+                        item,
+                        argIndex,
+                        ($event.target as HTMLInputElement).value,
+                      )
+                    "
+                  />
+                </div>
+              </div>
+            </div>
+            <pre class="init-preview"
+              >{{ item.command }} {{
+                readableArguments(item.argumentsText)
+              }}</pre>
           </article>
           <p v-if="!customItems.length" class="advanced-empty">
             No custom commands.

@@ -1,6 +1,6 @@
-# Margatroid Daemon
+# Margatroid
 
-Daemon是应用入口，定位~/.margatroid，调用Compose装配并运行App。配置读取由各领域负责，daemon不处理协议或定义业务System。
+margatroid是统一应用入口，定位~/.margatroid，调用Compose装配并运行App。配置读取由各领域负责，daemon不处理协议或定义业务System。
 
 ```text
 ~/.margatroid/
@@ -33,8 +33,8 @@ Ctrl+C和SIGTERM先唤醒并停止正常运行循环，随后调用Compose关停
 启动时向终端stderr输出数据目录；Axum实际绑定成功后输出启动成功、真实监听地址、前端HTTP URL及WebSocket URL。配置端口为0时显示操作系统分配的实际端口。监听0.0.0.0或::时，浏览器链接分别使用127.0.0.1或[::1]，监听行仍显示实际绑定地址。启动提示直接输出，独立于业务日志等级及筛选配置。
 
 ```text
-margatroid-daemon: starting (data directory: /home/example/.margatroid)
-margatroid-daemon: started successfully (listening on 127.0.0.1:3939)
+margatroid: starting (data directory: /home/example/.margatroid)
+margatroid: started successfully (listening on 127.0.0.1:3939)
 Webui:  http://127.0.0.1:3939/
 WebSocket: ws://127.0.0.1:3939/ws
 ```
@@ -44,3 +44,5 @@ WebSocket: ws://127.0.0.1:3939/ws
 应用退出覆盖所有Workspace状态：Starting/Running/Error均提交原StopWorkspace；Stopping等待已有监督及其原reply，不重复关闭。Starting中的Lua立即收到取消，仍等待初始化和进程真实退出。回归直接在启动失败后发送SIGINT/SIGTERM，不预先调用workspace.stop，并验证未完成初始化的Lua子进程在daemon退出前已回收。
 
 未绑定Agent的日志直接通过既有tracing输出，遵守配置的日志级别和过滤器；不创建独立运行日志数据库、不强制保存运行级报告。绑定Agent的日志沿原AgentStorage及提交探针处理。
+
+唯一主程序包和编译产物均名为margatroid，入口位于apps/margatroid，不再构建旧CLI工作区控制客户端或单独daemon程序。使用cargo build --release -p margatroid，再运行./target/release/margatroid启动服务；工具worker/supervisor仍由同一可执行文件内部模式启动。mcp-client和shell-client是工具辅助程序，继续独立保留。

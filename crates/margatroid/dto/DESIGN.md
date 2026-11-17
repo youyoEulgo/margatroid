@@ -30,17 +30,17 @@ DtoPlugin：无字段，Default
                 为安装前已有Agent初始化实际来源观察，在应用启动建立一次Workspace定义磁盘监控。
                 注册GET /ws及GET/HEAD /{workspace}/{*path}；文件handler复用既有ingress、AxumLifetime及WorldClosureSender，不新增业务System或公共事件。
                 只安装PRE_UPDATE的abort_control_system和UPDATE的dto_route_system，不安装同步System。
-task_sync_binding(clients: Clients, targets: &[OutboundTarget]) -> TaskSyncBinding
+task_sync_binding(clients: Clients) -> TaskSyncBinding
     行为：构造Task完整快照的DTO编码函数和同一共享槽位，注入ToolPlugin。
-agent_sync_context(clients: Clients, targets: &[OutboundTarget]) -> AgentUpdateContext
+agent_sync_context(clients: Clients) -> AgentUpdateContext
     行为：创建一个应用级AgentViews、完整Agent集合来源及per-Agent turn来源；World同步入口提交owned投影，公共资源回调提交typed派生字段。
 resource_sync_bindings(context: AgentUpdateContext) -> (ToolResourceSyncBinding, SandboxSyncBinding, SandboxSelectionSyncBinding)
 model_sync_binding(context: AgentUpdateContext) -> ModelSyncBinding
     行为：按owner衍生实际来源scope，映射安全Tools/沙箱/模型纯值；旧scope失效后回调不生效，不跨plugin依赖。
-workspace_sync_binding(clients: Clients, targets: &[OutboundTarget]) -> WorkspaceSyncBinding
+workspace_sync_binding(clients: Clients) -> WorkspaceSyncBinding
     行为：创建应用级WorkspaceViews，定义成功/错误观察和生命周期探针共同更新同一owned列表。
-sync_selectors(targets: &[OutboundTarget]) -> Arc<[ClientSelector]>
-    行为：明确转换Broadcast/Type/Name，不从任意wire消息猜投递范围。
+sync_selectors() -> Arc<[ClientSelector]>
+    行为：返回仅含ClientSelector::Type("webui")的固定Arc数组；状态、任务、资源和持久记录与推理出口统一，不从配置或任意wire消息推导投递范围。
 
 ```
 
@@ -96,7 +96,7 @@ ws_handler(State(state): State<DtoState>, ConnectInfo(peer): ConnectInfo<SocketA
     行为：评估入口策略和退出状态，通过state.clients.allocate取得真实连接、唯一ClientReceiver及取消能力；升级任务持有AxumWorkGuard。
 
 handle_dto_request(world: &mut World, request: DtoRequest)
-    行为：取出具体owned对象，按route转换领域请求或只读查询；原reply继续沿领域执行链回复。agent.restart在全量定义重载验证Workspace仍存在后沿用目标Agent保存的创建参数，不用定义中的程序目录覆盖配置/UI引用。
+    行为：取出具体owned对象，按route转换领域请求或只读查询；原reply继续沿领域执行链回复。agent.restart只沿用目标Agent保存的创建参数，直接提交RestartAgent，不额外重载定义或检查成员文件，不用定义中的程序目录覆盖配置/UI引用。
 
 handle_abort_control(world: &mut World, event: AbortTurnControl)
     行为：认领原请求，校验真实Client、Agent及turn，调用WorldAgentExt的统一turn入口及相关领域取消能力；原oneshot回复。
@@ -132,7 +132,7 @@ read_batch(storage: &AgentStorage, position: RecordWatermarks, high: RecordWater
 encode_batch(address: &str, batch: &RecordBatch) -> Result<Vec<Arc<ClientFrame>>, DtoAsyncError>
     行为：每类最多50条，当前高水位限定排他范围；有request_id的assistant/error由推理通道完成，记录监控跳过其网络投影但照常推进游标；compact历史虽保留request_id但不属于assistant生成去重分支，仍交付generation=null的持久记录；非生成消息full保留真实持久序号、generation=null，MCL和日志过滤内部VM信息，完整编码/预算失败明确重试诊断而不重复旧记录。
 install_model_config_monitor(world: &mut World)
-    行为：取得实际ModelConfigFile；无来源时不创建伪监控。使用同一Clients及backend_state目标建立model.config.sync的state_source，来源view与SyncContext同归ModelConfigSource；创建持AxumWorkGuard的watch_model_config。
+    行为：取得实际ModelConfigFile；无来源时不创建伪监控。使用同一Clients及固定webui目标建立model.config.sync的state_source，来源view与SyncContext同归ModelConfigSource；创建持AxumWorkGuard的watch_model_config。
 watch_model_config(source: ModelConfigView) -> Future<Output=Result<(),String>>
     行为：notify观察文件父目录NonRecursive，只接受目标来源路径的实际变更及观察错误，忽略Access和其他文件；先挂观察再初读，AtomicBool/Notify合并脏信号，顺序await read，闲时等待；取消仍等待当前文件worker完成，不产出ECS同步事件或逐帧调查。
 ModelConfigView::read(&self) -> Future<Output=Result<String,ProtocolErrorDto>>
@@ -169,7 +169,7 @@ prepare_request(state: &DtoState, connection: ConnectionId, message: ClientMessa
         从唯一Clients.claim取得ticket，创建具体领域Result的原oneshot。
         普通请求包装DtoRequest，中止包装AbortTurnControl；注册只携带ConnectionId及自报标签，不复制sender或网络注册表。
         注册成功后Client领域已经原子发布身份；一次性回复不绕回DTO完成事件。
-        单独Agent启动/重启仍在worker全量reload并把本次不可变快照放入具体预处理对象。
+        单独Agent启动仍在worker全量reload并传入本次快照；Agent重启直接使用AgentTargetDto及既存AgentResources，无RestartInput快照或提前reload。
         UI查询沿原oneshot返回观察状态；base64和wire编码保持在网络边界。
 
 request<T, R, E>(ticket: Arc<RequestTicket>, route: &str, input: T, response: &str, project: impl FnOnce(R) -> Result<Value, ProtocolErrorDto> + Send + 'static) -> (DtoRequest, ReplyFuture)

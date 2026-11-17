@@ -6,7 +6,7 @@ use axum_plugin::{AxumHandle, AxumPlugin};
 use client_core::{Client, ConnectionId, WorldClientExt};
 use client_plugin::ClientPlugin;
 use closure_plugin::{AppClosureExt, ClosurePlugin};
-use config_core::{LogLevel, MargatroidConfig, OutboundTarget};
+use config_core::{LogLevel, MargatroidConfig};
 use core_plugin::{App, Entity, World};
 use dto_plugin::DtoPlugin;
 use futures_util::{SinkExt, StreamExt};
@@ -100,22 +100,10 @@ impl Harness {
             .add_plugin(StoragePlugin::new())
             .add_plugin(MclPlugin::new());
         app.world_mut().insert_resource(
-            MargatroidConfig::new(
-                "127.0.0.1:0".parse().unwrap(),
-                LogLevel::Info,
-                None,
-                vec![
-                    OutboundTarget::Type("cli".into()),
-                    OutboundTarget::Name("terminal".into()),
-                ],
-                vec![
-                    OutboundTarget::Type("webui".into()),
-                    OutboundTarget::Name("browser".into()),
-                ],
-            )
-            .unwrap()
-            .with_ingress(policy)
-            .unwrap(),
+            MargatroidConfig::new("127.0.0.1:0".parse().unwrap(), LogLevel::Info, None)
+                .unwrap()
+                .with_ingress(policy)
+                .unwrap(),
         );
         let definitions_root = root.path().join("workspaces");
         std::fs::create_dir_all(definitions_root.join("demo")).unwrap();
@@ -137,10 +125,6 @@ impl Harness {
                 .get_resource::<client_core::Clients>()
                 .unwrap()
                 .clone(),
-            app.world()
-                .get_resource::<MargatroidConfig>()
-                .unwrap()
-                .backend_state(),
         );
         app.world_mut()
             .insert_resource(workspace_binding.updates.clone());
@@ -165,10 +149,6 @@ impl Harness {
                 .get_resource::<client_core::Clients>()
                 .unwrap()
                 .clone(),
-            app.world()
-                .get_resource::<MargatroidConfig>()
-                .unwrap()
-                .backend_state(),
         );
         app.world_mut().insert_resource(agent_updates.clone());
         app.world_mut().insert_component(
@@ -213,10 +193,6 @@ impl Harness {
                 .get_resource::<client_core::Clients>()
                 .unwrap()
                 .clone(),
-            app.world()
-                .get_resource::<MargatroidConfig>()
-                .unwrap()
-                .backend_state(),
         );
         let task_address = app
             .world()

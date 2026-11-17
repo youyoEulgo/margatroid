@@ -22,7 +22,6 @@ import { formatRecordTime } from '@/lib/time';
 const store = useWorkbenchStore();
 const {
   endpoint,
-  driverContextPath,
   connectionStatus,
   connectionError,
   workspaces,
@@ -45,13 +44,12 @@ const sidebarCollapsed = ref(false);
 const viewMode = ref<'driver' | 'info'>(
   typeof window !== 'undefined' && window.location.hash === '#info' ? 'info' : 'driver',
 );
-const activityOpen = ref(typeof window === 'undefined' ? true : window.innerWidth > 1180);
+const activityOpen = ref(false);
 const activityTab = ref<'activity' | 'mcl'>('activity');
 const logFilter = ref<'all' | 'errors'>('all');
 const settingsOpen = ref(false);
 const settingsTab = ref<'connection' | 'models'>('connection');
 const endpointDraft = ref(endpoint.value);
-const contextPathDraft = ref(driverContextPath.value);
 const formError = ref('');
 const driverDocument = ref('');
 const driverDocumentError = ref('');
@@ -91,7 +89,6 @@ function renderDriver() {
     driverDocument.value = buildDriverDocument(agentUiBundle.value, {
       endpoint: endpoint.value,
       address: selectedAgent.value,
-      contextPath: driverContextPath.value,
     });
     iframeKey.value = `${selectedAgent.value}:${agentUiBundle.value.revision}`;
   } catch {
@@ -99,7 +96,7 @@ function renderDriver() {
     driverDocument.value = '';
   }
 }
-watch([agentUiBundle, selectedAgent, endpoint, driverContextPath], renderDriver, {
+watch([agentUiBundle, selectedAgent, endpoint], renderDriver, {
   immediate: true,
 });
 
@@ -142,12 +139,10 @@ function stopWorkspace(address: string) {
 function openSettings() {
   settingsTab.value = 'connection';
   endpointDraft.value = endpoint.value;
-  contextPathDraft.value = driverContextPath.value;
   formError.value = '';
   settingsOpen.value = true;
 }
 function saveSettings() {
-  store.driverContextPath = contextPathDraft.value;
   if (store.connect(endpointDraft.value)) settingsOpen.value = false;
   else formError.value = 'Check the WebSocket endpoint';
 }
@@ -409,17 +404,6 @@ onBeforeUnmount(() => {
             placeholder="ws://127.0.0.1:3939/ws"
             @keydown.enter="saveSettings"
           />
-          <label class="field-label" for="shell-context-path">Driver context path</label>
-          <input
-            id="shell-context-path"
-            v-model="contextPathDraft"
-            class="field-input"
-            placeholder="entry.pending[-1]"
-            @keydown.enter="saveSettings"
-          />
-          <p class="field-hint">
-            The context path is passed to the Driver interface when it is loaded.
-          </p>
           <p v-if="formError" class="form-error">{{ formError }}</p>
           <div class="dialog-actions">
             <button class="secondary-button" @click="settingsOpen = false">Cancel</button>

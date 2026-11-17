@@ -112,6 +112,7 @@ const imagePicker = ref<HTMLInputElement | null>(null);
 const uploadMenuOpen = ref(false);
 const composerError = ref("");
 const importingImages = ref(false);
+const dragActive = ref(false);
 const compacting = ref(false);
 const compactNotice = ref("");
 let draftGeneration = 0;
@@ -161,7 +162,7 @@ async function compactContext() {
     compactNotice.value = "Compaction requested.";
     uploadMenuOpen.value = false;
   } catch {
-    composerError.value = "Compaction request failed — see Activity logs";
+    composerError.value = "Compaction request failed";
   } finally {
     compacting.value = false;
   }
@@ -181,7 +182,7 @@ async function importFiles(files: File[]) {
     if (generation === draftGeneration) draftImages.value.push(...imported);
   } catch (error) {
     if (generation === draftGeneration)
-      composerError.value = "Image import failed — see Activity logs";
+      composerError.value = "Image import failed";
   } finally {
     if (generation === draftGeneration) importingImages.value = false;
   }
@@ -192,8 +193,47 @@ function pickImages(event: Event) {
     void importFiles(Array.from(input.files ?? []));
   input.value = "";
 }
-function dropImages(event: DragEvent) {
-  void importFiles(Array.from(event.dataTransfer?.files ?? []));
+function dragHasFiles(event: DragEvent): boolean {
+  return Array.from(event.dataTransfer?.types ?? []).includes("Files");
+}
+
+function dragEnter(event: DragEvent) {
+  if (!dragHasFiles(event) || !canEditComposer.value) return;
+  event.preventDefault();
+  dragActive.value = true;
+}
+
+function dragOver(event: DragEvent) {
+  if (!dragHasFiles(event)) return;
+  event.preventDefault();
+  if (event.dataTransfer) event.dataTransfer.dropEffect = "copy";
+}
+
+function dragLeave(event: DragEvent) {
+  if (!dragHasFiles(event)) return;
+  const related = event.relatedTarget as Node | null;
+  if (related && (event.currentTarget as Node | null)?.contains(related))
+    return;
+  dragActive.value = false;
+}
+
+function dropFiles(event: DragEvent) {
+  dragActive.value = false;
+  if (!canEditComposer.value) return;
+  const files = Array.from(event.dataTransfer?.files ?? []).filter((file) =>
+    file.type.startsWith("image/"),
+  );
+  if (files.length) void importFiles(files);
+}
+
+function pasteImages(event: ClipboardEvent) {
+  const files = Array.from(event.clipboardData?.items ?? [])
+    .filter((item) => item.kind === "file" && item.type.startsWith("image/"))
+    .map((item) => item.getAsFile())
+    .filter((file): file is File => file !== null);
+  if (!files.length) return;
+  event.preventDefault();
+  void importFiles(files);
 }
 
 const submittingMessage = ref(false);
@@ -314,7 +354,7 @@ async function chooseModel(id: string) {
   try {
     await store.selectModel(id);
   } catch {
-    composerError.value = "Model change failed — see Activity logs";
+    composerError.value = "Model change failed";
   } finally {
     modelSwitching.value = false;
   }
@@ -499,8 +539,7 @@ async function submitMessage() {
     draftImages.value = [];
     nextTick(scrollMessages);
   } catch (error) {
-    if (generation === draftGeneration)
-      composerError.value = "Send failed — see Activity logs";
+    if (generation === draftGeneration) composerError.value = "Send failed";
   } finally {
     if (generation === draftGeneration) {
       submittingMessage.value = false;
@@ -514,7 +553,7 @@ async function runAgentAction(action: () => Promise<unknown>) {
     await action();
   } catch {
     if (connectionStatus.value === "online")
-      composerError.value = "Action failed — see Activity logs";
+      composerError.value = "Action failed";
   }
 }
 
@@ -523,7 +562,7 @@ async function runWorkspaceAction(action: () => Promise<unknown>) {
     await action();
     workspaceNotice.value = "";
   } catch {
-    workspaceNotice.value = "Workspace operation failed — see Activity logs";
+    workspaceNotice.value = "Workspace operation failed";
   }
 }
 
@@ -746,7 +785,6 @@ watch(
   },
 );
 
-
 function stopReason(message: ConversationEntry): string | null {
   const payload = message.payload;
   if (!isRecord(payload)) return null;
@@ -834,7 +872,13 @@ const conversationRows = computed<ConversationRow[]>(() => {
 </script>
 
 <template>
-  <div :class="['app-shell', { 'driver-mode': driverMode }]">
+  <div
+    :class="['app-shell', { 'driver-mode': driverMode }]"
+    @dragenter.prevent="dragEnter"
+    @dragover.prevent="dragOver"
+    @dragleave.prevent="dragLeave"
+    @drop.prevent="dropFiles"
+  >
     <div
       v-if="sidebarOpen"
       class="mobile-scrim"
@@ -971,7 +1015,7 @@ const conversationRows = computed<ConversationRow[]>(() => {
           >
           <span v-else>Conversation is ready.</span>
           <span v-if="selectedAgentFailure" class="agent-failure">
-            Agent error — see Activity logs
+            Agent error
           </span>
         </div>
 
@@ -1157,12 +1201,7 @@ const conversationRows = computed<ConversationRow[]>(() => {
         class="composer"
         @wheel="handleComposerWheel"
       >
-        <form
-          class="composer-box"
-          @submit.prevent="submitMessage"
-          @dragover.prevent
-          @drop.prevent="dropImages"
-        >
+        <form class="composer-box" @submit.prevent="submitMessage">
           <input
             ref="imagePicker"
             class="image-picker"
@@ -1206,6 +1245,7 @@ const conversationRows = computed<ConversationRow[]>(() => {
               v-model="draft"
               :disabled="!canEditComposer"
               rows="1"
+              @paste="pasteImages"
               :placeholder="
                 !selectedWorkspace
                   ? 'Select a workspace...'
@@ -1709,5 +1749,12 @@ const conversationRows = computed<ConversationRow[]>(() => {
       </section>
     </div>
     <AdvancedPanel v-if="advancedOpen" @close="advancedOpen = false" />
+    <div v-if="dragActive" class="image-drop-overlay">
+      <div class="image-drop-card">
+        <ImagePlus :size="28" />
+        <strong>Drop images to attach</strong>
+        <span>Images will be added to the current message</span>
+      </div>
+    </div>
   </div>
 </template>

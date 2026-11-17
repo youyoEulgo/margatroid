@@ -22,7 +22,6 @@ use std::{
     sync::{Arc, Mutex},
 };
 use tokio::sync::oneshot;
-use tool_core::ToolTasks;
 use workspace_core::*;
 
 fn error(kind: WorkspaceErrorKind, message: impl std::fmt::Display) -> WorkspaceError {
@@ -235,84 +234,61 @@ pub(crate) fn handle_stop_workspace(world: &mut World, request: StopWorkspace) {
 }
 pub(crate) fn handle_restart_workspace(world: &mut World, request: RestartWorkspace) {
     let result = (|| {
-        valid_id(&request.id)?;
         let path = checked_path(
             world.get_resource::<WorkspaceInstalled>().unwrap(),
             &request.path,
         )?;
-        let matches: Vec<_> = world
+        world
             .query_with::<Workspace>()
             .result()
             .into_iter()
-            .filter(|entity| {
+            .find(|entity| {
                 world
                     .get_component::<Workspace>(*entity)
-                    .is_some_and(|w| w.definition_path == path)
+                    .is_some_and(|workspace| workspace.definition_path == path)
             })
-            .collect();
-        let workspace = match matches.as_slice() {
-            [entity] => *entity,
-            [] => {
-                return Err(error(
-                    WorkspaceErrorKind::Missing,
-                    "workspace path is not running",
-                ));
-            }
-            _ => {
-                return Err(error(
-                    WorkspaceErrorKind::Duplicate,
-                    "workspace path has multiple runtime entities",
-                ));
-            }
-        };
-        if !matches!(
-            world.get_component::<Workspace>(workspace).unwrap().state,
-            WorkspaceState::Running | WorkspaceState::Error
-        ) {
-            return Err(error(
-                WorkspaceErrorKind::StateRejected,
-                "workspace is not Running",
-            ));
-        }
-        for member in members(world, workspace)? {
-            if world
-                .get_component::<ToolTasks>(member)
-                .is_some_and(|tasks| !tasks.list().is_empty())
-            {
-                return Err(error(
-                    WorkspaceErrorKind::Busy,
-                    "workspace member has an unfinished tool task",
-                ));
-            }
-        }
-        world.insert_component(
-            workspace,
-            StartupBarrier(Arc::new(StartupCompletion::default())),
-        );
-        update_workspace(
-            world,
-            workspace,
-            WorkspaceChange::State(WorkspaceState::Stopping),
-        )?;
-        Ok(context(
-            world,
-            request.id.clone(),
-            path,
-            workspace,
-            request.reply.clone(),
-        ))
+            .ok_or_else(|| error(WorkspaceErrorKind::Missing, "workspace path is not running"))
     })();
-    match result {
-        Err(error) => reply(&request.reply, Err(error)),
-        Ok(context) => {
-            let schedule = world
-                .get_resource::<WorkspaceInstalled>()
-                .unwrap()
-                .schedule
-                .clone();
-            world.send_async_closure(&schedule, move || guarded_restart(context));
+    let workspace = match result {
+        Ok(workspace) => workspace,
+        Err(failure) => {
+            reply(&request.reply, Err(failure));
+            return;
         }
-    }
+    };
+    let (sender, receiver) = oneshot::channel();
+    handle_stop_workspace(
+        world,
+        StopWorkspace {
+            id: request.id.clone(),
+            workspace,
+            reply: Arc::new(Mutex::new(Some(sender))),
+        },
+    );
+    let events = world.event_sender();
+    let schedule = world
+        .get_resource::<WorkspaceInstalled>()
+        .unwrap()
+        .schedule
+        .clone();
+    world.send_async_closure(&schedule, move || async move {
+        match receiver.await {
+            Ok(Ok(_)) => events.send_event(StartWorkspace {
+                id: request.id,
+                path: request.path,
+                reply: request.reply,
+            }),
+            Ok(Err(failure)) => reply(&request.reply, Err(failure)),
+            Err(_) => reply(
+                &request.reply,
+                Err(error(
+                    WorkspaceErrorKind::CleanupFailed,
+                    "workspace stop reply was lost; restart cannot start",
+                )),
+            ),
+        }
+        Ok::<_, async_runtime_plugin::AsyncTaskError>(())
+    });
 }
 fn finish_running(
     world: &mut World,
@@ -448,68 +424,6 @@ pub(crate) fn handle_stop_result(world: &mut World, result: Result<StopOutput, S
         }
         Err(failure) => {
             failure_result(world, &failure, WorkspaceState::Stopping);
-            reply(&failure.reply, Err(failure.error));
-        }
-    }
-}
-pub(crate) fn handle_restart_result(
-    world: &mut World,
-    result: Result<RestartOutput, RestartError>,
-) {
-    match result {
-        Ok(output) => {
-            if world
-                .get_component::<Workspace>(output.workspace)
-                .is_none_or(|workspace| workspace.state != WorkspaceState::Starting)
-            {
-                reply(
-                    &output.reply,
-                    Err(error(
-                        WorkspaceErrorKind::StateRejected,
-                        "startup superseded by cleanup",
-                    )),
-                );
-                return;
-            }
-            if !output.member_errors.is_empty() {
-                if let Ok(all) = members(world, output.workspace) {
-                    let _ =
-                        update_workspace(world, output.workspace, WorkspaceChange::Members(all));
-                }
-                let failure = error(
-                    WorkspaceErrorKind::MemberFailed,
-                    output
-                        .member_errors
-                        .iter()
-                        .map(|item| format!("{}: {}", item.name, item.error))
-                        .collect::<Vec<_>>()
-                        .join("; "),
-                );
-                let _ = update_workspace(
-                    world,
-                    output.workspace,
-                    WorkspaceChange::Failure(Some(failure.clone())),
-                );
-                let _ = update_workspace(
-                    world,
-                    output.workspace,
-                    WorkspaceChange::State(WorkspaceState::Error),
-                );
-                reply(&output.reply, Err(failure));
-                return;
-            }
-            let result =
-                finish_running(world, output.workspace, WorkspaceState::Starting).map(|()| {
-                    WorkspaceOperationOutput {
-                        workspace: output.workspace,
-                        members: output.members,
-                        member_errors: output.member_errors.clone(),
-                    }
-                });
-            reply(&output.reply, result);
-        }
-        Err(failure) => {
-            failure_result(world, &failure, WorkspaceState::Starting);
             reply(&failure.reply, Err(failure.error));
         }
     }
@@ -849,35 +763,6 @@ async fn stop_flow(context: WorkspaceFlowContext) -> Result<StopOutput, StopErro
         member_errors: Vec::new(),
     })
 }
-async fn restart_flow(mut context: WorkspaceFlowContext) -> Result<RestartOutput, RestartError> {
-    stop_members_and_join(&context, WorkspaceState::Stopping)
-        .await
-        .map_err(|e| fail(&context, e, false))?;
-    let workspace = context.workspace;
-    with_world(&context, move |world| {
-        update_workspace(
-            world,
-            workspace,
-            WorkspaceChange::State(WorkspaceState::Starting),
-        )
-    })
-    .await
-    .map_err(|e| fail(&context, e, false))?;
-    context.state = WorkspaceState::Starting;
-    let definition = fresh_definition(&context)
-        .await
-        .map_err(|e| fail(&context, e, false))?;
-    mount_executor(&context, &definition, WorkspaceState::Starting)
-        .await
-        .map_err(|e| fail(&context, e, false))?;
-    let (members, member_errors) = start_members(&context, definition).await;
-    Ok(RestartOutput {
-        reply: context.reply,
-        workspace: context.workspace,
-        members,
-        member_errors,
-    })
-}
 async fn guarded_start(context: WorkspaceFlowContext) -> Result<StartOutput, StartError> {
     let retained = context.clone();
     let result = AssertUnwindSafe(start_flow(context))
@@ -911,22 +796,4 @@ async fn guarded_stop(context: WorkspaceFlowContext) -> Result<StopOutput, StopE
                 false,
             ))
         })
-}
-async fn guarded_restart(context: WorkspaceFlowContext) -> Result<RestartOutput, RestartError> {
-    let retained = context.clone();
-    let result = AssertUnwindSafe(restart_flow(context))
-        .catch_unwind()
-        .await
-        .unwrap_or_else(|_| {
-            Err(fail(
-                &retained,
-                error(
-                    WorkspaceErrorKind::CleanupFailed,
-                    "workspace restart flow panicked; cleanup is not confirmed",
-                ),
-                false,
-            ))
-        });
-    retained.startup.finish();
-    result
 }

@@ -195,7 +195,11 @@ mod mailbox_compaction {
                 .local_addr()
                 .unwrap()
                 .port();
-            std::fs::write(data.join("config.toml"),format!("[server]\nbind='127.0.0.1:{port}'\n[outbound]\nlogs=['type:none']\nbackend_state=['type:webui']\n")).unwrap();
+            std::fs::write(
+                data.join("config.toml"),
+                format!("[server]\nbind='127.0.0.1:{port}'\n"),
+            )
+            .unwrap();
             std::fs::write(data.join("models.toml"),format!("[[models]]\nid='offline'\nmodel='local'\nprovider='openai'\napi_type='chat_completions'\nbase_url='http://{endpoint}/v1'\napi_key='test'\ncontext_window='128k'\n")).unwrap();
             let definition = data.join("workspaces/probe/workspace.yaml");
             std::fs::create_dir_all(definition.parent().unwrap()).unwrap();
@@ -203,7 +207,7 @@ mod mailbox_compaction {
             let mut child = Child(
                 std::process::Command::new(
                     std::env::var_os("MARGATROID_DRIVER_TEST_BINARY")
-                        .unwrap_or_else(|| env!("CARGO_BIN_EXE_margatroid-daemon").into()),
+                        .unwrap_or_else(|| env!("CARGO_BIN_EXE_margatroid").into()),
                 )
                 .env("HOME", home.path())
                 .stdout(std::process::Stdio::null())
@@ -242,6 +246,47 @@ mod mailbox_compaction {
             )
             .await;
             let address = format!("agent:probe/{name}:latest");
+            let persistent_setup=request(&mut socket,"mcl.execute","persistent-import",json!({"address":address,"command":"IMPORT TOOL tool:local/bash:latest AS restart_probe","arguments":[]}),&mut seen).await;
+            assert_eq!(persistent_setup["success"], true);
+            let started=request(&mut socket,"mcl.execute","persistent-start",json!({"address":address,"command":"EFFECT tool_call ?","arguments":[[{"id":"persistent-before-restart","tool_name":"restart_probe","arguments":"{}"}]]}),&mut seen).await;
+            assert_eq!(started["success"], true);
+            let tasks = request(
+                &mut socket,
+                "agent.task.req",
+                "before-restart-tasks",
+                json!({"address":address}),
+                &mut seen,
+            )
+            .await;
+            let task = tasks["tasks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|task| task["call_id"] == "persistent-before-restart")
+                .expect("returned persistent task");
+            assert_eq!(task["returned"], true);
+            let old_task = task["task_id"].clone();
+            request(
+                &mut socket,
+                "workspace.restart",
+                "restart-with-returned-task",
+                json!({"path":definition}),
+                &mut seen,
+            )
+            .await;
+            let after = request(
+                &mut socket,
+                "agent.task.req",
+                "after-restart-tasks",
+                json!({"address":address}),
+                &mut seen,
+            )
+            .await;
+            assert!(after["tasks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|task| task["task_id"] != old_task));
             let config = request(
                 &mut socket,
                 "mcl.execute",
@@ -435,14 +480,18 @@ mod mailbox_compaction {
             .local_addr()
             .unwrap()
             .port();
-        std::fs::write(data.join("config.toml"),format!("[server]\nbind='127.0.0.1:{port}'\n[outbound]\nlogs=['type:none']\nbackend_state=['type:webui']\n")).unwrap();
+        std::fs::write(
+            data.join("config.toml"),
+            format!("[server]\nbind='127.0.0.1:{port}'\n"),
+        )
+        .unwrap();
         let original="[[models]]\nid='route'\nmodel='first-model'\nprovider='openai'\napi_type='chat_completions'\nbase_url='http://127.0.0.1:1/v1'\napi_key='test-key'\ncontext_window='128k'\n";
         let path = data.join("models.toml");
         std::fs::write(&path, original).unwrap();
         let mut child = Child(
             std::process::Command::new(
                 std::env::var_os("MARGATROID_DRIVER_TEST_BINARY")
-                    .unwrap_or_else(|| env!("CARGO_BIN_EXE_margatroid-daemon").into()),
+                    .unwrap_or_else(|| env!("CARGO_BIN_EXE_margatroid").into()),
             )
             .env("HOME", home.path())
             .stdout(std::process::Stdio::null())

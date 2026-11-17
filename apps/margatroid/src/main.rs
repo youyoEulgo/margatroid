@@ -21,7 +21,7 @@ fn main() {
         std::process::exit(runtime.block_on(tool_plugin::runner_main()));
     }
     if let Err(error) = run() {
-        eprintln!("margatroid-daemon: {error}");
+        eprintln!("margatroid: {error}");
         std::process::exit(1);
     }
 }
@@ -34,7 +34,7 @@ fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let data_root = options.data_root.clone();
     let mut app = build_app(options)?;
     tracing::info!(
-        "margatroid-daemon: starting (data directory: {})",
+        "margatroid: starting (data directory: {})",
         data_root.display()
     );
     let server = app
@@ -71,7 +71,7 @@ fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 }
                 _ => address,
             };
-            tracing::info!("margatroid-daemon: started successfully (listening on {address})");
+            tracing::info!("margatroid: started successfully (listening on {address})");
             tracing::info!("Webui:  http://{browser_address}/");
             tracing::info!("WebSocket: ws://{browser_address}/ws");
             reported.set(true);
@@ -85,7 +85,9 @@ fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 // The installed Axum service reports its final error after domain drain.
                 Err(error) if error.domain == "axum" => break Err(error),
                 Err(error) => {
-                    tracing::error!("margatroid-daemon: cleanup is not complete: {error}; continuing to supervise");
+                    tracing::error!(
+                        "margatroid: cleanup is not complete: {error}; continuing to supervise"
+                    );
                     tokio::time::sleep(std::time::Duration::from_millis(10)).await;
                 }
             }
@@ -98,16 +100,16 @@ fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if let Err(error) = shutdown {
         return Err(Box::new(error));
     }
-    tracing::info!("margatroid-daemon: shutdown complete");
+    tracing::info!("margatroid: shutdown complete");
     Ok(())
 }
 
 fn request_shutdown(stopping: &AtomicBool, handle: &RuntimeHandle) {
     if !stopping.swap(true, Ordering::AcqRel) {
-        tracing::info!("margatroid-daemon: shutdown requested; waiting for tasks and child processes to finish cleanup");
+        tracing::info!("margatroid: shutdown requested; waiting for tasks and child processes to finish cleanup");
         handle.wake();
     } else {
-        tracing::info!("margatroid-daemon: cleanup is still in progress");
+        tracing::info!("margatroid: cleanup is still in progress");
     }
 }
 
@@ -138,7 +140,7 @@ fn listen_for_shutdown(
     Ok(tokio::spawn(async move {
         loop {
             if let Err(error) = tokio::signal::ctrl_c().await {
-                tracing::error!("margatroid-daemon: signal listener failed: {error}");
+                tracing::error!("margatroid: signal listener failed: {error}");
                 request_shutdown(&stopping, &handle);
                 break;
             }

@@ -1,10 +1,10 @@
-use config_core::{ConfigError, IngressPolicy, LogLevel, MargatroidConfig, OutboundTarget};
+use config_core::{ConfigError, IngressPolicy, LogLevel, MargatroidConfig};
 use config_plugin::ConfigPlugin;
 use core_plugin::App;
 use std::fs;
 use std::path::PathBuf;
 
-const BASE: &str = "[server]\nbind = '127.0.0.1:3939'\n[outbound]\nlogs = ['type:cli', 'type:webui']\nbackend_state = ['type:webui']\n";
+const BASE: &str = "[server]\nbind = '127.0.0.1:3939'\n";
 
 struct File {
     directory: tempfile::TempDir,
@@ -37,17 +37,6 @@ fn opens_configuration_with_default_log_and_ingress() {
     assert_eq!(config.server_ingress(), &IngressPolicy::Localhost);
     assert_eq!(config.log_level(), LogLevel::Info);
     assert_eq!(config.log_filter(), None);
-    assert_eq!(
-        config.logs(),
-        [
-            OutboundTarget::Type("cli".into()),
-            OutboundTarget::Type("webui".into())
-        ]
-    );
-    assert_eq!(
-        config.backend_state(),
-        [OutboundTarget::Type("webui".into())]
-    );
 }
 
 #[test]
@@ -56,8 +45,6 @@ fn installs_validated_configuration_without_a_file() {
         "0.0.0.0:4000".parse().unwrap(),
         LogLevel::Debug,
         Some("application=trace".into()),
-        vec![OutboundTarget::Broadcast],
-        vec![OutboundTarget::Name("frontend".into())],
     )
     .unwrap()
     .with_ingress(IngressPolicy::Any)
@@ -132,9 +119,7 @@ fn rejects_unknown_fields_at_every_document_level() {
         format!("unknown = 1\n{BASE}"),
         BASE.replace("bind =", "unknown = 1\nbind ="),
         format!("{BASE}[log]\nlevel = 'info'\nunknown = 1\n"),
-        BASE.replace("logs =", "unknown = 1\nlogs ="),
         format!("{BASE}[inference]\nmodel = 'removed'\n"),
-        BASE.replace("logs =", "member_messages = []\nlogs ="),
     ] {
         assert_eq!(error(&source), ConfigError::DecodeFailed, "{source}");
     }
@@ -187,44 +172,12 @@ fn validates_bind_and_all_log_levels() {
 }
 
 #[test]
-fn validates_both_outbound_groups_and_preserves_target_kinds() {
-    for field in ["logs", "backend_state"] {
-        let baseline = if field == "logs" {
-            "logs = ['type:cli', 'type:webui']"
-        } else {
-            "backend_state = ['type:webui']"
-        };
-        for targets in ["[]", "['']", "['client:cli']", "['type:']", "['name:   ']"] {
-            assert_eq!(
-                error(&BASE.replace(baseline, &format!("{field} = {targets}"))),
-                ConfigError::InvalidTarget,
-                "{field} {targets}"
-            );
-        }
-        for targets in [
-            "['broadcast', 'broadcast']",
-            "['type:cli', 'type:cli']",
-            "['name:client', 'name:client']",
-        ] {
-            assert_eq!(
-                error(&BASE.replace(baseline, &format!("{field} = {targets}"))),
-                ConfigError::DuplicateTarget
-            );
-        }
-    }
-    let plugin = File::new(BASE.replace(
-        "['type:cli', 'type:webui']",
-        "['broadcast', 'name:local', 'type:local']",
-    ))
-    .open()
-    .unwrap();
+fn removed_outbound_configuration_is_rejected_as_an_unknown_field() {
     assert_eq!(
-        plugin.config().logs(),
-        [
-            OutboundTarget::Broadcast,
-            OutboundTarget::Name("local".into()),
-            OutboundTarget::Type("local".into())
-        ]
+        error(&format!(
+            "{BASE}[outbound]\nlogs=['broadcast']\nbackend_state=['type:webui']\n"
+        )),
+        ConfigError::DecodeFailed
     );
 }
 

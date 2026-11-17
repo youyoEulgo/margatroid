@@ -16,7 +16,7 @@ const LIMIT: Duration = Duration::from_secs(20);
 fn daemon_binary() -> PathBuf {
     std::env::var_os("MARGATROID_SHUTDOWN_TEST_BINARY")
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_margatroid-daemon")))
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_margatroid")))
 }
 
 // Include start time so failure cleanup can never signal an unrelated reused PID.
@@ -133,9 +133,7 @@ fn fixture(home: &Path, address: std::net::SocketAddr) -> PathBuf {
     write(
         &root,
         "config.toml",
-        &format!(
-            "[server]\nbind='{address}'\n[outbound]\nlogs=['type:unmatched']\nbackend_state=['type:webui']\n"
-        ),
+        &format!("[server]\nbind='{address}'\n"),
     );
     write(
         &root,
@@ -523,7 +521,7 @@ fn bind_failure_reports_error_and_exits_without_success_banner() {
     };
     assert!(!status.success());
     let output = daemon.log();
-    assert!(output.contains("margatroid-daemon: starting"), "{output}");
+    assert!(output.contains("margatroid: starting"), "{output}");
     assert!(output.contains("axum"), "{output}");
     assert!(!output.contains("started successfully"), "{output}");
     assert!(!output.contains("Webui:"), "{output}");

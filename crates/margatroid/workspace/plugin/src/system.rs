@@ -21,19 +21,11 @@ pub(crate) fn stop_workspace_system(world: &mut World) {
     }
 }
 pub(crate) fn restart_workspace_system(world: &mut World) {
-    let results: Vec<_> = world
-        .event_reader::<Result<RestartOutput, RestartError>>()
-        .into_iter()
-        .cloned()
-        .collect();
     let requests: Vec<_> = world
         .event_reader::<RestartWorkspace>()
         .into_iter()
         .cloned()
         .collect();
-    for result in results {
-        handler::handle_restart_result(world, result);
-    }
     for request in requests {
         handler::handle_restart_workspace(world, request);
     }

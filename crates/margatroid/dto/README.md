@@ -34,7 +34,7 @@ chunk和记录不采用状态覆盖。新连接获得当前状态源的初始化
 
 Task在共享更新门提交状态及revision；Agent/Workspace在World同步入口提交实际修改，DTO公共视图在短锁内更新owned值及版本，释放领域锁再通知ClientSender。来源epoch区分Agent重启或资源替换，完整Entity及epoch只作内部归属。准备快照时读取实际版本，旧来源或旧版本不覆盖新状态。读回调只捕获Weak共享数据，避免上下文和发布索引形成Arc环。
 
-按既定配置筛选：状态与持久记录使用backend_state，推理出口保持webui类别语义；匹配按ConnectionId去重。慢连接队列满或关闭时取消连接，有序增量不静默丢帧。编码/32MiB预算失败明确诊断并关闭受影响同步连接；普通查询沿原res错误返回，不能无条件重试制造忙循环。
+按固定webui类别筛选：状态、持久记录和推理出口统一交付注册webui客户端；匹配按ConnectionId去重。慢连接队列满或关闭时取消连接，有序增量不静默丢帧。编码/32MiB预算失败明确诊断并关闭受影响同步连接；普通查询沿原res错误返回，不能无条件重试制造忙循环。
 
 ## 生命周期与接口边界
 
@@ -73,4 +73,4 @@ Workspace文件读取已实现：GET/HEAD /{workspace}/{*path}由本插件提供
 推理终态中的assistant及error已由推理通道交付；带request_id的这两类消息写入历史后，记录监控只推进真实提交游标，不再发送第二条full。历史查询保留完整记录；不带推理request_id的独立error和compact历史仍按普通持久记录同步。
 
 models.toml现支持每次推理前有界重读并按id选择，文件损坏/删除或id缺失均失败，不回退启动快照。既有ModelRoutes只服务最近安全公共投影；有效文件改动刷新Agent安全model信息，无效文件清空投影。
-model.config.req/res/sync及model.config.update/update.result已实现，读取/同步原始TOML供编辑，修改完整校验后原子覆盖同一文件并保留权限；外部编辑/原子替换/删除也触发同一来源监控。无需Workspace、Agent或turn，不接收客户端文件路径，不新增持久目录/数据库或领域System/事件。接口遵循原注册、ingress、backend_state目标和id关联规则；前端源码未改。
+model.config.req/res/sync及model.config.update/update.result已实现，读取/同步原始TOML供编辑，修改完整校验后原子覆盖同一文件并保留权限；外部编辑/原子替换/删除也触发同一来源监控。无需Workspace、Agent或turn，不接收客户端文件路径，不新增持久目录/数据库或领域System/事件。接口遵循原注册、ingress、固定webui目标和id关联规则；前端源码未改。

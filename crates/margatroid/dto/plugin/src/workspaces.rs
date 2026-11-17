@@ -95,12 +95,9 @@ pub struct WorkspaceSyncBinding {
     views: Arc<WorkspaceViews>,
 }
 impl core_plugin::Resource for WorkspaceSyncBinding {}
-pub fn workspace_sync_binding(
-    clients: Clients,
-    targets: &[config_core::OutboundTarget],
-) -> WorkspaceSyncBinding {
+pub fn workspace_sync_binding(clients: Clients) -> WorkspaceSyncBinding {
     let view = Arc::new(Mutex::new((0, Vec::<WorkspaceInfoDto>::new())));
-    let targets = crate::sync_selectors(targets);
+    let targets = crate::sync_selectors();
     let sync = state_source(
         clients,
         targets,

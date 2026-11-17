@@ -43,10 +43,6 @@ impl Plugin for DtoPlugin {
                     .get_resource::<client_core::Clients>()
                     .unwrap()
                     .clone(),
-                app.world()
-                    .get_resource::<MargatroidConfig>()
-                    .unwrap()
-                    .backend_state(),
             );
             app.world_mut().insert_resource(binding.updates.clone());
             app.world_mut().insert_resource(binding);
@@ -99,20 +95,10 @@ impl Plugin for DtoPlugin {
     }
 }
 
-pub fn task_sync_binding(
-    clients: client_core::Clients,
-    targets: &[config_core::OutboundTarget],
-) -> tool_core::TaskSyncBinding {
+pub fn task_sync_binding(clients: client_core::Clients) -> tool_core::TaskSyncBinding {
     use std::sync::Arc;
-    let targets = targets
-        .iter()
-        .map(|target| match target {
-            config_core::OutboundTarget::Broadcast => client_core::ClientSelector::Broadcast,
-            config_core::OutboundTarget::Type(t) => client_core::ClientSelector::Type(t.clone()),
-            config_core::OutboundTarget::Name(n) => client_core::ClientSelector::Name(n.clone()),
-        })
-        .collect::<Vec<_>>();
-    tool_core::TaskSyncBinding::new(clients, targets.into(), |snapshot| {
+    let targets = sync_selectors();
+    tool_core::TaskSyncBinding::new(clients, targets, |snapshot| {
         let tasks = snapshot
             .tasks
             .into_iter()
@@ -140,16 +126,6 @@ pub fn task_sync_binding(
     })
 }
 
-pub(crate) fn sync_selectors(
-    targets: &[config_core::OutboundTarget],
-) -> std::sync::Arc<[client_core::ClientSelector]> {
-    targets
-        .iter()
-        .map(|target| match target {
-            config_core::OutboundTarget::Broadcast => client_core::ClientSelector::Broadcast,
-            config_core::OutboundTarget::Type(t) => client_core::ClientSelector::Type(t.clone()),
-            config_core::OutboundTarget::Name(n) => client_core::ClientSelector::Name(n.clone()),
-        })
-        .collect::<Vec<_>>()
-        .into()
+pub(crate) fn sync_selectors() -> std::sync::Arc<[client_core::ClientSelector]> {
+    vec![client_core::ClientSelector::Type("webui".into())].into()
 }

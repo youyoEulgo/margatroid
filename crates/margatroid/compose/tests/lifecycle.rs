@@ -106,7 +106,11 @@ fn bundled_driver_runs_real_mcl_storage_and_http_then_stops_its_workspace() {
     std::fs::create_dir_all(&directory).unwrap();
     let definition = directory.join("workspace.yaml");
     std::fs::write(&definition, format!("name: demo\nproject_root: {}\nmembers:\n  - name: coder\n    driver: driver:local/coder:latest\n    home_root: {}\n", project.display(), root.path().display())).unwrap();
-    std::fs::write(root.path().join("config.toml"), "[server]\nbind='127.0.0.1:0'\n[outbound]\nlogs=['type:unmatched']\nbackend_state=['type:unmatched']\n").unwrap();
+    std::fs::write(
+        root.path().join("config.toml"),
+        "[server]\nbind='127.0.0.1:0'\n",
+    )
+    .unwrap();
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let endpoint = listener.local_addr().unwrap();
     let (request_tx, request_rx) = std::sync::mpsc::channel();

@@ -146,7 +146,7 @@ async function save() {
     externalChange.value = false;
     notice.value = 'Model configuration saved.';
   } catch {
-    notice.value = 'Model configuration was not saved — see Activity logs';
+    notice.value = 'Model configuration was not saved';
   } finally {
     saving.value = false;
   }
@@ -175,7 +175,7 @@ async function save() {
       </button>
     </p>
     <p v-if="modelConfigError && !initialized" class="form-error">
-      Model configuration is unavailable — see Activity logs
+      Model configuration is unavailable
     </p>
     <div v-if="routes.length" class="model-route-list">
       <article

@@ -29,9 +29,9 @@ MargatroidConfig：全局配置，公开Resource
     ingress: IngressPolicy
     log_level: LogLevel
     log_filter: Option<String>
-    logs: Vec<OutboundTarget>
-    backend_state: Vec<OutboundTarget>
     tools: FileToolConfig
+    new(server_bind:SocketAddr,log_level:LogLevel,log_filter:Option<String>) -> Result<Self,ConfigError>
+        行为：校验可选日志filter非空，初始化默认入口及工具配置；不包含出站目标配置。
     with_tools(tools: FileToolConfig) -> Result<Self, ConfigError>
     tools(&self) -> &FileToolConfig
     impl Resource for MargatroidConfig
@@ -58,8 +58,8 @@ ConfigPlugin：全局配置安装插件
 ```text
 read_config(path: &Path) -> Result<MargatroidConfig, ConfigError>
     行为：
-        有界读取UTF-8 TOML；拒绝未知字段；校验监听地址、入口策略、日志及两组非空且不重复的出站目标。
-        解析server、log、outbound及可选tools；入口解析localhost/all及原地址别名或CIDR数组。
+        有界读取UTF-8 TOML；拒绝未知字段；校验监听地址、入口策略、日志和工具预算。
+        解析server、log及可选tools；outbound属于未知字段，明确拒绝；入口解析localhost/all及原地址别名或CIDR数组。
         tools三字段省略项保留None，正整数校验由自有配置类型执行，compose补工具默认值并完成运行时约束校验；旧tools.limits及memory/cache严格拒绝。
         只产出config_core自有数据，不实现服务器框架的握手trait；DTO在自己的/ws handler调用IngressPolicy::evaluate。
 ```
@@ -108,9 +108,6 @@ CidrBlock：网络地址段
     contains(&self, address: IpAddr) -> bool
         行为：同地址族按前缀匹配。
 
-OutboundTarget：未解析的出站目标，公开枚举
-    Broadcast | Type(String) | Name(String)
-
 LogLevel：日志级别，公开枚举
     Off | Error | Warn | Info | Debug | Trace
 ```
@@ -123,7 +120,7 @@ LogLevel：日志级别，公开枚举
 ```text
 ConfigError：配置错误，公开枚举
     ReadFailed(PathBuf) | TooLarge | DecodeFailed | InvalidBind
-    InvalidIngress | InvalidLogLevel | InvalidLogFilter | InvalidTarget | DuplicateTarget
+    InvalidIngress | InvalidLogLevel | InvalidLogFilter
     InvalidToolLimit { field: &'static str, reason: String }
     impl Display + std::error::Error
 ```
@@ -138,5 +135,5 @@ World（安装后）
 └── MargatroidConfig: Resource
     ├── 监听与入口策略
     ├── 日志过滤配置
-    └── 出站目标声明
+    └── 工具预算覆盖
 ```

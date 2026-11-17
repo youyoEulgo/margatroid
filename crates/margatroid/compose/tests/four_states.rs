@@ -54,11 +54,7 @@ fn command(app: &mut App, source: Entity, target: Entity, text: &str) -> MclValu
 #[test]
 fn automatic_lua_failure_persists_and_pushes_logs_and_error_without_ready_or_refresh() {
     let root = tempfile::tempdir().unwrap();
-    write(
-        root.path(),
-        "config.toml",
-        "[server]\nbind='127.0.0.1:0'\n[outbound]\nlogs=['type:none']\nbackend_state=['type:webui']\n",
-    );
+    write(root.path(), "config.toml", "[server]\nbind='127.0.0.1:0'\n");
     write(
         root.path(),
         "models.toml",

@@ -187,12 +187,7 @@ pub(crate) fn refresh_ui_watch(
     let revision = Arc::new(AtomicU64::new(0));
     let version = revision.clone();
     let weak = Arc::downgrade(&delivery);
-    let targets = crate::sync_selectors(
-        world
-            .get_resource::<config_core::MargatroidConfig>()
-            .unwrap()
-            .backend_state(),
-    );
+    let targets = crate::sync_selectors();
     let sync = client_core::SyncContext::new(
         state.clients.clone(),
         client_core::SyncKey {

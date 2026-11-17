@@ -1,23 +1,14 @@
 use config_core::IngressRequest;
-use config_core::{
-    CidrBlock, ConfigError, IngressPolicy, LogLevel, MargatroidConfig, OutboundTarget,
-};
+use config_core::{CidrBlock, ConfigError, IngressPolicy, LogLevel, MargatroidConfig};
 use core_plugin::Resource;
 use std::net::{IpAddr, SocketAddr};
 
 fn config(bind: &str) -> MargatroidConfig {
-    MargatroidConfig::new(
-        bind.parse().unwrap(),
-        LogLevel::Info,
-        None,
-        vec![OutboundTarget::Broadcast],
-        vec![OutboundTarget::Type("webui".into())],
-    )
-    .unwrap()
+    MargatroidConfig::new(bind.parse().unwrap(), LogLevel::Info, None).unwrap()
 }
 
 #[test]
-fn resource_exposes_validated_configuration_and_owned_targets() {
+fn resource_exposes_validated_configuration() {
     fn resource<T: Resource>() {}
     resource::<MargatroidConfig>();
     let value = config("127.0.0.1:3939");
@@ -25,75 +16,6 @@ fn resource_exposes_validated_configuration_and_owned_targets() {
     assert_eq!(value.server_ingress(), &IngressPolicy::Localhost);
     assert_eq!(value.log_level(), LogLevel::Info);
     assert_eq!(value.log_filter(), None);
-    assert_eq!(value.logs(), [OutboundTarget::Broadcast]);
-    assert_eq!(
-        value.backend_state(),
-        [OutboundTarget::Type("webui".into())]
-    );
-}
-
-#[test]
-fn validates_both_target_groups_without_rejecting_cross_group_reuse() {
-    for invalid in [
-        vec![],
-        vec![OutboundTarget::Type("".into())],
-        vec![OutboundTarget::Name("   ".into())],
-        vec![OutboundTarget::Name("bad\nname".into())],
-        vec![OutboundTarget::Type("bad\0type".into())],
-    ] {
-        for logs_invalid in [true, false] {
-            let valid = vec![OutboundTarget::Broadcast];
-            let (logs, backend) = if logs_invalid {
-                (invalid.clone(), valid)
-            } else {
-                (valid, invalid.clone())
-            };
-            assert_eq!(
-                MargatroidConfig::new(
-                    "127.0.0.1:1".parse().unwrap(),
-                    LogLevel::Info,
-                    None,
-                    logs,
-                    backend
-                ),
-                Err(ConfigError::InvalidTarget)
-            );
-        }
-    }
-    let duplicate = vec![OutboundTarget::Broadcast, OutboundTarget::Broadcast];
-    assert_eq!(
-        MargatroidConfig::new(
-            "127.0.0.1:1".parse().unwrap(),
-            LogLevel::Info,
-            None,
-            duplicate.clone(),
-            vec![OutboundTarget::Broadcast]
-        ),
-        Err(ConfigError::DuplicateTarget)
-    );
-    assert_eq!(
-        MargatroidConfig::new(
-            "127.0.0.1:1".parse().unwrap(),
-            LogLevel::Info,
-            None,
-            vec![OutboundTarget::Broadcast],
-            duplicate
-        ),
-        Err(ConfigError::DuplicateTarget)
-    );
-    assert!(
-        MargatroidConfig::new(
-            "127.0.0.1:1".parse().unwrap(),
-            LogLevel::Info,
-            None,
-            vec![
-                OutboundTarget::Type("cli".into()),
-                OutboundTarget::Name("cli".into())
-            ],
-            vec![OutboundTarget::Type("cli".into())]
-        )
-        .is_ok()
-    );
 }
 
 #[test]
@@ -103,9 +25,7 @@ fn filter_is_nonempty_but_logging_expression_validation_is_deferred() {
             MargatroidConfig::new(
                 "127.0.0.1:1".parse().unwrap(),
                 LogLevel::Info,
-                Some(filter.into()),
-                vec![OutboundTarget::Broadcast],
-                vec![OutboundTarget::Broadcast]
+                Some(filter.into())
             ),
             Err(ConfigError::InvalidLogFilter)
         );
@@ -114,8 +34,6 @@ fn filter_is_nonempty_but_logging_expression_validation_is_deferred() {
         "127.0.0.1:1".parse().unwrap(),
         LogLevel::Off,
         Some("application validates [this".into()),
-        vec![OutboundTarget::Broadcast],
-        vec![OutboundTarget::Broadcast],
     )
     .unwrap();
     assert_eq!(value.log_filter(), Some("application validates [this"));
@@ -302,8 +220,6 @@ fn public_errors_have_useful_display_messages() {
         ConfigError::InvalidIngress,
         ConfigError::InvalidLogLevel,
         ConfigError::InvalidLogFilter,
-        ConfigError::InvalidTarget,
-        ConfigError::DuplicateTarget,
     ];
     for error in errors {
         let error: &dyn std::error::Error = &error;

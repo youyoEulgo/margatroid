@@ -453,83 +453,51 @@ fn unreadable_fresh_definition_never_starts_from_display_cache() {
     );
 }
 #[test]
-fn restart_refuses_unfinished_tasks_on_every_member_without_cancelling_them() {
+fn restart_with_member_tasks_uses_stop_then_start_without_busy_admission() {
     let root = tempfile::tempdir().unwrap();
     let path = file(root.path(), "demo");
     write(&path, "demo", &["one", "two"], "project");
     let mut app = app(WorkspacePlugin::open(root.path())
         .unwrap()
         .with_program_root(root.path().join("agent-drivers")));
-    let output = start(&mut app, &path, "start");
+    let original = start(&mut app, &path, "start");
     let (reply, _result) = tokio::sync::oneshot::channel();
     let (task, _input) = ToolTaskHandle::new(
         &ToolExecutionLimits::default(),
         "call".into(),
-        "tool".into(),
+        "mcp_register".into(),
         reply,
         app.world()
-            .get_component::<ToolTasks>(output.members[1])
+            .get_component::<ToolTasks>(original.members[1])
             .unwrap()
             .update_context(),
         None,
     )
     .unwrap();
-    let tasks = app
-        .world()
-        .get_component::<ToolTasks>(output.members[1])
-        .unwrap();
-    tasks.register("unfinished".into(), task.clone()).unwrap();
-    app.world().emit_event(RestartWorkspace {
-        id: "busy".into(),
-        reply: request_reply("busy"),
-        path: path.clone(),
-    });
-    app.tick();
-    assert_eq!(
-        *app.world().workspace_state(output.workspace).unwrap(),
-        WorkspaceState::Running
-    );
-    assert!(!app
-        .world()
-        .get_component::<WorkspaceExecutor>(output.workspace)
-        .unwrap()
-        .entry
-        .is_closed());
-    assert_eq!(
-        wait(&mut app, "busy").unwrap_err().kind,
-        WorkspaceErrorKind::Busy
-    );
-    assert!(!task.cancel_token().is_cancelled());
-    assert_eq!(app.world().get_resource::<FakeAgents>().unwrap().stops, 0);
     app.world()
-        .get_component::<ToolTasks>(output.members[1])
+        .get_component::<ToolTasks>(original.members[1])
         .unwrap()
-        .complete_cleanup("unfinished", &task, None);
-    write(&path, "new definition", &[], "next-project");
+        .register("persistent".into(), task)
+        .unwrap();
     let old = app
         .world()
-        .get_component::<WorkspaceExecutor>(output.workspace)
+        .get_component::<WorkspaceExecutor>(original.workspace)
         .unwrap()
         .close
         .clone();
+    write(&path, "new definition", &[], "next-project");
     app.world().emit_event(RestartWorkspace {
         id: "restart".into(),
         reply: request_reply("restart"),
-        path: path.clone(),
+        path,
     });
-    let restarted = wait(&mut app, "restart").unwrap();
-    assert_eq!(restarted.workspace, output.workspace);
-    assert!(restarted.members.is_empty());
+    let new = wait(&mut app, "restart").unwrap();
+    assert_ne!(new.workspace, original.workspace);
+    assert!(!app.world().is_alive(original.workspace));
     assert!(old.is_joined());
+    assert!(new.members.is_empty());
     assert_eq!(app.world().get_resource::<FakeAgents>().unwrap().stops, 2);
-    assert_eq!(
-        app.world()
-            .get_component::<Workspace>(output.workspace)
-            .unwrap()
-            .name,
-        "new definition"
-    );
-    stop(&mut app, output.workspace, "stop");
+    stop(&mut app, new.workspace, "stop");
 }
 #[test]
 fn restart_invalid_file_stops_old_runtime_and_reports_new_start_error() {
@@ -556,18 +524,9 @@ fn restart_invalid_file_stops_old_runtime_and_reports_new_start_error() {
         wait(&mut app, "restart").unwrap_err().kind,
         WorkspaceErrorKind::InvalidDefinition
     );
-    assert_eq!(
-        *app.world().workspace_state(output.workspace).unwrap(),
-        WorkspaceState::Error
-    );
+    assert!(!app.world().is_alive(output.workspace));
     assert!(!app.world().is_alive(output.members[0]));
     assert!(old.is_joined());
-    assert!(app
-        .world()
-        .get_component::<WorkspaceExecutor>(output.workspace)
-        .unwrap()
-        .entry
-        .is_closed());
     assert_eq!(
         app.world()
             .workspace_definitions()
@@ -578,7 +537,6 @@ fn restart_invalid_file_stops_old_runtime_and_reports_new_start_error() {
         "old"
     );
     assert_eq!(app.world().get_resource::<FakeAgents>().unwrap().stops, 1);
-    stop(&mut app, output.workspace, "stop");
 }
 #[test]
 fn stop_failure_or_lost_reply_preserves_workspace_and_unjoined_executor() {
@@ -877,21 +835,6 @@ fn removed_definition_remains_on_running_component_and_only_stop_succeeds() {
         reply: request_reply("missing-restart"),
     });
     assert!(wait(&mut app, "missing-restart").is_err());
-    assert_eq!(
-        *app.world().workspace_state(running.workspace).unwrap(),
-        WorkspaceState::Error
-    );
-    assert_eq!(
-        app.world()
-            .get_component::<Workspace>(running.workspace)
-            .unwrap()
-            .definition
-            .as_ref()
-            .unwrap()
-            .name,
-        "retained"
-    );
-    stop(&mut app, running.workspace, "stop-retained");
     assert!(!app.world().is_alive(running.workspace));
 }
 
