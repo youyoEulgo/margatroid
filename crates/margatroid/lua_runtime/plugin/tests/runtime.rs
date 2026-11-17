@@ -74,7 +74,8 @@ impl Fixture {
         let closures = app.world().closure_sender(RuntimePlugin::UPDATE);
         app.world_mut().insert_resource(LuaServices::new(move|identity,method,args|{let events=events.clone();let closures=closures.clone();Box::pin(async move{
             let invalid=|message:&str|LuaRuntimeError::new(LuaRuntimeErrorKind::InvalidRequest,message);
-            if method=="wait" {
+            if method=="execution_finished" { Ok(json!({}))
+            }else if method=="wait" {
                 let(tx,rx)=oneshot::channel();let source=identity.source;closures.send(move|world|{let _=tx.send(world.get_component::<DriverLuaVm>(source).unwrap().wake.clone());});let slot=rx.await.unwrap();let cancel=identity.cancel.clone();
                 tokio::select!{_=cancel.cancelled()=>Err(invalid("wait cancelled")),result=DriverWakeSlot::wait(slot)=>{result?;Ok(serde_json::Value::Null)}}
             }else if method=="mcl_execute"{

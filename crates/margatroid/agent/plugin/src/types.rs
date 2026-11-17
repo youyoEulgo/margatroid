@@ -1,5 +1,4 @@
 use agent_core::{AgentError, AgentErrorKind, AgentStartParameters, AgentState};
-use app_runtime_plugin::RuntimeEventSender;
 use async_runtime_plugin::AsyncTaskError;
 use closure_plugin::WorldClosureSender;
 use core_plugin::Entity;
@@ -13,7 +12,6 @@ pub(crate) struct FlowContext {
     pub agent: Entity,
     pub workspace: Entity,
     pub state: AgentState,
-    pub events: RuntimeEventSender,
     pub world: WorldClosureSender,
     pub parameters: Option<AgentStartParameters>,
     pub reply: Reply,

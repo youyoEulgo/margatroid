@@ -454,25 +454,30 @@ LuaExecutionTask（tool_core公开组件）
     tasks: ToolTasks
     input: Arc<tokio::sync::Mutex<mpsc::UnboundedReceiver<Value>>>
     resource_dir: PathBuf--自动任务的真实Lua入口路径
-    行为：复用原任务scope/输入/输出/Return能力，不持Agent生命周期；Workspace内部任务使用TaskSyncBinding.execution_only，不投Agent专属消息。
+    行为：复用原任务scope/输入/输出/Return能力，创建的Agent通过同一任务scope登记清理责任；Workspace内部任务使用TaskSyncBinding.execution_only，不投Agent专属消息。
 LuaServices安装（tool/plugin/src/services.rs）
     install(app: &mut App)
     install_on(app: &mut App, schedule: &str)
         行为：应用内唯一服务表，Weak World发送能力避免环；自动执行和tool bin转发使用同一invoke。
-    ExecutionBindings：Resource，Arc<Mutex<HashMap<执行实例, BTreeMap<登记id, MonitoredAgent>>>>
+    ExecutionBindings：Resource，三份Arc<Mutex<HashMap<执行实例,...>>>：诊断MonitoredAgent登记、Agent实际移除watch Receiver登记、在途创建完成watch Receiver列表
+    AgentTaskBinding：私有Component，保留Option<TaskBinding>及unlink闭包；真实Agent销毁时Drop注销任务scope回调并退休生命周期登记，提前主动StopAgent同样解除绑定
     MonitoredAgent：实际Entity、AgentSession、owned AgentStorage
     bound_context(world, agent) -> Value
         行为：在真实调用时从World取得Agent/Workspace Address、当前turn和实际AgentSession；与可信执行instance/source_address组合保留完整日志关联，不缓存启动时的回合。
-    bind_agent(world, instance, entity)
-        行为：Agent创建资源挂载后、返回信息前登记实际会话；安装LuaAgentMonitor解绑凭证，重启/停止资源时移除；无需帧扫描或轮询任务。
+    bind_agent(world, source, instance, entity)
+        行为：从确切source上的LuaExecutionTask/DriverLuaVm或ToolTasks.execution_id找到创建者真实任务；登记实际AgentSession、owned日志存储和Agent::removal完成观察。
+        同一TaskScope::bind回调持Weak服务World发送器，scope关闭时只对匹配完整Entity/Session且未Stopping的Agent提交原StopAgent；已有Stopping由原监督清理，等待仍以实际移除为准。
+        回调不持Agent或任务强引用环，作用域已关闭则立即排队停止；AgentTaskBinding保留撤销凭证至实际Agent销毁。LuaAgentMonitor继续独立承担日志关联，资源停止时移除不会提前丢生命周期等待。
     finish_execution(sender, identity, diagnostic)
-        行为：实际执行退出清理后精确取走本实例登记；正常/受控取消只退休登记，异常逐目标await日志blocking提交，再复检当前Entity/Session并发送原AgentException。
+        行为：先取走并等待本执行全部已受理Agent创建交接完成，防止Lua await被取消后StartAgent继续产生无归属实例。
+        精确取走诊断登记，关闭创建者任务scope，取走本执行Agent移除观察并逐一等待实际移除；watch丢失不冒充完成。正常/受控取消不写故障日志，绑定清理仍执行；异常保留原日志提交及仍匹配存活会话的AgentException处理。
+        任务finish、超时、异常、正常execute返回均沿此收口；return_result本身不关闭scope或停止Agent。调用失败时工具监督保留未清理任务并报告CleanupFailed，自动Lua将真实cleanup_result/ended标为错误，不确认task.complete_cleanup。
         持久日志提交驱动现有record probe直接投Clients；日志写入失败也不能遗漏其他Agent的error报告，聚合诊断错误。
     invoke(sender, identity, method, arguments) -> LuaServiceFuture
         行为：所有实际World读取/修改处validate_execution核对source Address、实际VM或唯一task-instance及取消状态。
         execution_log将自动执行的主动日志投递给实际绑定Agent存储，沿原提交探针发布；无Agent的诊断由Lua宿主直接按原级别输出tracing，受既有日志级别及过滤配置控制。
         agent_stop提交原StopAgent并在调用栈外监督原reply；
-        agent_create通过原StartAgent/oneshot挂载独立Agent并调用bind_agent；mcl_execute通过原MclCommand/oneshot；wait使用AgentWaitSlot；其他工具、成员、任务服务复用原入口。
+        agent_create在World受理时先登记在途创建watch、发送原StartAgent；另一个受监督异步闭包持有原启动oneshot，等资源挂载后bind_agent再发布创建完成并回复Lua；调用方Future取消不丢弃此闭包。创建者取消后不返回可用Agent，已创建实例仍通过scope关闭自动Stop并等待清理；mcl_execute通过原MclCommand/oneshot；wait使用AgentWaitSlot；其他工具、成员、任务服务复用原入口。
     acknowledge_execution(world: &World, identity: &LuaExecutionIdentity)
         行为：自动Lua首次wait或Return交接启动；短任务正常执行结束也可成功，Agent.ready不控制VM寿命。
 

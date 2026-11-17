@@ -91,6 +91,9 @@ Agent：Agent领域组件，不可克隆
     fault: Option<AgentError>--私有，只读fault() -> Option<&AgentError>
     updates: AgentUpdateContext
     source_alive: Arc<AtomicBool>
+    removed: tokio::sync::watch::Sender<bool>--new初始false
+    removal(&self) -> tokio::sync::watch::Receiver<bool>
+        行为：返回该实际Agent实例移除观察；等待者在完整生命周期清理及Entity销毁前不能视为完成。
     new(name: String, workspace: Entity, state: AgentState, turn: Option<String>, updates: AgentUpdateContext) -> Self
     updates(&self) -> AgentUpdateContext
     source_lease(&self) -> Arc<AtomicBool>
@@ -98,7 +101,7 @@ Agent：Agent领域组件，不可克隆
         行为：旧源失效后分配新的有效标记。
     close_source(&self)
     impl Component + Debug
-    impl Drop：关闭实际来源，已经排队的旧推理帧不能复活。
+    impl Drop：关闭实际来源，发布removed=true；正常停止仅在真实清理及监控等待后移除Entity，旧推理帧不能复活。
 
 AgentResources：Component
     parameters: AgentStartParameters--保留实际创建参数；UI目录是引用，配置目标为Agent持久文件
@@ -265,6 +268,7 @@ start_steps(context: &FlowContext) -> Future<Output = Result<(), StartFailure>>
     行为：prepare与install_runtime后同时提交InitToolTasks/InitInference并收齐原oneshot；失败不提前丢弃另一项，不启动VM。
 stop_runtime(context: &FlowContext, _require_vm: bool) -> Future<Output = Result<(), AgentError>>
     行为：关闭Agent受理、等待槽、推理及工具；按AgentOwner精确找到直接子Agent并通过原StopAgent逐个等待其递归清理。
+        对子Agent先经World核对完整Entity；已移除跳过，Stopping等待Agent::removal；其他状态提交原StopAgent并等待reply及实际移除。与创建者task scope触发停止并发时不重复Stop、不反向等待创建者VM。
         复用原tasks.finish、inference.wait_finished及MclDrain真实等待；之后按AgentSession调用DropTemporaryBlocks，保留持久Block和历史。
         移除AgentResources并等待实际UI/记录监控收口；不读取或终止创建者VM，不销毁协调Entity。
 
@@ -286,7 +290,6 @@ StartupBarrier(Arc<StartupCompletion>)：私有Component
 FlowContext：闭包上下文
     id: String--原请求ID
     agent: Entity
-    events: RuntimeEventSender
     parameters: Option<AgentStartParameters>--启动为Some，关闭为None
     reply: Option<oneshot::Sender<Result<Entity, AgentError>>>--原请求回复端
     startup: Arc<StartupCompletion>--同一实际启动工作完成屏障

@@ -91,6 +91,7 @@ impl Fixture {
         let closures = app.world().closure_sender(RuntimePlugin::UPDATE);
         app.world_mut().insert_resource(LuaServices::new(move|identity,method,args|{let events=events.clone();let closures=closures.clone();Box::pin(async move{
             match method.as_str(){
+                "execution_finished"=>Ok(json!({})),
                 "agent_create"=>Ok(json!({"address":"agent:local/driver-errors:latest"})),
                 "wait"=>{let(tx,rx)=oneshot::channel();closures.send(move|world|{let _=tx.send(world.get_component::<DriverLuaVm>(owner).unwrap().wake.clone());});let slot=rx.await.unwrap();tokio::select!{_=identity.cancel.cancelled()=>Err(LuaRuntimeError::new(LuaRuntimeErrorKind::Cancelled,"cancelled")),result=DriverWakeSlot::wait(slot)=>{result?;Ok(serde_json::Value::Null)}}},
                 "task_receive"=>std::future::pending::<Result<Value,LuaRuntimeError>>().await,

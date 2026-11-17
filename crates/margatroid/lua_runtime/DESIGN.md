@@ -159,8 +159,8 @@ stop_vm(context: StopContext) -> Future<Output = Result<StopOutput, StopError>>
 
 run_driver(context: RunContext) -> LocalFuture
     行为：沿原Workspace线程和监督运行execute_lua，捕获诊断；有AgentStorage时按原append_agent_log落库，无目标存储时通过运行日志记录。
-        执行完成后等待process registry真实cleanup，再关闭实际任务scope，经World complete_cleanup移除任务；不改变或销毁任何Agent。
-        进程真实清理后通过LuaServices.execution_finished交付本次执行诊断，等待绑定Agent日志提交及故障交接，再完成ended及DriverLuaVmExited；尚未交接启动则短任务正常结束确认成功、失败确认原错误。
+        执行完成后等待process registry真实cleanup，再经LuaServices.execution_finished关闭实际任务scope并等待创建的全部Agent实际移除，成功后经World complete_cleanup移除任务。Agent停止仍由公共服务提交原StopAgent完成，不在Lua运行器复制清理流程。
+        进程真实清理后通过LuaServices.execution_finished交付本次执行诊断，等待在途创建交接、绑定Agent真实停止及日志提交，再完成ended及DriverLuaVmExited；服务清理失败设置cleanup_result/ended错误且不确认task清理完成；尚未交接启动则短任务正常结束确认成功、失败确认原错误。
 execute_lua(context, environment, logger, processes) -> Future<Output = Result<(), LuaRuntimeError>>
     行为：调用共享create_environment，安装取消hook后复用configuration_globals/load_program；configure返回ToolConfiguration，纯阶段能力未启用。
         enable_execution加载同一标准库并恢复保存全局，Margatroid.enable安装相同公共方法；读取execute并异步调用，配置超时同时约束CPU及等待。

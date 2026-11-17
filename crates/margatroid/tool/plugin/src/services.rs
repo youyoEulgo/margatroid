@@ -111,8 +111,8 @@ async fn invoke(
    let config_path=arguments.get("config_path").and_then(Value::as_str).ok_or_else(||failure("Agent config_path required"))?.to_owned();
     let ui_path=arguments.get("ui_path").and_then(Value::as_str).ok_or_else(||failure("Agent ui_path required"))?.to_owned();
     if arguments.as_object().is_none_or(|fields|fields.keys().any(|key|!matches!(key.as_str(),"owner"|"name"|"config_path"|"ui_path"))){return Err(failure("unknown Agent creation parameter"));}
-   let cancel=identity.cancel.clone();let(tx,rx)=oneshot::channel();
-   let sender_for_info=sender.clone();let execution=identity.instance.clone();
+   let cancel=identity.cancel.clone();let(tx,rx)=oneshot::channel();let(info_tx,info_rx)=oneshot::channel();
+   let sender_for_info=sender.clone();let execution=identity.instance.clone();let creator=identity.source;
    world(sender,move|world|{validate_execution(world,&identity)?;
     let requested=address::Address::new(&owner).map_err(failure)?;
     let owner=world.query_with::<address::Address>().result().into_iter().find(|entity|world.get_component::<address::Address>(*entity)==Some(&requested)).ok_or_else(||failure("Agent owner missing"))?;
@@ -125,13 +125,21 @@ async fn invoke(
     };
     if name.is_empty()||matches!(name.as_str(),"."|"..")||name.chars().any(|c|matches!(c,'/'|'\\'|':')||c.is_control()){return Err(failure("invalid Agent name"));}
     let home=parent.join("agents").join(&name);let parameters=agent_core::AgentStartParameters{initial_settings_path:config_path.into(),ui_path:ui_path.into(),project_root:root.project_root.clone(),home_root:home.clone(),database_path:home.join("state.sqlite"),settings_path:home.join("setting.toml")};
-    world.send_event(agent_core::StartAgent{owner,id:format!("lua-create:{}",next()),workspace:identity.workspace,name,parameters,reply:Arc::new(std::sync::Mutex::new(Some(tx)))});Ok(())
-   }).await?;
-   let entity=rx.await.map_err(failure)?.map_err(failure)?;
-   let info=world(sender_for_info,move|world|{let agent=world.get_component::<agent_core::Agent>(entity).ok_or_else(||failure("created Agent missing"))?;let info=json!({"address":world.get_component::<address::Address>(entity).unwrap().as_str(),"name":agent.name(),"workspace":world.get_component::<address::Address>(agent.workspace()).unwrap().as_str()});bind_agent(world,&execution,entity)?;Ok(info)}).await?;
-   if cancel.is_cancelled(){return Err(failure("Agent creation caller cancelled after creation"));}Ok(info)
-  }
-  "wait"=>{
+    let(completed,completion)=tokio::sync::watch::channel(false);
+     world.get_resource::<ExecutionBindings>().unwrap().2.lock().unwrap().entry(execution.clone()).or_default().push(completion);
+     world.send_event(agent_core::StartAgent{owner,id:format!("lua-create:{}",next()),workspace:identity.workspace,name,parameters,reply:Arc::new(std::sync::Mutex::new(Some(tx)))});
+     async_runtime_plugin::WorldAsyncExt::send_async_closure(world,RuntimePlugin::UPDATE,move||async move{
+        let result=async{
+            let entity=rx.await.map_err(failure)?.map_err(failure)?;
+            self::world(sender_for_info,move|world|{let agent=world.get_component::<agent_core::Agent>(entity).ok_or_else(||failure("created Agent missing"))?;let info=json!({"address":world.get_component::<address::Address>(entity).unwrap().as_str(),"name":agent.name(),"workspace":world.get_component::<address::Address>(agent.workspace()).unwrap().as_str()});bind_agent(world,creator,&execution,entity)?;Ok(info)}).await
+        }.await;
+        completed.send_replace(true);let _=info_tx.send(result);Ok::<(),async_runtime_plugin::AsyncTaskError>(())
+     });Ok(())
+    }).await?;
+    let info=info_rx.await.map_err(failure)??;
+    if cancel.is_cancelled(){return Err(failure("Agent creation caller cancelled after creation"));}Ok(info)
+   }
+   "wait"=>{
    let target=arguments.as_str().ok_or_else(||failure("wait requires Agent address"))?.to_owned();let cancel=identity.cancel.clone();
    let slot=world(sender,move|world|{validate_execution(world,&identity)?;let address=address::Address::new(&target).map_err(failure)?;let entity=world.query_with::<address::Address>().result().into_iter().find(|entity|world.get_component::<address::Address>(*entity)==Some(&address)).ok_or_else(||failure("wait Agent missing"))?;
     if world.get_component::<agent_core::Agent>(entity).is_none_or(|agent|agent.workspace()!=identity.workspace){return Err(failure("wait target outside Workspace"));}
@@ -235,13 +243,63 @@ struct ExecutionBindings(
             std::collections::HashMap<String, std::collections::BTreeMap<u64, MonitoredAgent>>,
         >,
     >,
+    Arc<
+        std::sync::Mutex<
+            std::collections::HashMap<
+                String,
+                std::collections::BTreeMap<u64, tokio::sync::watch::Receiver<bool>>,
+            >,
+        >,
+    >,
+    Arc<
+        std::sync::Mutex<
+            std::collections::HashMap<String, Vec<tokio::sync::watch::Receiver<bool>>>,
+        >,
+    >,
 );
+struct AgentTaskBinding {
+    _binding: Option<tool_core::TaskBinding>,
+    unlink: Option<Box<dyn FnOnce() + Send + Sync>>,
+}
+impl core_plugin::Component for AgentTaskBinding {}
+impl Drop for AgentTaskBinding {
+    fn drop(&mut self) {
+        if let Some(unlink) = self.unlink.take() {
+            unlink();
+        }
+    }
+}
 impl core_plugin::Resource for ExecutionBindings {}
 fn bind_agent(
     world: &mut World,
+    source: core_plugin::Entity,
     instance: &str,
     entity: core_plugin::Entity,
 ) -> Result<(), LuaRuntimeError> {
+    let creator = world
+        .get_component::<tool_core::LuaExecutionTask>(source)
+        .filter(|_| {
+            world
+                .get_component::<lua_runtime_core::DriverLuaVm>(source)
+                .is_some_and(|vm| vm.instance.start_id == instance)
+        })
+        .map(|task| task.handle.clone())
+        .or_else(|| {
+            world
+                .get_component::<tool_core::ToolTasks>(source)
+                .and_then(|tasks| {
+                    tasks
+                        .list()
+                        .into_iter()
+                        .map(|(_, task)| task)
+                        .find(|task| task.execution_id() == instance)
+                })
+        })
+        .ok_or_else(|| failure("Agent creator task missing"))?;
+    let removal = world
+        .get_component::<agent_core::Agent>(entity)
+        .ok_or_else(|| failure("created Agent missing"))?
+        .removal();
     let session = world
         .get_component::<agent_core::AgentSession>(entity)
         .ok_or_else(|| failure("Agent session missing"))?
@@ -266,6 +324,87 @@ fn bind_agent(
                 storage,
             },
         );
+    let lifetimes = world.get_resource::<ExecutionBindings>().unwrap().1.clone();
+    lifetimes
+        .lock()
+        .unwrap()
+        .entry(instance.to_owned())
+        .or_default()
+        .insert(id, removal);
+    let weak_sender = Arc::downgrade(&world.get_resource::<ServiceOwner>().unwrap()._sender);
+    let expected_session = world
+        .get_component::<agent_core::AgentSession>(entity)
+        .unwrap()
+        .0
+        .clone();
+    let stop: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+        if let Some(sender) = weak_sender.upgrade() {
+            let expected_session = expected_session.clone();
+            sender.send(move |world| {
+                if world
+                    .get_component::<agent_core::AgentSession>(entity)
+                    .is_none_or(|session| session.0 != expected_session)
+                {
+                    return;
+                }
+                if world
+                    .get_component::<agent_core::Agent>(entity)
+                    .is_none_or(|agent| agent.state() == agent_core::AgentState::Stopping)
+                {
+                    return;
+                }
+                let (tx, rx) = oneshot::channel();
+                world.send_event(agent_core::StopAgent {
+                    id: format!("task-agent-stop:{}", next()),
+                    agent: entity,
+                    reply: Arc::new(std::sync::Mutex::new(Some(tx))),
+                });
+                async_runtime_plugin::WorldAsyncExt::send_async_closure(
+                    world,
+                    RuntimePlugin::UPDATE,
+                    move || async move {
+                        match rx.await {
+                            Ok(Ok(_))=>{},
+                            Ok(Err(failure)) if matches!(failure.kind,agent_core::AgentErrorKind::StateRejected|agent_core::AgentErrorKind::AgentMissing)=>{
+                                // Another ordinary stop may have won the same-frame race.
+                                // The creator still waits for actual Entity removal below.
+                                tracing::debug!(%failure,"task-bound Agent stop overlapped another stop");
+                            },
+                            result=>tracing::error!(?result,"task-bound Agent cleanup remains unconfirmed"),
+                        }
+                        Ok::<(), async_runtime_plugin::AsyncTaskError>(())
+                    },
+                );
+            });
+        }
+    });
+    let callback = stop.clone();
+    let binding = match creator.registration_scope().bind(move || callback()) {
+        Ok(binding) => Some(binding),
+        Err(_) => {
+            stop();
+            None
+        }
+    };
+    let weak_lifetimes = Arc::downgrade(&lifetimes);
+    let execution = instance.to_owned();
+    world.insert_component(
+        entity,
+        AgentTaskBinding {
+            _binding: binding,
+            unlink: Some(Box::new(move || {
+                if let Some(lifetimes) = weak_lifetimes.upgrade() {
+                    let mut entries = lifetimes.lock().unwrap();
+                    if let Some(agents) = entries.get_mut(&execution) {
+                        agents.remove(&id);
+                        if agents.is_empty() {
+                            entries.remove(&execution);
+                        }
+                    }
+                }
+            })),
+        },
+    );
     let weak = Arc::downgrade(&registry);
     let instance = instance.to_owned();
     world.insert_component(
@@ -293,6 +432,26 @@ async fn finish_execution(
     identity: LuaExecutionIdentity,
     diagnostic: Value,
 ) -> Result<Value, LuaRuntimeError> {
+    let execution = identity.instance.clone();
+    let creations = world(sender.clone(), move |world| {
+        Ok(world
+            .get_resource::<ExecutionBindings>()
+            .unwrap()
+            .2
+            .lock()
+            .unwrap()
+            .remove(&execution)
+            .unwrap_or_default())
+    })
+    .await?;
+    for mut creation in creations {
+        while !*creation.borrow_and_update() {
+            creation
+                .changed()
+                .await
+                .map_err(|_| failure("Agent creation cleanup handoff was lost"))?;
+        }
+    }
     let instance = identity.instance.clone();
     let agents = world(sender.clone(), move |world| {
         let agents = world
@@ -312,6 +471,44 @@ async fn finish_execution(
             .collect::<Vec<_>>())
     })
     .await?;
+    let execution = identity.instance.clone();
+    let source = identity.source;
+    let mut pending = world(sender.clone(), move |world| {
+        if let Some(task) = world.get_component::<tool_core::LuaExecutionTask>(source) {
+            if world
+                .get_component::<lua_runtime_core::DriverLuaVm>(source)
+                .is_some_and(|vm| vm.instance.start_id == execution)
+            {
+                task.handle.close_registrations();
+            }
+        }
+        if let Some(tasks) = world.get_component::<tool_core::ToolTasks>(source) {
+            for (_, task) in tasks.list() {
+                if task.execution_id() == execution {
+                    task.close_registrations();
+                }
+            }
+        }
+        Ok(world
+            .get_resource::<ExecutionBindings>()
+            .unwrap()
+            .1
+            .lock()
+            .unwrap()
+            .remove(&execution)
+            .unwrap_or_default()
+            .into_values()
+            .collect::<Vec<_>>())
+    })
+    .await?;
+    for removal in &mut pending {
+        while !*removal.borrow_and_update() {
+            removal
+                .changed()
+                .await
+                .map_err(|_| failure("task-bound Agent removal was not confirmed"))?;
+        }
+    }
     if diagnostic.is_null() {
         return Ok(json!({}));
     }

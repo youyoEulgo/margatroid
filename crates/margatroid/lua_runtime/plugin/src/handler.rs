@@ -547,6 +547,7 @@ async fn run_driver(mut context: RunContext) {
         cleanup_result = Err(error.clone());
         result = Err(error);
     }
+    let mut agent_cleanup_confirmed = true;
     if let Some(services) = &context.services {
         let diagnostic = if failure_diagnostic.is_null() {
             result.as_ref().err().filter(|error|error.kind!=LuaRuntimeErrorKind::Cancelled).map(|error|serde_json::json!({"message":error.description,"raw_error":error.description,"origin":context.program.origin.to_string_lossy()})).unwrap_or(serde_json::Value::Null)
@@ -568,6 +569,9 @@ async fn run_driver(mut context: RunContext) {
             .await
         {
             tracing::error!(%error,"Lua Agent monitor completion failed");
+            agent_cleanup_confirmed = false;
+            cleanup_result = Err(error.clone());
+            result = Err(error);
         }
     }
     let source = context.instance.owner;
@@ -580,7 +584,9 @@ async fn run_driver(mut context: RunContext) {
             .cloned()
         {
             task.handle.cancel();
-            task.tasks.complete_cleanup(&id, &task.handle, None);
+            if agent_cleanup_confirmed {
+                task.tasks.complete_cleanup(&id, &task.handle, None);
+            }
         }
         let _ = tx.send(());
     });

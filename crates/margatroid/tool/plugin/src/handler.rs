@@ -467,6 +467,8 @@ async fn supervise_tool(mut context: ToolExecutionContext) {
             .await
         {
             tracing::error!(%failure,"tool Agent monitor completion failed");
+            handle.set_error(error(Kind::CleanupFailed, failure.to_string()));
+            return;
         }
     }
     if cleanup_confirmed {

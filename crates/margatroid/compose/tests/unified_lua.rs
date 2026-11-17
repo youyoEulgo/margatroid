@@ -176,7 +176,9 @@ fn identical_lua_programs_create_independent_agents_and_stop_without_owning_the_
     );
     let mut app = build_app(ApplicationOptions {
         data_root: root.path().into(),
-        runner_path: std::env::current_exe().unwrap(),
+        runner_path: std::env::var_os("MARGATROID_LIFETIME_TEST_BINARY")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::env::current_exe().unwrap()),
     })
     .unwrap();
     let (tx, mut rx) = oneshot::channel();
@@ -375,6 +377,268 @@ fn identical_lua_programs_create_independent_agents_and_stop_without_owning_the_
         .unwrap();
     runtime.block_on(compose::shutdown_app(&mut app)).unwrap();
 }
+
+fn creator_tasks_own_agents_until_explicit_stop_or_actual_task_cleanup() {
+    for mode in [
+        "normal",
+        "error",
+        "finish",
+        "explicit",
+        "parent-stop",
+        "create-cancel",
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        write(root.path(), "config.toml", "[server]\nbind='127.0.0.1:0'\n");
+        write(
+            root.path(),
+            "models.toml",
+            "[[models]]\nid='offline'\nmodel='unused'\nprovider='openai'\napi_type='chat_completions'\nbase_url='http://127.0.0.1:1/v1'\napi_key='unused'\n",
+        );
+        for dir in ["tools", "prompts", "sandboxes", "skills"] {
+            std::fs::create_dir_all(root.path().join(dir)).unwrap();
+        }
+        write(
+            root.path(),
+            "agent-drivers/probe/owner/latest/base.lua",
+            r#"
+function configure()return {timeout_ms=0}end
+function execute(_,ctx)
+ local agent=margatroid.agent:create({owner=ctx.workspace.address,name=ctx.name,config_path=ctx.resource_dir..'/setting.toml',ui_path=ctx.resource_dir..'/ui'})
+ assert(not margatroid.mcl:execute(agent.address,'IMPORT TOOL tool:probe/child:latest AS spawn_child').Error)
+ assert(not margatroid.mcl:execute(agent.address,'EFFECT ready').Error)
+ margatroid.task:return_result(agent.address)
+ margatroid.task:receive()
+end
+"#,
+        );
+        write(
+            root.path(),
+            "agent-drivers/probe/owner/latest/setting.toml",
+            "",
+        );
+        write(
+            root.path(),
+            "tools/probe/child/latest/tool.toml",
+            "schema_version=1\ndescription='create task-owned agents'\n",
+        );
+        write(
+            root.path(),
+            "tools/probe/child/latest/input.schema.json",
+            "{}",
+        );
+        write(root.path(), "tools/probe/child/latest/setting.toml", "");
+        write(
+            root.path(),
+            "tools/probe/child/latest/main.lua",
+            r#"
+function configure()return {timeout_ms=0}end
+function execute(_,ctx)
+ local agents={}
+ for i=1,2 do
+  agents[i]=margatroid.agent:create({owner=ctx.agent_info.address,name='child'..i,config_path=ctx.resource_dir..'/setting.toml',ui_path=ctx.resource_dir..'/ui'})
+  assert(not margatroid.mcl:execute(agents[i].address,'EFFECT ready').Error)
+ end
+ margatroid.task:return_result({task_id=ctx.task_id})
+ local action=margatroid.task:receive()
+ if action=='explicit' then
+  for _,agent in ipairs(agents) do margatroid.agent:stop(agent.address) end
+  margatroid.task:receive()
+ elseif action=='error' then error('task-owner-failure') end
+end
+"#,
+        );
+        let definition = root.path().join("workspaces/test/workspace.yaml");
+        write(
+            root.path(),
+            "workspaces/test/workspace.yaml",
+            &format!(
+                "name: test\nproject_root: {}\nmembers:\n- name: parent\n  driver: driver:probe/owner:latest\n  home_root: {}\n",
+                root.path().display(),
+                root.path().display()
+            ),
+        );
+        let mut app = build_app(ApplicationOptions {
+            data_root: root.path().into(),
+            runner_path: std::env::var_os("MARGATROID_LIFETIME_TEST_BINARY")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| std::env::current_exe().unwrap()),
+        })
+        .unwrap();
+        let (tx, mut rx) = oneshot::channel();
+        app.world().emit_event(StartWorkspace {
+            id: "start".into(),
+            path: definition,
+            reply: Arc::new(Mutex::new(Some(tx))),
+        });
+        if mode == "create-cancel" {
+            until(&mut app, |world| {
+                !world.query_with::<agent_core::Agent>().result().is_empty()
+            });
+            let source = app
+                .world()
+                .query_with::<lua_runtime_core::WorkspaceLuaTask>()
+                .result()[0];
+            let handle = app
+                .world()
+                .get_component::<tool_core::LuaExecutionTask>(source)
+                .unwrap()
+                .handle
+                .clone();
+            app.world()
+                .get_component::<lua_runtime_core::DriverLuaVm>(source)
+                .unwrap()
+                .cancel
+                .cancel();
+            let _ = drive(&mut app, &mut rx);
+            until(&mut app, |world| {
+                handle.is_cleanup_complete()
+                    && world.query_with::<agent_core::Agent>().result().is_empty()
+            });
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            rt.block_on(compose::shutdown_app(&mut app)).unwrap();
+            continue;
+        }
+        let workspace = drive(&mut app, &mut rx).unwrap();
+        let parent = app.world().query_with::<agent_core::Agent>().result()[0];
+        let source = app.world_mut().spawn();
+        app.world_mut().insert_component(
+            source,
+            address::Address::new("client:test/lifetime").unwrap(),
+        );
+        let (tx, mut rx) = oneshot::channel();
+        app.world().emit_event(MclCommand {
+            id: "spawn-task".into(),
+            source,
+            source_address: "client:test/lifetime:latest".into(),
+            source_instance: None,
+            target: parent,
+            instruction: MclInstruction {
+                text: "EFFECT tool_call ?".into(),
+                arguments: vec![
+                    serde_json::json!([{"id":"spawn","tool_name":"spawn_child","arguments":"{}"}]),
+                ],
+            },
+            cancel: CancellationToken::new(),
+            reply: Arc::new(Mutex::new(Some(tx))),
+        });
+        let result = drive(&mut app, &mut rx).unwrap();
+        assert!(!matches!(result, MclValue::Error(_)), "{result:?}");
+        let tasks = app
+            .world()
+            .get_component::<tool_core::ToolTasks>(parent)
+            .unwrap()
+            .clone();
+        let (task_id, task) = tasks
+            .list()
+            .into_iter()
+            .find(|(_, handle)| handle.has_returned())
+            .unwrap();
+        let children = app
+            .world()
+            .query_with::<agent_core::Agent>()
+            .result()
+            .into_iter()
+            .filter(|entity| *entity != parent)
+            .collect::<Vec<_>>();
+        assert_eq!(children.len(), 2);
+        assert!(!task.is_cleanup_complete());
+        let mut stop_reply = None;
+        if mode == "parent-stop" {
+            let (tx, rx) = oneshot::channel();
+            app.world().emit_event(agent_core::StopAgent {
+                id: "parent-stop".into(),
+                agent: parent,
+                reply: Arc::new(Mutex::new(Some(tx))),
+            });
+            stop_reply = Some(rx);
+        } else if mode == "finish" {
+            let child_tasks = app
+                .world()
+                .get_component::<tool_core::ToolTasks>(children[0])
+                .unwrap()
+                .clone();
+            let (tx, _rx) = oneshot::channel();
+            let (held, _input) = tool_core::ToolTaskHandle::new(
+                &tool_core::ToolExecutionLimits::default(),
+                "held".into(),
+                "held".into(),
+                tx,
+                child_tasks.update_context(),
+                None,
+            )
+            .unwrap();
+            child_tasks.register("held".into(), held.clone()).unwrap();
+            let (release, wait) = oneshot::channel();
+            let cleanup = held.clone();
+            let runtime = tokio::runtime::Runtime::new().unwrap();
+            held.attach_task(runtime.spawn(async move {
+                wait.await.unwrap();
+                child_tasks.complete_cleanup("held", &cleanup, None);
+            }))
+            .unwrap();
+            let finishing = task.clone();
+            let (tx, mut rx) = oneshot::channel();
+            async_runtime_plugin::WorldAsyncExt::send_async_closure(
+                app.world(),
+                app_runtime_plugin::RuntimePlugin::UPDATE,
+                move || async move {
+                    let result = finishing.finish().await;
+                    let _ = tx.send(result);
+                    Ok::<(), async_runtime_plugin::AsyncTaskError>(())
+                },
+            );
+            until(&mut app, |_| held.cancel_token().is_cancelled());
+            assert!(rx.try_recv().is_err());
+            assert!(!task.is_cleanup_complete());
+            assert!(app.world().is_alive(children[0]));
+            release.send(()).unwrap();
+            drive(&mut app, &mut rx).unwrap();
+            assert!(children.iter().all(|entity| !app.world().is_alive(*entity)));
+        } else {
+            tasks.send(&task_id, serde_json::json!(mode)).unwrap();
+        }
+        until(&mut app, |world| {
+            children.iter().all(|entity| !world.is_alive(*entity))
+        });
+        if mode == "explicit" {
+            assert!(!task.is_cleanup_complete());
+            let task = task.clone();
+            let (tx, mut rx) = oneshot::channel();
+            async_runtime_plugin::WorldAsyncExt::send_async_closure(
+                app.world(),
+                app_runtime_plugin::RuntimePlugin::UPDATE,
+                move || async move {
+                    let _ = tx.send(task.finish().await);
+                    Ok::<(), async_runtime_plugin::AsyncTaskError>(())
+                },
+            );
+            drive(&mut app, &mut rx).unwrap();
+        }
+        if let Some(mut rx) = stop_reply {
+            drive(&mut app, &mut rx).unwrap();
+        }
+        until(&mut app, |_| task.is_cleanup_complete());
+        assert!(children.iter().all(|entity| !app.world().is_alive(*entity)));
+        if mode != "parent-stop" {
+            assert!(app.world().is_alive(parent));
+        }
+        let (tx, mut rx) = oneshot::channel();
+        app.world().emit_event(StopWorkspace {
+            id: "stop-workspace".into(),
+            workspace: workspace.workspace,
+            reply: Arc::new(Mutex::new(Some(tx))),
+        });
+        drive(&mut app, &mut rx).unwrap();
+        assert!(
+            app.world()
+                .query_with::<agent_core::Agent>()
+                .result()
+                .is_empty()
+        );
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(compose::shutdown_app(&mut app)).unwrap();
+    }
+}
 fn main() {
     if std::env::args()
         .nth(1)
@@ -386,6 +650,7 @@ fn main() {
             .unwrap();
         std::process::exit(rt.block_on(tool_plugin::runner_main()));
     }
+    creator_tasks_own_agents_until_explicit_stop_or_actual_task_cleanup();
     let tests: Vec<(&str, fn())> = vec![(
         "identical_lua_programs_create_independent_agents_and_stop_without_owning_the_vm",
         identical_lua_programs_create_independent_agents_and_stop_without_owning_the_vm,

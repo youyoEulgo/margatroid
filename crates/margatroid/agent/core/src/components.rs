@@ -8,6 +8,7 @@ pub struct Agent {
     pub(crate) turn: Option<String>,
     pub(crate) fault: Option<crate::AgentError>,
     pub(crate) updates: crate::AgentUpdateContext,
+    removed: tokio::sync::watch::Sender<bool>,
     source_alive: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 impl Agent {
@@ -19,6 +20,7 @@ impl Agent {
         updates: crate::AgentUpdateContext,
     ) -> Self {
         Self {
+            removed: tokio::sync::watch::channel(false).0,
             name,
             workspace,
             state,
@@ -27,6 +29,9 @@ impl Agent {
             fault: None,
             updates,
         }
+    }
+    pub fn removal(&self) -> tokio::sync::watch::Receiver<bool> {
+        self.removed.subscribe()
     }
     pub fn name(&self) -> &String {
         &self.name
@@ -70,6 +75,7 @@ impl Component for AgentResources {}
 impl Drop for Agent {
     fn drop(&mut self) {
         self.close_source();
+        self.removed.send_replace(true);
     }
 }
 

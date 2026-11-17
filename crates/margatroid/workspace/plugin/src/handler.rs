@@ -637,20 +637,6 @@ async fn stop_members_and_join(
                     .is_none_or(|owner| owner.0 == workspace)
             })
             .collect::<BTreeSet<_>>();
-        for member in &members {
-            let agent = world.get_component::<Agent>(*member).ok_or_else(|| {
-                error(
-                    WorkspaceErrorKind::CleanupFailed,
-                    "workspace contains a missing or unconfirmed member",
-                )
-            })?;
-            if agent.state() == AgentState::Stopping {
-                return Err(error(
-                    WorkspaceErrorKind::Busy,
-                    "member creation or lifecycle cleanup has not confirmed completion",
-                ));
-            }
-        }
         let close = world
             .get_component::<WorkspaceExecutor>(workspace)
             .map(|executor| {
@@ -701,24 +687,72 @@ async fn stop_members_and_join(
     }
     let mut failures = Vec::new();
     for member in &members {
-        let (sender, receiver) = oneshot::channel();
-        context.events.send_event(StopAgent {
-            id: format!(
-                "{}:stop:{}:{}",
-                context.id,
-                member.index(),
-                member.generation()
-            ),
-            agent: *member,
-            reply: Arc::new(Mutex::new(Some(sender))),
-        });
-        match receiver.await {
-            Ok(Ok(stopped)) if stopped == *member => {}
-            Ok(Ok(_)) => failures.push("StopAgent replied with a different Entity".to_owned()),
-            Ok(Err(error)) => failures.push(error.to_string()),
-            Err(error) => failures.push(format!(
-                "member stop reply closed without cleanup proof: {error}"
-            )),
+        let member = *member;
+        let id = format!(
+            "{}:stop:{}:{}",
+            context.id,
+            member.index(),
+            member.generation()
+        );
+        let pending = with_world(context, move |world| {
+            let Some(agent) = world.get_component::<Agent>(member) else {
+                return Ok(None);
+            };
+            let removal = agent.removal();
+            if agent.state() == AgentState::Stopping {
+                return Ok(Some((removal, None)));
+            }
+            let (sender, receiver) = oneshot::channel();
+            world.send_event(StopAgent {
+                id,
+                agent: member,
+                reply: Arc::new(Mutex::new(Some(sender))),
+            });
+            Ok(Some((removal, Some(receiver))))
+        })
+        .await?;
+        if let Some((mut removal, reply)) = pending {
+            if let Some(reply) = reply {
+                match reply.await {
+                    Ok(Ok(stopped)) if stopped == member => {}
+                    Ok(Ok(_)) => {
+                        failures.push("StopAgent replied with a different Entity".into());
+                        continue;
+                    }
+                    Ok(Err(failure)) => {
+                        let concurrent = if matches!(
+                            failure.kind,
+                            agent_core::AgentErrorKind::StateRejected
+                                | agent_core::AgentErrorKind::AgentMissing
+                        ) {
+                            with_world(context, move |world| {
+                                Ok(world
+                                    .get_component::<Agent>(member)
+                                    .is_none_or(|agent| agent.state() == AgentState::Stopping))
+                            })
+                            .await?
+                        } else {
+                            false
+                        };
+                        if !concurrent {
+                            failures.push(failure.to_string());
+                            continue;
+                        }
+                    }
+                    Err(error) => {
+                        failures.push(format!(
+                            "member stop reply closed without cleanup proof: {error}"
+                        ));
+                        continue;
+                    }
+                }
+            }
+            while !*removal.borrow_and_update() {
+                if let Err(error) = removal.changed().await {
+                    failures.push(format!("member removal unconfirmed: {error}"));
+                    break;
+                }
+            }
         }
     }
     if !failures.is_empty() {

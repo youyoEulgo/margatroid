@@ -1,9 +1,8 @@
-use app_runtime_plugin::RuntimePlugin;
 use client_core::{ClientFrame, ClientIdentity, ClientSender, Clients, ConnectionId};
 use compose::{ApplicationOptions, build_app};
 use core_plugin::{App, Entity};
 use mcl_core::{MclCommand, MclInstruction, MclValue};
-use serde_json::{Value, json};
+use serde_json::Value;
 use std::{
     path::Path,
     sync::{Arc, Mutex},
@@ -145,29 +144,21 @@ end
         MclValue::Error(_)
     ));
     command(&mut app, client, agent, "EFFECT wake");
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        app.tick();
-        if app
-            .world()
-            .get_component::<agent_core::Agent>(agent)
-            .unwrap()
-            .state()
-            == agent_core::AgentState::Error
-        {
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "VM monitor did not publish error"
-        );
-        std::thread::sleep(Duration::from_millis(1));
-    }
     let storage = app
         .world()
         .get_component::<storage_core::AgentStorage>(agent)
-        .unwrap();
-    let logs = storage_core::read_agent_logs(storage, None, 50).unwrap();
+        .unwrap()
+        .clone();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while app.world().is_alive(agent) {
+        app.tick();
+        assert!(
+            Instant::now() < deadline,
+            "failed creator task did not clean its Agent"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let logs = storage_core::read_agent_logs(&storage, None, 50).unwrap();
     assert_eq!(logs.len(), 2);
     assert_eq!(logs[0].record.message, "starting-probe");
     assert!(
@@ -210,16 +201,10 @@ end
                     messages.push(serde_json::from_str(&text).unwrap());
                 }
                 if messages.iter().any(|value| {
-                    value["type"] == "agent.log.sync"
-                        && value["records"].as_array().is_some_and(|rows| {
-                            rows.iter().any(|row| {
-                                row["raw_error"]
-                                    .as_str()
-                                    .is_some_and(|raw| raw.contains("EFFECT model_set ?"))
-                            })
-                        })
-                }) && messages.iter().any(|value| {
-                    value["type"] == "agent.sync" && value["agents"][0]["status"] == "error"
+                    value["type"] == "agent.sync"
+                        && value["agents"]
+                            .as_array()
+                            .is_some_and(|agents| agents.is_empty())
                 }) {
                     break;
                 }
@@ -236,69 +221,8 @@ end
             .all(|value| value["agents"][0]["status"] != "running"),
         "Agent was falsely made ready"
     );
-    let execution = app
-        .world()
-        .query_with::<lua_runtime_core::WorkspaceLuaTask>()
-        .result()
-        .into_iter()
-        .find(|entity| {
-            app.world()
-                .get_component::<lua_runtime_core::WorkspaceLuaTask>(*entity)
-                .unwrap()
-                .name
-                == "control"
-        })
-        .unwrap();
-    let vm = app
-        .world()
-        .get_component::<lua_runtime_core::DriverLuaVm>(execution)
-        .unwrap();
-    let identity = lua_runtime_core::LuaExecutionIdentity {
-        source: execution,
-        workspace: workspace.workspace,
-        address: app
-            .world()
-            .get_component::<address::Address>(execution)
-            .unwrap()
-            .as_str()
-            .into(),
-        instance: vm.instance.start_id.clone(),
-        cancel: vm.cancel.clone(),
-    };
-    let services = app
-        .world()
-        .get_resource::<lua_runtime_core::LuaServices>()
-        .unwrap()
-        .clone();
-    let target = app
-        .world()
-        .get_component::<address::Address>(agent)
-        .unwrap()
-        .as_str()
-        .to_owned();
-    let (tx, mut accepted) = oneshot::channel();
-    async_runtime_plugin::WorldAsyncExt::send_async_closure(
-        app.world(),
-        RuntimePlugin::UPDATE,
-        move || async move {
-            let _ = tx.send(
-                services
-                    .call(identity, "agent_stop".into(), json!(target))
-                    .await,
-            );
-            Ok::<(), async_runtime_plugin::AsyncTaskError>(())
-        },
-    );
-    assert_eq!(drive(&mut app, &mut accepted).unwrap(), json!({}));
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while app.world().is_alive(agent) {
-        app.tick();
-        assert!(
-            Instant::now() < deadline,
-            "injected stop could not clean an error Agent"
-        );
-        std::thread::sleep(Duration::from_millis(1));
-    }
+    // The failing execution's bound Agent has already completed ordinary StopAgent cleanup.
+    assert!(!app.world().is_alive(agent));
     let (tx, mut rx) = oneshot::channel();
     app.world().emit_event(StopWorkspace {
         id: "stop".into(),

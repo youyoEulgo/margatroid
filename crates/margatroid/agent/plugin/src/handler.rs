@@ -199,7 +199,6 @@ fn context(
         state,
         parameters,
         reply,
-        events: world.event_sender(),
         world: world.closure_sender(&installed.schedule),
     }
 }
@@ -809,14 +808,57 @@ async fn stop_runtime(context: &FlowContext, _require_vm: bool) -> Result<(), Ag
     })
     .await?;
     for child in children {
-        let (tx, rx) = oneshot::channel();
-        context.events.send_event(StopAgent {
-            id: format!("{}:child:{}", context.id, child.index()),
-            agent: child,
-            reply: Arc::new(Mutex::new(Some(tx))),
-        });
-        rx.await
-            .map_err(|e| error(AgentErrorKind::ReplyClosed, e))??;
+        let id = format!("{}:child:{}", context.id, child.index());
+        let pending = with_world(context, move |world| {
+            let Some(component) = world.get_component::<Agent>(child) else {
+                return Ok(None);
+            };
+            let removal = component.removal();
+            if component.state() == AgentState::Stopping {
+                return Ok(Some((removal, None)));
+            }
+            let (tx, rx) = oneshot::channel();
+            world.send_event(StopAgent {
+                id,
+                agent: child,
+                reply: Arc::new(Mutex::new(Some(tx))),
+            });
+            Ok(Some((removal, Some(rx))))
+        })
+        .await?;
+        if let Some((mut removal, reply)) = pending {
+            if let Some(reply) = reply {
+                if let Err(failure) = reply
+                    .await
+                    .map_err(|e| error(AgentErrorKind::ReplyClosed, e))?
+                {
+                    let concurrent = if matches!(
+                        failure.kind,
+                        AgentErrorKind::StateRejected | AgentErrorKind::AgentMissing
+                    ) {
+                        with_world(context, move |world| {
+                            Ok(world
+                                .get_component::<Agent>(child)
+                                .is_none_or(|agent| agent.state() == AgentState::Stopping))
+                        })
+                        .await?
+                    } else {
+                        false
+                    };
+                    if !concurrent {
+                        return Err(failure);
+                    }
+                }
+            }
+            while !*removal.borrow_and_update() {
+                removal.changed().await.map_err(|_| {
+                    error(
+                        AgentErrorKind::CleanupFailed,
+                        "child Agent removal was not confirmed",
+                    )
+                })?;
+            }
+        }
     }
     let snapshot = with_world(context, move |world| {
         check_agent(world, agent, workspace, state)?;

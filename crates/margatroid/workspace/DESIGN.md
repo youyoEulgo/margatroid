@@ -217,7 +217,7 @@ mount_executor(context, definition, state) / start_members(context, definition)
 
 stop_flow(context: WorkspaceFlowContext) -> Future<Output = Result<StopOutput, StopError>>
     行为：等待已受理创建收口，先关闭新提交并逐个停止WorkspaceLuaTask对应实际执行，等待StopDriverLuaVm原oneshot及ended；移除独立执行Entity。
-        再对直接归属Workspace的Agent发送StopAgent并等待reply，子Agent由父Agent递归清理；最后执行线程退出并在线程外join，不销毁协调Entity。
+        再经World逐个核对直接归属Workspace的Agent；任务scope清理已移除的成员跳过，Stopping成员等待Agent::removal，其他成员提交原StopAgent并等待reply及实际移除；子Agent由父Agent递归清理；最后执行线程退出并在线程外join，不销毁协调Entity。
 
 
 ```
