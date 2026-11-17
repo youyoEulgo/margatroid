@@ -108,3 +108,6 @@ Rust类型、机器Schema和可执行样例已同步，AsyncAPI引用新Schema�
 历史compact消息保留type=compact及assistant同结构字段，推理边界按assistant处理。压缩推理原始生成full仍为assistant；Driver写入历史的compact记录通过普通持久记录同步交付，generation=null且携带真实history_sequence，不伪装成同一generation的第二条终态。前端需接受compact并按assistant布局或压缩摘要展示；本轮不改前端源码。
 
 推理失败的mcl.execute.result为success=true、data.kind=inference，其value.message是error AgentMessage且value.stop_reason=error；原请求id保留。success仅表示MCL成功交付领域结果，不表示模型推理成功。compact()由调用方把成功compact或失败error写入历史，前端可查询并展示二者。
+
+models.toml现支持每次推理前有界重读并按id选择，文件损坏/删除或id缺失均失败，不回退启动快照。既有ModelRoutes只服务最近安全公共投影；有效文件改动刷新Agent安全model信息，无效文件清空投影。
+model.config.req/res/sync及model.config.update/update.result已实现，读取/同步原始TOML供编辑，修改完整校验后原子覆盖同一文件并保留权限；外部编辑/原子替换/删除也触发同一来源监控。无需Workspace、Agent或turn，不接收客户端文件路径，不新增持久目录/数据库或领域System/事件。接口遵循原注册、ingress、backend_state目标和id关联规则；前端源码未改。

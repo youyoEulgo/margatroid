@@ -174,10 +174,7 @@ onMounted(async () => {
         <h3><Cpu :size="14" /> Model</h3>
         <div v-if="model" class="info-model">
           <div>
-            <span>Model</span><code>{{ model.model }}</code>
-          </div>
-          <div>
-            <span>Route</span><code>{{ model.id }}</code>
+            <span>Model</span><code>{{ model.id }}</code>
           </div>
           <div>
             <span>Provider / API</span><code>{{ model.provider }} · {{ model.api_type }}</code>

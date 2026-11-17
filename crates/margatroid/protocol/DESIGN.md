@@ -51,9 +51,13 @@ logical_name / validate_path / validate_target / validate_address / validate_ima
 公开：
 ```text
 AddressDto = String
+ModelConfigUpdateDto { content: String }--无路径参数；UTF-8最多1MiB
+    行为：model.config.res成功必有content，失败省略；sync必有content/error且不带id，可选值均nullable，content为文本时error必须为null；update.result只有success/error，沿原请求id关联。
 
-ClientMessage：18种入站枚举，每个variant均为type、id和message信封
+ClientMessage：20种入站枚举，每个variant均为type、id和message信封
     ConnectionRegister { id: String, message: RegisterConnectionDto }
+    ModelConfigReq { id: String, message: EmptyDto }
+    ModelConfigUpdate { id: String, message: ModelConfigUpdateDto }
     WorkspaceReq { id: String, message: EmptyDto }
     WorkspaceStart { id: String, message: WorkspacePathDto }
     WorkspaceStop { id: String, message: WorkspacePathDto }
@@ -72,8 +76,11 @@ ClientMessage：18种入站枚举，每个variant均为type、id和message信封
     AgentMclReq { id: String, message: AgentRecordsQueryDto }
     MclExecute { id: String, message: MclExecuteDto }
 
-ServerMessage：27种出站枚举，type之外的字段位于顶层，不包message
+ServerMessage：30种出站枚举，type之外的字段位于顶层，不包message
     ConnectionRegisterResult { id: String, success: bool, client: Option<ClientInfoDto>, error: Option<ProtocolErrorDto> }
+    ModelConfigRes { id: String, success: bool, content: Option<String>, error: Option<ProtocolErrorDto> }
+    ModelConfigSync { content: Option<String>, error: Option<ProtocolErrorDto> }
+    ModelConfigUpdateResult { id: String, success: bool, error: Option<ProtocolErrorDto> }
     WorkspaceRes { id: String, success: bool, workspaces: Option<Vec<WorkspaceInfoDto>>, error: Option<ProtocolErrorDto> }
     WorkspaceSync { workspaces: Vec<WorkspaceInfoDto> }
     WorkspaceStartResult { id: String, success: bool, error: Option<ProtocolErrorDto> }

@@ -19,6 +19,7 @@ fn fixture(url: String, format: &str) -> (App, Entity) {
         .add_closure_system(RuntimePlugin::UPDATE)
         .add_plugin(crate::InferencePlugin {
             schedule: RuntimePlugin::UPDATE.into(),
+            path: None,
             routes: inference_core::ModelRoutes::new(BTreeMap::from([("route".into(), selected)])),
         });
     let agent = app.world_mut().spawn();

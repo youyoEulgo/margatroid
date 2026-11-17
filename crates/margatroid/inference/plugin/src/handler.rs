@@ -28,7 +28,7 @@ fn error(kind: Kind, message: impl Into<String>) -> InferenceError {
     InferenceError::new(kind, message)
 }
 
-pub(crate) fn load_model_routes(path: &Path) -> Result<ModelRoutes, InferenceError> {
+fn read_model_config(path: &Path) -> Result<String, InferenceError> {
     let mut source = String::new();
     std::fs::File::open(path)
         .and_then(|file| {
@@ -47,7 +47,13 @@ pub(crate) fn load_model_routes(path: &Path) -> Result<ModelRoutes, InferenceErr
             "model route configuration exceeds budget",
         ));
     }
-    let document: ModelRouteDocument = toml::from_str(&source)
+    Ok(source)
+}
+pub(crate) fn load_model_routes(path: &Path) -> Result<ModelRoutes, InferenceError> {
+    parse_model_routes(&read_model_config(path)?)
+}
+fn parse_model_routes(source: &str) -> Result<ModelRoutes, InferenceError> {
+    let document: ModelRouteDocument = toml::from_str(source)
         .map_err(|_| error(Kind::InvalidModelRoute, "invalid model route configuration"))?;
     if document.models.is_empty() {
         return Err(error(
@@ -196,12 +202,10 @@ pub(crate) fn handle_inference(world: &mut World, request: InferenceRequest) {
         {
             return Err(error(Kind::InferenceBusy, "an inference is already active"));
         }
-        let route = world
-            .get_resource::<ModelRoutes>()
-            .and_then(|routes| routes.get(&request.config.model))
-            .ok_or_else(|| error(Kind::ModelRouteMissing, "model route not found"))?
-            .clone();
-        let tools = world
+        let model_config = world
+            .get_resource::<inference_core::ModelConfigFile>()
+            .cloned();
+        let tools: Vec<InferenceToolDefinition> = world
             .get_component::<Tools>(request.agent)
             .into_iter()
             .flat_map(Tools::iter)
@@ -211,7 +215,18 @@ pub(crate) fn handle_inference(world: &mut World, request: InferenceRequest) {
                 input_schema: entry.input_schema.clone(),
             })
             .collect();
-        let http_request = build_request(prepare_domain(&request, &route, tools)?, &route)?;
+        let http_request = if model_config.is_none() {
+            let route = world
+                .get_resource::<ModelRoutes>()
+                .and_then(|routes| routes.get(&request.config.model))
+                .ok_or_else(|| error(Kind::ModelRouteMissing, "model route not found"))?;
+            Some(build_request(
+                prepare_domain(&request, route, tools.clone())?,
+                route,
+            )?)
+        } else {
+            None
+        };
         let agent_address = world
             .get_component::<Address>(request.agent)
             .ok_or_else(|| error(Kind::InvalidRequest, "Agent address missing"))?
@@ -227,6 +242,8 @@ pub(crate) fn handle_inference(world: &mut World, request: InferenceRequest) {
             .expect("inference HTTP runtime missing");
         Ok((
             http_request,
+            model_config,
+            tools,
             agent_address,
             agent_instance,
             clients,
@@ -238,14 +255,23 @@ pub(crate) fn handle_inference(world: &mut World, request: InferenceRequest) {
             runtime.schedule.clone(),
         ))
     })();
-    let (http_request, agent_address, agent_instance, clients, source_alive, client, schedule) =
-        match prepared {
-            Ok(prepared) => prepared,
-            Err(error) => {
-                let _ = reply.send(Err(error));
-                return;
-            }
-        };
+    let (
+        http_request,
+        model_config,
+        tools,
+        agent_address,
+        agent_instance,
+        clients,
+        source_alive,
+        client,
+        schedule,
+    ) = match prepared {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            let _ = reply.send(Err(error));
+            return;
+        }
+    };
     let gate = Arc::new(Mutex::new(StreamGate::default()));
     let frozen = gate.clone();
     let stop_stream: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
@@ -274,7 +300,9 @@ pub(crate) fn handle_inference(world: &mut World, request: InferenceRequest) {
         },
         request,
         reply: Some(reply),
-        http_request: Some(http_request),
+        http_request,
+        model_config,
+        tools,
         deadline,
         client,
         gate,
@@ -412,6 +440,13 @@ async fn supervise_inference(mut context: InferenceContext) {
         }
         if context.reply.as_ref().is_some_and(|reply| reply.is_closed()) { return Err(error(Kind::ReplyClosed, "inference reply receiver closed")); }
         if tokio::time::Instant::now() >= deadline { return Err(error(Kind::Timeout, "inference preparation exhausted deadline")); }
+        if let Some(file)=context.model_config.take(){
+            let routes=file.load().await?;
+            if context.request.cancel.is_cancelled() || context.gate.lock().unwrap_or_else(|error|error.into_inner()).closed{return Ok(frozen_response(&context.gate));}
+            if tokio::time::Instant::now()>=deadline{return Err(error(Kind::Timeout,"model configuration read exhausted inference deadline"));}
+            let route=routes.get(&context.request.config.model).ok_or_else(||error(Kind::ModelRouteMissing,"model route not found"))?;
+            context.http_request=Some(build_request(prepare_domain(&context.request,route,std::mem::take(&mut context.tools))?,route)?);
+        }
         let request = context.http_request.take().expect("inference HTTP request prepared before launch");
         let upstream = CancellationToken::new();
         let (sender, receiver) = mpsc::channel(FRAGMENT_CAPACITY);
@@ -883,4 +918,103 @@ fn http_request_error(failure: reqwest::Error) -> InferenceError {
         source = cause.source();
     }
     error(Kind::RequestFailed, "inference HTTP request failed")
+}
+
+pub(crate) fn model_config_file(path: std::path::PathBuf) -> inference_core::ModelConfigFile {
+    let read_path = path.clone();
+    let load_path = path.clone();
+    let write_path = path.clone();
+    let gate = Arc::new(tokio::sync::Mutex::new(()));
+    inference_core::ModelConfigFile::new(
+        path,
+        move || {
+            let path = read_path.clone();
+            Box::pin(async move {
+                tokio::task::spawn_blocking(move || read_model_config(&path))
+                    .await
+                    .map_err(|_| error(Kind::CleanupFailed, "model configuration reader failed"))?
+            })
+        },
+        move || {
+            let path = load_path.clone();
+            Box::pin(async move {
+                tokio::task::spawn_blocking(move || load_model_routes(&path))
+                    .await
+                    .map_err(|_| error(Kind::CleanupFailed, "model route reader failed"))?
+            })
+        },
+        move |source| {
+            let path = write_path.clone();
+            let gate = gate.clone();
+            Box::pin(async move {
+                let permit = gate.lock_owned().await;
+                tokio::task::spawn_blocking(move || {
+                    let _permit = permit;
+                    if source.len() > MAX_CONFIG_BYTES {
+                        return Err(error(
+                            Kind::InvalidModelRoute,
+                            "model route configuration exceeds budget",
+                        ));
+                    }
+                    parse_model_routes(&source)?;
+                    let parent = path.parent().ok_or_else(|| {
+                        error(
+                            Kind::InvalidModelRoute,
+                            "model configuration parent missing",
+                        )
+                    })?;
+                    let permissions = std::fs::metadata(&path)
+                        .map_err(|_| {
+                            error(
+                                Kind::InvalidModelRoute,
+                                "model configuration metadata unavailable",
+                            )
+                        })?
+                        .permissions();
+                    let mut temporary = tempfile::NamedTempFile::new_in(parent).map_err(|_| {
+                        error(
+                            Kind::InvalidModelRoute,
+                            "model configuration temporary file could not be created",
+                        )
+                    })?;
+                    temporary
+                        .as_file()
+                        .set_permissions(permissions)
+                        .map_err(|_| {
+                            error(
+                                Kind::InvalidModelRoute,
+                                "model configuration permissions could not be preserved",
+                            )
+                        })?;
+                    use std::io::Write;
+                    temporary
+                        .write_all(source.as_bytes())
+                        .and_then(|_| temporary.as_file().sync_all())
+                        .map_err(|_| {
+                            error(
+                                Kind::InvalidModelRoute,
+                                "model configuration could not be written",
+                            )
+                        })?;
+                    temporary.persist(&path).map_err(|_| {
+                        error(
+                            Kind::InvalidModelRoute,
+                            "model configuration could not be replaced",
+                        )
+                    })?;
+                    std::fs::File::open(parent)
+                        .and_then(|directory| directory.sync_all())
+                        .map_err(|_| {
+                            error(
+                                Kind::CleanupFailed,
+                                "model configuration directory commit failed",
+                            )
+                        })?;
+                    Ok(())
+                })
+                .await
+                .map_err(|_| error(Kind::CleanupFailed, "model configuration writer failed"))?
+            })
+        },
+    )
 }

@@ -24,7 +24,7 @@ fn all_bundled_drivers_and_declared_resource_files_are_readable_with_the_new_con
             .as_array()
             .unwrap()
             .iter()
-            .filter_map(serde_json::Value::as_str)
+            .filter_map(|entry| entry["command"].as_str())
             .filter(|line| line.starts_with("IMPORT "))
             .filter_map(|line| line.split_whitespace().nth(2))
         {
@@ -181,8 +181,9 @@ mod mailbox_compaction {
             )
             .unwrap();
             std::fs::write(driver.join("setting.toml"),format!("sandbox=[]\n[inference]\nmodel='offline'\n[compaction]\nthreshold=0.8\nkeep_messages=2\n[initialization]{}",std::fs::read_to_string(resources.join(format!("agent-drivers/local/{name}/latest/setting.toml"))).unwrap().split_once("[initialization]").unwrap().1)).unwrap();
+
             let settings_file = driver.join("setting.toml");
-            let text=std::fs::read_to_string(&settings_file).unwrap().replace("custom = []","custom = ['CREATE TEMP BLOCK user_setup (messages)', 'INJECT soul TO user_setup.messages']");
+            let text=std::fs::read_to_string(&settings_file).unwrap().replace("custom = []","custom = [{command='IMPORT TOOL tool:local/bash-exec:latest AS init_exec',arguments=[]}, {command='CREATE TEMP BLOCK user_setup (messages)',arguments=[]}, {command='INJECT soul TO user_setup.messages',arguments=[]}, {command='EFFECT tool_call ?', arguments=[[{id='init-tool',tool_name='init_exec',arguments='{\"cmd\":\"printf initialized > initialization-result.txt\"}'}]]}]");
             std::fs::write(settings_file, text).unwrap();
             if legacy_config {
                 let file = data.join(format!("workspaces/probe/agents/{name}/setting.toml"));
@@ -262,6 +263,10 @@ mod mailbox_compaction {
             )
             .await;
             assert!(!custom["data"]["value"].as_array().unwrap().is_empty());
+            assert_eq!(
+                std::fs::read_to_string(home.path().join("initialization-result.txt")).unwrap(),
+                "initialized"
+            );
             let target = config["data"]["value"]["driver_task"].clone();
             assert!(target["agent"].as_str().unwrap().starts_with("execution:"));
             assert!(!target["task_id"].as_str().unwrap().is_empty());
@@ -409,5 +414,126 @@ mod mailbox_compaction {
             stop.store(true, Ordering::Release);
             model.join().unwrap();
         }
+    }
+    #[tokio::test]
+    async fn model_file_api_reads_updates_and_syncs_without_starting_a_workspace() {
+        let home = tempfile::tempdir().unwrap();
+        let data = home.path().join(".margatroid");
+        std::fs::create_dir(&data).unwrap();
+        for directory in [
+            "workspaces",
+            "tools",
+            "prompts",
+            "sandboxes",
+            "skills",
+            "agent-drivers",
+        ] {
+            std::fs::create_dir(data.join(directory)).unwrap();
+        }
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        std::fs::write(data.join("config.toml"),format!("[server]\nbind='127.0.0.1:{port}'\n[outbound]\nlogs=['type:none']\nbackend_state=['type:webui']\n")).unwrap();
+        let original="[[models]]\nid='route'\nmodel='first-model'\nprovider='openai'\napi_type='chat_completions'\nbase_url='http://127.0.0.1:1/v1'\napi_key='test-key'\ncontext_window='128k'\n";
+        let path = data.join("models.toml");
+        std::fs::write(&path, original).unwrap();
+        let mut child = Child(
+            std::process::Command::new(
+                std::env::var_os("MARGATROID_DRIVER_TEST_BINARY")
+                    .unwrap_or_else(|| env!("CARGO_BIN_EXE_margatroid-daemon").into()),
+            )
+            .env("HOME", home.path())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap(),
+        );
+        let mut socket = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let Ok((socket, _)) =
+                    tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port}/ws")).await
+                {
+                    break socket;
+                }
+                assert!(child.0.try_wait().unwrap().is_none());
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let mut seen = Vec::new();
+        request(
+            &mut socket,
+            "connection.register",
+            "model-register",
+            json!({"client_type":"webui","name":"model-editor"}),
+            &mut seen,
+        )
+        .await;
+        let workspaces = request(
+            &mut socket,
+            "workspace.req",
+            "empty-workspaces",
+            json!({}),
+            &mut seen,
+        )
+        .await;
+        assert!(workspaces["workspaces"].as_array().unwrap().is_empty());
+        let response = request(
+            &mut socket,
+            "model.config.req",
+            "read-file",
+            json!({}),
+            &mut seen,
+        )
+        .await;
+        assert_eq!(response["content"], original);
+        let updated = original.replace("first-model", "updated-model");
+        request(
+            &mut socket,
+            "model.config.update",
+            "update-file",
+            json!({"content":updated}),
+            &mut seen,
+        )
+        .await;
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), updated);
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if seen.iter().any(|value| {
+                    value["type"] == "model.config.sync" && value["content"] == updated
+                }) {
+                    break;
+                }
+                let frame = socket.next().await.unwrap().unwrap();
+                if let tokio_tungstenite::tungstenite::Message::Text(text) = frame {
+                    seen.push(serde_json::from_str::<Value>(&text).unwrap());
+                }
+            }
+        })
+        .await
+        .unwrap();
+        let external = updated.replace("updated-model", "external-model");
+        let staging = data.join("models-next.toml");
+        std::fs::write(&staging, &external).unwrap();
+        std::fs::rename(staging, &path).unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let frame = socket.next().await.unwrap().unwrap();
+                if let tokio_tungstenite::tungstenite::Message::Text(text) = frame {
+                    let value: Value = serde_json::from_str(&text).unwrap();
+                    if value["type"] == "model.config.sync" && value["content"] == external {
+                        break;
+                    }
+                }
+            }
+        })
+        .await
+        .unwrap();
+        socket.close(None).await.unwrap();
+        child.0.kill().unwrap();
+        child.0.wait().unwrap();
     }
 }

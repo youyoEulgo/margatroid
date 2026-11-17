@@ -254,7 +254,9 @@ export type ClientMessage =
       message: AgentTarget & { command: string; arguments: unknown[] };
     }
   | { type: 'agent.ui.req'; id: string; message: AgentTarget }
-  | { type: 'agent.turn.abort'; id: string; message: AgentTarget & { turn: string } };
+  | { type: 'agent.turn.abort'; id: string; message: AgentTarget & { turn: string } }
+  | { type: 'model.config.req'; id: string; message: Record<string, never> }
+  | { type: 'model.config.update'; id: string; message: { content: string } };
 type Failure = { success: false; error: ProtocolError };
 type Receipt = { id: string } & ({ success: true } | Failure);
 type Page<T> = { id: string } & AgentTarget &
@@ -322,7 +324,10 @@ export type ServerMessage =
       history_sequence: number | null;
       message: AgentMessage;
       error: ProtocolError | null;
-    } & AgentTarget);
+    } & AgentTarget)
+  | ({ type: 'model.config.res'; id: string } & ({ success: true; content: string } | Failure))
+  | { type: 'model.config.sync'; content: string | null; error: ProtocolError | null }
+  | ({ type: 'model.config.update.result'; id: string } & ({ success: true } | Failure));
 
 export function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
@@ -663,6 +668,15 @@ export function parseServerMessage(raw: string): ServerMessage | null {
           isAgentMessage(v.message) &&
           (v.history_sequence === null || v.message.sequence === v.history_sequence) &&
           errorOrNull(v.error);
+        break;
+      case 'model.config.res':
+        valid = reply && (v.success === false ? v.content === undefined : string(v.content));
+        break;
+      case 'model.config.sync':
+        valid = v.id === undefined && nullableString(v.content) && errorOrNull(v.error);
+        break;
+      case 'model.config.update.result':
+        valid = reply;
         break;
     }
     return valid ? (v as unknown as ServerMessage) : null;

@@ -26,7 +26,7 @@ DtoPlugin：无字段，Default
     impl Plugin
         build(self, app: &mut App)
             行为：检查Runtime/AsyncRuntime/Axum及MargatroidConfig，复用World唯一Clients；存在的typed绑定必须与该槽位一致。
-                取得或创建应用级WorkspaceSyncBinding及AgentUpdateContext，安装资源probe工厂，初始化DtoState及只持监控归属的SyncObservations。
+                取得或创建应用级WorkspaceSyncBinding及AgentUpdateContext，安装资源probe工厂，初始化DtoState及只持监控归属的SyncObservations；存在ModelConfigFile时install_model_config_monitor。
                 为安装前已有Agent初始化实际来源观察，在应用启动建立一次Workspace定义磁盘监控。
                 注册GET /ws及GET/HEAD /{workspace}/{*path}；文件handler复用既有ingress、AxumLifetime及WorldClosureSender，不新增业务System或公共事件。
                 只安装PRE_UPDATE的abort_control_system和UPDATE的dto_route_system，不安装同步System。
@@ -131,6 +131,18 @@ run_record_watch(context: RecordMonitorContext) -> Future<Output = Result<(), Dt
 read_batch(storage: &AgentStorage, position: RecordWatermarks, high: RecordWatermarks) -> Result<RecordBatch, StorageError>
 encode_batch(address: &str, batch: &RecordBatch) -> Result<Vec<Arc<ClientFrame>>, DtoAsyncError>
     行为：每类最多50条，当前高水位限定排他范围；有request_id的assistant/error由推理通道完成，记录监控跳过其网络投影但照常推进游标；compact历史虽保留request_id但不属于assistant生成去重分支，仍交付generation=null的持久记录；非生成消息full保留真实持久序号、generation=null，MCL和日志过滤内部VM信息，完整编码/预算失败明确重试诊断而不重复旧记录。
+install_model_config_monitor(world: &mut World)
+    行为：取得实际ModelConfigFile；无来源时不创建伪监控。使用同一Clients及backend_state目标建立model.config.sync的state_source，来源view与SyncContext同归ModelConfigSource；创建持AxumWorkGuard的watch_model_config。
+watch_model_config(source: ModelConfigView) -> Future<Output=Result<(),String>>
+    行为：notify观察文件父目录NonRecursive，只接受目标来源路径的实际变更及观察错误，忽略Access和其他文件；先挂观察再初读，AtomicBool/Notify合并脏信号，顺序await read，闲时等待；取消仍等待当前文件worker完成，不产出ECS同步事件或逐帧调查。
+ModelConfigView::read(&self) -> Future<Output=Result<String,ProtocolErrorDto>>
+ModelConfigView::replace(&self, content:String) -> Future<Output=Result<(),ProtocolErrorDto>>
+ModelConfigView::refresh_locked(&self) -> Future<Output=Result<String,ProtocolErrorDto>>
+    行为：operations锁统一串行监控/查询/修改；调用inference的read/load能力取得原文与最近校验路由，通过既有WorldClosureSender将ModelRoutes::replace和AgentInferenceConfig安全投影提交回World；无效来源清空路由投影，不回退旧模型。
+        原文读取成功即可供编辑，不要求当前文本语义有效；读取失败发布content=None及error。视图实际变化经update直接提交SyncContext，初始None/None表示尚未读取。
+        replace先await inference的完整校验和原子写入能力，成功后refresh_locked，再完成请求；校验/写入失败返回原错误，不伪造成功。
+model_config(world: &World, object: Box<dyn Any+Send>, write:bool)
+    行为：按req/update取Prepared，校验真实注册Client，克隆ModelConfigView并在持AxumWorkGuard的普通异步闭包执行read/replace，原oneshot回复；不创建Workspace/Agent/turn或新领域事件。
 install_workspace_monitor(world: &mut World)
     行为：安装前已有定义和运行状态先发布，绑定同一WorkspaceDefinitions.observe回调；实际配置来源存在时建立一次watch_definitions，归属AxumLifetime。
 watch_definitions(source: PathBuf, definitions: WorkspaceDefinitions, lifetime: AxumLifetime) -> Future<Output = Result<(), String>>
@@ -213,6 +225,18 @@ WorkspaceSyncBinding
 
 私有：
 ```text
+ModelFileSnapshot
+    content: Option<String>
+    error: Option<ProtocolErrorDto>
+ModelConfigSource
+    file: ModelConfigFile
+    view: View<ModelFileSnapshot>
+    sync: SyncContext<ModelFileSnapshot>
+    operations: tokio::sync::Mutex<()>
+    world: WorldClosureSender
+    lifetime: AxumLifetime
+    Drop：关闭sync来源
+ModelConfigView(Arc<ModelConfigSource>)--Resource、Clone
 DtoState
     world: WorldClosureSender--文件请求沿既有UPDATE闭包通道一次取得实际Workspace根，不缓存第二份目录
     ingress: IngressPolicy

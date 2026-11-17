@@ -1827,7 +1827,7 @@ async fn bundled_drivers_record_inference_error_messages_and_keep_running_while_
                 .as_array()
                 .unwrap()
                 .iter()
-                .filter_map(Value::as_str)
+                .filter_map(|entry| entry["command"].as_str())
                 .filter(|line| line.starts_with("IMPORT "))
             {
                 let address = instruction.split_whitespace().nth(2).unwrap();

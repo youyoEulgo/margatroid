@@ -45,7 +45,7 @@ impl RuntimeHandle {
     pub fn open_gate(&self) {
         let previous = self
             .blocker_count
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |count| {
                 count.checked_sub(1)
             })
             .unwrap_or_else(|_| RuntimeError::GateOperationUnbalanced.panic());
@@ -56,7 +56,7 @@ impl RuntimeHandle {
 
     pub fn close_gate(&self) {
         self.blocker_count
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |count| {
                 count.checked_add(1)
             })
             .expect("runtime blocker count overflow");

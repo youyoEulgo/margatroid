@@ -658,7 +658,7 @@ async fn configured_initialization_runs_defaults_before_custom_and_stops_on_cust
             {
                 let mut state = fixture.commands.lock().unwrap();
                 state.initialization = Some(
-                    json!({"default":["CREATE TEMP BLOCK defaults (messages)","INJECT [] TO defaults.messages"],"custom":["CREATE TEMP BLOCK custom (messages)","INJECT [] TO custom.messages"]}),
+                    json!({"default":[{"command":"CREATE TEMP BLOCK defaults (messages)","arguments":[]},{"command":"INJECT [] TO defaults.messages","arguments":[]}],"custom":[{"command":"CREATE TEMP BLOCK custom (messages)","arguments":[]},{"command":"INJECT [] TO custom.messages","arguments":[]}]}),
                 );
                 if fail_custom {
                     state.fail = Some("CREATE TEMP BLOCK custom (messages)".into());

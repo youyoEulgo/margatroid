@@ -59,4 +59,6 @@ Driver任务目标保存在自身配置driver_task={agent=执行地址,task_id=�
 
 推理领域执行失败以Inference.message={type="error",message=原错误文本,request_id=原请求id}及stop_reason="error"返回，不走顶层MCL Error。普通回合将error排入原消息入口，记录历史并等待本轮真实清理；压缩调用直接记录error，不改成compact、不替换上下文、不自动重试，Driver仍可接收后续任务。MCL参数/权限/队列或历史写入等真实执行错误仍由原command封装处理。
 
-内置Driver的初始设置包含[initialization]：default为原静态IMPORT/CREATE/INJECT指令文本数组，custom初始为[]，供用户追加初始化指令。initialize读取Agent配置，严格按default再custom顺序逐条command执行；参数化model_set、sandbox_use、driver_task登记及最后ready保留在脚本，任一指令失败不发送ready。已有Agent持久配置缺少整个initialization段时，只读Driver资源目录setting.toml中的该段执行，不自动写回或覆盖持久配置；显式配置了该段时使用其default/custom，不合并额外隐藏指令。修改custom在下一次Driver初始化时生效，编辑保留默认数组和soul/compact及msg/entry/session等运行依赖。
+内置Driver的初始设置包含[initialization]：default为原静态IMPORT/CREATE/INJECT指令对象数组，每项固定为{command=指令文本,arguments=参数数组}，custom初始为[]，供用户追加初始化指令。initialize读取Agent配置，严格按default再custom顺序逐条command(item.command,item.arguments)执行；参数化model_set、sandbox_use、driver_task登记及最后ready保留在脚本，任一指令失败不发送ready。已有Agent持久配置缺少整个initialization段时，只读Driver资源目录setting.toml中的该段执行，不自动写回或覆盖持久配置；显式配置了该段时使用其default/custom，不合并额外隐藏指令。修改custom在下一次Driver初始化时生效，编辑保留默认数组和soul/compact及msg/entry/session等运行依赖。
+
+初始化default/custom统一使用对象条目，不混用旧字符串；无参数条目显式arguments=[]，有参数条目以arguments按顺序绑定?。参数保留TOML可表示的数组/对象/数字/布尔/字符串类型，不做文本替换或内联JSON拼接；tool_call对象内的arguments沿原协议为JSON字符串。现有用户持久设置不自动迁移；已有initialization段中的字符串条目需手动改为对象。

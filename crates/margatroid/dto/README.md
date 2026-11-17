@@ -71,3 +71,6 @@ Workspace文件读取已实现：GET/HEAD /{workspace}/{*path}由本插件提供
 文件读取在Unix使用目录句柄及逐段no-follow打开，拒绝符号链接、目录和特殊文件；GET按已打开文件长度流式返回，HEAD只返对应头，未知类型为application/octet-stream。非Unix目标返回501，不使用不安全路径检查降级。现有45种WS消息不变，不需Agent、turn或WebSocket注册。
 
 推理终态中的assistant及error已由推理通道交付；带request_id的这两类消息写入历史后，记录监控只推进真实提交游标，不再发送第二条full。历史查询保留完整记录；不带推理request_id的独立error和compact历史仍按普通持久记录同步。
+
+models.toml现支持每次推理前有界重读并按id选择，文件损坏/删除或id缺失均失败，不回退启动快照。既有ModelRoutes只服务最近安全公共投影；有效文件改动刷新Agent安全model信息，无效文件清空投影。
+model.config.req/res/sync及model.config.update/update.result已实现，读取/同步原始TOML供编辑，修改完整校验后原子覆盖同一文件并保留权限；外部编辑/原子替换/删除也触发同一来源监控。无需Workspace、Agent或turn，不接收客户端文件路径，不新增持久目录/数据库或领域System/事件。接口遵循原注册、ingress、backend_state目标和id关联规则；前端源码未改。

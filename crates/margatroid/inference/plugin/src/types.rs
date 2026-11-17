@@ -43,6 +43,8 @@ pub(crate) struct InferenceContext {
     pub request: InferenceRequest,
     pub reply: Option<oneshot::Sender<Result<InferenceResponse>>>,
     pub http_request: Option<ProviderHttpRequest>,
+    pub model_config: Option<inference_core::ModelConfigFile>,
+    pub tools: Vec<inference_core::InferenceToolDefinition>,
     pub deadline: tokio::time::Instant,
     pub client: reqwest::Client,
     pub gate: Arc<Mutex<StreamGate>>,

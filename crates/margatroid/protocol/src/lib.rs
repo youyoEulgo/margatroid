@@ -54,7 +54,8 @@ pub fn parse_client_message(text: &str) -> Result<ClientMessage, ProtocolError> 
                 return Err(invalid("invalid client name"));
             }
         }
-        ClientMessage::WorkspaceReq { .. }
+        ClientMessage::ModelConfigReq { .. }
+        | ClientMessage::WorkspaceReq { .. }
         | ClientMessage::WorkspaceReload { .. }
         | ClientMessage::AgentReq { .. } => {}
         ClientMessage::WorkspaceStart { message, .. }
@@ -87,6 +88,11 @@ pub fn parse_client_message(text: &str) -> Result<ClientMessage, ProtocolError> 
                 || matches!((message.after_sequence,message.before_sequence),(Some(a),Some(b)) if a>=b)
             {
                 return Err(invalid("invalid record range"));
+            }
+        }
+        ClientMessage::ModelConfigUpdate { message, .. } => {
+            if message.content.len() > 1024 * 1024 {
+                return Err(invalid("model configuration exceeds budget"));
             }
         }
         ClientMessage::MclExecute { message, .. } => {
@@ -280,7 +286,8 @@ pub(crate) fn validate_server_value(value: &Value) -> Result<(), ProtocolError> 
         .ok_or_else(|| invalid("missing response type"))?;
     let sync = matches!(
         kind,
-        "workspace.sync"
+        "model.config.sync"
+            | "workspace.sync"
             | "agent.sync"
             | "agent.ui.sync"
             | "agent.turn.sync"
@@ -293,7 +300,9 @@ pub(crate) fn validate_server_value(value: &Value) -> Result<(), ProtocolError> 
     let known = sync
         || matches!(
             kind,
-            "connection.register.result"
+            "model.config.res"
+                | "model.config.update.result"
+                | "connection.register.result"
                 | "workspace.res"
                 | "workspace.start.result"
                 | "workspace.stop.result"
@@ -337,6 +346,7 @@ pub(crate) fn validate_server_value(value: &Value) -> Result<(), ProtocolError> 
         }
         let payload = match kind {
             "connection.register.result" => Some("client"),
+            "model.config.res" => Some("content"),
             "workspace.res" => Some("workspaces"),
             "agent.res" => Some("agents"),
             "agent.ui.res" => Some("ui"),
@@ -491,6 +501,14 @@ pub(crate) fn validate_server_value(value: &Value) -> Result<(), ProtocolError> 
     }
     if kind == "agent.message.full.sync" {
         require_fields(value, &["turn", "generation", "history_sequence", "error"])?;
+    }
+    if kind == "model.config.sync" {
+        require_fields(value, &["content", "error"])?;
+        if value["content"].is_string() && !value["error"].is_null() {
+            return Err(invalid(
+                "model configuration content and read error are mutually exclusive",
+            ));
+        }
     }
     if kind == "mcl.execute.result"
         && value["success"] == true

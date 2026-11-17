@@ -30,7 +30,7 @@ method(args) -> xxx
 
 ```text
 -- 公开，定义于inference_core
-ModelRoutes：模型配置，公开Resource
+ModelRoutes：安全模型投影和model_set使用的最近校验快照，公开Resource
     entries: BTreeMap<String, ModelRoute>--私有
     get(&self, id: &str) -> Option<&ModelRoute>
         行为：
@@ -40,6 +40,18 @@ ModelRoutes：模型配置，公开Resource
     replace(&mut self, routes: BTreeMap<String, ModelRoute>, configs: &[AgentInferenceConfig])
         行为：内部路由替换的唯一入口，替换调用方已校验的路由集合后，对传入受影响配置调用publish_current提交安全模型投影；不增加网络reload接口，不把端点或密钥交给回调。
     impl Resource for ModelRoutes
+ModelConfigFuture<T> = Pin<Box<dyn Future<Output=Result<T,InferenceError>> + Send>>
+ModelConfigFile：公开Resource，Clone；不缓存文件内容
+    path: PathBuf
+    read: Arc<dyn Fn() -> ModelConfigFuture<String> + Send + Sync>
+    load: Arc<dyn Fn() -> ModelConfigFuture<ModelRoutes> + Send + Sync>
+    replace: Arc<dyn Fn(String) -> ModelConfigFuture<()> + Send + Sync>
+    new(path, read, load, replace) -> Self
+    path(&self) -> &Path
+    read(&self) -> Future<Output=Result<String,InferenceError>>
+    load(&self) -> Future<Output=Result<ModelRoutes,InferenceError>>
+    replace(&self, content:String) -> Future<Output=Result<(),InferenceError>>
+        行为：仅调用插件提供的文件操作能力；校验、文件IO和厂商选项由插件承担，不依赖DTO或HTTP框架。
 ```
 
 ```text
@@ -47,6 +59,7 @@ ModelRoutes：模型配置，公开Resource
 InferencePlugin：单次推理执行插件
     schedule: String
     routes: ModelRoutes
+    path: Option<PathBuf>--open始终设置绝对来源路径；None仅供插件内显式内存测试构造
     open(path: &Path) -> Result<Self, InferenceError>
         行为：
             有界读取models.toml，完整校验provider、api_type及路由选项；
@@ -56,7 +69,7 @@ InferencePlugin：单次推理执行插件
             行为：
                 检查运行设施，拒绝重复安装；
                 schedule仅允许UPDATE或POST_UPDATE，拒绝PRE_UPDATE及无法证明顺序的自定义schedule；
-                安装ModelRoutes及共享reqwest HTTP客户端，挂载init_inference_system和inference_system。不通过临时握手取得Tokio Handle，不在Resource保存执行器Handle；
+                安装ModelRoutes、model_config_file提供的ModelConfigFile及共享reqwest HTTP客户端，挂载init_inference_system和inference_system。不通过临时握手取得Tokio Handle，不在Resource保存执行器Handle；
                 推理启动进入普通异步闭包；模型选择/安全路由公共信息的实际变动通过注入的Agent公共信息入口提交agent.sync，查询路由和构造HTTP本身不发布。
 ```
 
@@ -137,6 +150,15 @@ inference_system(world: &mut World)
 
 ```text
 -- crate公开
+read_model_config(path: &Path) -> Result<String,InferenceError>
+    行为：blocking调用方有界读取UTF-8，最多1MiB，不做模型语义校验。
+parse_model_routes(source: &str) -> Result<ModelRoutes,InferenceError>
+    行为：解析非空models列表，校验唯一id、model/api_key、HTTP前缀、provider/api_type适配组合及context_window，构造完整路由；错误文本不含凭据。
+load_model_routes(path: &Path) -> Result<ModelRoutes,InferenceError>
+    行为：read_model_config后parse_model_routes，不查询历史快照。
+model_config_file(path: PathBuf) -> ModelConfigFile
+    行为：构造read/load/replace异步能力，read和load每次spawn_blocking真实读来源文件。
+        replace按同来源async Mutex串行化，锁随真实blocking worker持有；先预算和完整parse校验，再同目录NamedTempFile写入、继承原权限、sync_all、persist原路径并同步父目录；不生成备份，不在校验失败时改文件。
 handle_init_inference(world: &mut World, request: InitInference)
     行为：
         认领reply，检查agent实体；
@@ -149,10 +171,10 @@ handle_inference(world: &mut World, request: InferenceRequest)
         turn=None时为自由调用：Starting/Running可受理，不要求Agent已有turn，当前恰有turn也不隐式绑定。
         turn=Some(id)时要求非空、Agent为Running且当前有效turn与id一致；失效或不匹配沿原中止响应收口，不创建HTTP或监督任务。
         两种调用均执行ActiveInference检查，保留同Agent单个活跃推理限制，不用无turn绕过推理互斥。
-        从ModelRoutes选定路由；
+        取得ModelConfigFile来源能力；真实文件插件不从启动快照选择执行路由。仅显式内存测试没有文件服务时沿用注入ModelRoutes。
         直接遍历当前Agent的Tools，以每条记录的alias、description及input_schema构造本次工具定义。
-        在受理阶段校验消息及参数，构造DomainRequest并调用build_request完成HTTP编码。
-        向闭包交付已编码请求；工具定义和工具名称集合不进入闭包，后续调用按当前Tools查找及校验参数。
+        将本次owned工具定义快照与请求交付监督闭包，文件型来源的HTTP请求在重新读文件后才构造。
+        无文件服务的显式内存测试仍在受理时prepare_domain/build_request并交付已有http_request；后续工具调用始终按当前Tools查找并校验参数。
         从World的唯一Clients资源克隆同一共享槽位及当前Agent来源有效租约，固定Agent/AgentSession、显式可选turn及generation身份；每次发送重新筛选当前webui接收者，不固定起始发送器快照；
         同步登记尚未启动的共享InferenceHandle，防止异步提交窗口受理重叠请求；
         通过send_async_closure提交launch_inference。
@@ -169,7 +191,9 @@ launch_inference(context: InferenceContext) -> Future<Output = Result<InferenceL
 
 supervise_inference(context: InferenceContext) -> Future<Output = ()>
     行为：
-        取出已编码HTTP请求，沿用受理时起算的deadline。
+        有ModelConfigFile时先await load，从最新校验结果按request.config.model查找路由，然后prepare_domain/build_request；不存在id或文件损坏明确失败，不使用旧ModelRoutes继续推理。
+        文件worker真实返回后复检取消、关闭接受门及受理时起算deadline，失效不发HTTP；已构造请求后文件变化不改本次owned请求。
+        无文件服务则取受理时已有http_request。
         建立有界mpsc::channel<ProviderFragment>并启动read_provider。
         完成响应时仅校验调用ID、名称和参数的结构，不校验名称是否已提供给模型。
         运行receive_stream，以其累积器作为唯一内容结果来源。
@@ -238,7 +262,7 @@ build_request(input: DomainRequest, route: ModelRoute) -> Result<ProviderHttpReq
 
 ```text
 -- 私有
-InferenceContext：请求执行材料--原请求及reply、已编码http_request、deadline、HTTP客户端、取消能力和推流投影；原样保留Option<String>回合，不将None改成当前turn
+InferenceContext：请求执行材料--原请求及reply、可选http_request、model_config: Option<ModelConfigFile>、tools: Vec<InferenceToolDefinition>、deadline、HTTP客户端、取消能力和推流投影；原样保留Option<String>回合，不将None改成当前turn
 ProviderContext：上游材料--HTTP请求、格式解码器、取消能力及读取预算
 StreamContext：接收材料--Arc<Mutex<StreamGate>>、取消能力及StreamDelivery
 ModelSyncBinding = ProbeFactory<Option<PublicModelInfo>>

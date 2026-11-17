@@ -72,7 +72,7 @@ impl Clients {
     pub fn allocate(&self) -> Option<(ConnectionId, ClientReceiver, CancellationToken)> {
         static NEXT: AtomicU64 = AtomicU64::new(1);
         let id = ConnectionId::new(
-            NEXT.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| v.checked_add(1))
+            NEXT.try_update(Ordering::Relaxed, Ordering::Relaxed, |v| v.checked_add(1))
                 .ok()?,
         );
         let (sender, receiver) = ClientSender::channel(128);

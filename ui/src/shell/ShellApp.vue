@@ -13,6 +13,7 @@ import {
   X,
 } from 'lucide-vue-next';
 import SidebarTree from '@/components/SidebarTree.vue';
+import ModelConfigPanel from '@/components/ModelConfigPanel.vue';
 import { useWorkbenchStore } from '@/stores/workbench';
 import { buildDriverDocument } from '@/lib/driverUi';
 import InfoPanel from './InfoPanel.vue';
@@ -48,6 +49,7 @@ const activityOpen = ref(typeof window === 'undefined' ? true : window.innerWidt
 const activityTab = ref<'activity' | 'mcl'>('activity');
 const logFilter = ref<'all' | 'errors'>('all');
 const settingsOpen = ref(false);
+const settingsTab = ref<'connection' | 'models'>('connection');
 const endpointDraft = ref(endpoint.value);
 const contextPathDraft = ref(driverContextPath.value);
 const formError = ref('');
@@ -138,6 +140,7 @@ function stopWorkspace(address: string) {
   void store.stopWorkspace(address);
 }
 function openSettings() {
+  settingsTab.value = 'connection';
   endpointDraft.value = endpoint.value;
   contextPathDraft.value = driverContextPath.value;
   formError.value = '';
@@ -373,36 +376,57 @@ onBeforeUnmount(() => {
         <div class="dialog-header">
           <div>
             <span class="eyebrow">Daemon</span>
-            <h2 id="shell-settings-title">Connection</h2>
+            <h2 id="shell-settings-title">Settings</h2>
           </div>
           <button class="icon-button" title="Close" @click="settingsOpen = false">
             <X :size="17" />
           </button>
         </div>
-        <label class="field-label" for="shell-endpoint">WebSocket endpoint</label>
-        <input
-          id="shell-endpoint"
-          v-model="endpointDraft"
-          class="field-input"
-          placeholder="ws://127.0.0.1:3939/ws"
-          @keydown.enter="saveSettings"
-        />
-        <label class="field-label" for="shell-context-path">Driver context path</label>
-        <input
-          id="shell-context-path"
-          v-model="contextPathDraft"
-          class="field-input"
-          placeholder="entry.pending[-1]"
-          @keydown.enter="saveSettings"
-        />
-        <p class="field-hint">
-          The context path is passed to the Driver interface when it is loaded.
-        </p>
-        <p v-if="formError" class="form-error">{{ formError }}</p>
-        <div class="dialog-actions">
-          <button class="secondary-button" @click="settingsOpen = false">Cancel</button>
-          <button class="primary-button" @click="saveSettings">Connect</button>
+        <div class="settings-tabs" role="tablist" aria-label="Settings sections">
+          <button
+            type="button"
+            :class="{ active: settingsTab === 'connection' }"
+            :aria-selected="settingsTab === 'connection'"
+            @click="settingsTab = 'connection'"
+          >
+            Connection
+          </button>
+          <button
+            type="button"
+            :class="{ active: settingsTab === 'models' }"
+            :aria-selected="settingsTab === 'models'"
+            @click="settingsTab = 'models'"
+          >
+            Models
+          </button>
         </div>
+        <template v-if="settingsTab === 'connection'">
+          <label class="field-label" for="shell-endpoint">WebSocket endpoint</label>
+          <input
+            id="shell-endpoint"
+            v-model="endpointDraft"
+            class="field-input"
+            placeholder="ws://127.0.0.1:3939/ws"
+            @keydown.enter="saveSettings"
+          />
+          <label class="field-label" for="shell-context-path">Driver context path</label>
+          <input
+            id="shell-context-path"
+            v-model="contextPathDraft"
+            class="field-input"
+            placeholder="entry.pending[-1]"
+            @keydown.enter="saveSettings"
+          />
+          <p class="field-hint">
+            The context path is passed to the Driver interface when it is loaded.
+          </p>
+          <p v-if="formError" class="form-error">{{ formError }}</p>
+          <div class="dialog-actions">
+            <button class="secondary-button" @click="settingsOpen = false">Cancel</button>
+            <button class="primary-button" @click="saveSettings">Connect</button>
+          </div>
+        </template>
+        <ModelConfigPanel v-else />
       </section>
     </div>
   </div>

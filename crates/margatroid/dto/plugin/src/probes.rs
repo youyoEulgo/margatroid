@@ -328,3 +328,178 @@ pub fn model_sync_binding(context: AgentUpdateContext) -> inference_core::ModelS
         })
     })
 }
+
+#[derive(Clone, PartialEq)]
+struct ModelFileSnapshot {
+    content: Option<String>,
+    error: Option<ProtocolErrorDto>,
+}
+struct ModelConfigSource {
+    file: inference_core::ModelConfigFile,
+    view: View<ModelFileSnapshot>,
+    sync: SyncContext<ModelFileSnapshot>,
+    operations: tokio::sync::Mutex<()>,
+    world: closure_plugin::WorldClosureSender,
+    lifetime: axum_plugin::AxumLifetime,
+}
+impl Drop for ModelConfigSource {
+    fn drop(&mut self) {
+        self.sync.close();
+    }
+}
+#[derive(Clone)]
+pub(crate) struct ModelConfigView(Arc<ModelConfigSource>);
+impl core_plugin::Resource for ModelConfigView {}
+impl ModelConfigView {
+    async fn refresh_locked(&self) -> Result<String, ProtocolErrorDto> {
+        let read = self
+            .0
+            .file
+            .read()
+            .await
+            .map_err(|e| ProtocolErrorDto::new(format!("{:?}", e.kind), e.message));
+        let snapshot = match &read {
+            Ok(content) => ModelFileSnapshot {
+                content: Some(content.clone()),
+                error: None,
+            },
+            Err(e) => ModelFileSnapshot {
+                content: None,
+                error: Some(e.clone()),
+            },
+        };
+        {
+            let routes = self.0.file.load().await.unwrap_or_default();
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            self.0.world.send(move |world| {
+                let configs: Vec<_> = world
+                    .query_with::<inference_core::AgentInferenceConfig>()
+                    .result()
+                    .into_iter()
+                    .filter_map(|entity| {
+                        world
+                            .get_component::<inference_core::AgentInferenceConfig>(entity)
+                            .cloned()
+                    })
+                    .collect();
+                if let Some(current) = world.get_resource_mut::<inference_core::ModelRoutes>() {
+                    current.replace(routes.entries().clone(), &configs);
+                }
+                let _ = tx.send(());
+            });
+            tokio::select! {_=self.0.lifetime.cancelled()=>return Err(ProtocolErrorDto::new("Closed","model configuration service stopped")),result=rx=>{result.map_err(|_|ProtocolErrorDto::new("Closed","model configuration projection reply was lost"))?;}}
+        }
+        update(&self.0.view, &self.0.sync, snapshot);
+        read
+    }
+    pub(crate) async fn read(&self) -> Result<String, ProtocolErrorDto> {
+        let _gate = self.0.operations.lock().await;
+        self.refresh_locked().await
+    }
+    pub(crate) async fn replace(&self, content: String) -> Result<(), ProtocolErrorDto> {
+        let _gate = self.0.operations.lock().await;
+        self.0
+            .file
+            .replace(content)
+            .await
+            .map_err(|e| ProtocolErrorDto::new(format!("{:?}", e.kind), e.message))?;
+        self.refresh_locked().await.map(|_| ())
+    }
+}
+pub(crate) fn install_model_config_monitor(world: &mut World) {
+    use async_runtime_plugin::WorldAsyncExt;
+    use closure_plugin::WorldClosureExt;
+    let Some(file) = world
+        .get_resource::<inference_core::ModelConfigFile>()
+        .cloned()
+    else {
+        return;
+    };
+    let state = world
+        .get_resource::<crate::types::DtoState>()
+        .unwrap()
+        .clone();
+    let view = Arc::new(Mutex::new((
+        0,
+        ModelFileSnapshot {
+            content: None,
+            error: None,
+        },
+    )));
+    let targets = crate::sync_selectors(
+        world
+            .get_resource::<config_core::MargatroidConfig>()
+            .unwrap()
+            .backend_state(),
+    );
+    let sync = state_source(
+        state.clients.clone(),
+        targets,
+        SyncKey {
+            topic: "model.config.sync".into(),
+            object: "file".into(),
+        },
+        &view,
+        |snapshot| {
+            encoded(ServerMessage::ModelConfigSync {
+                content: snapshot.content,
+                error: snapshot.error,
+            })
+        },
+    );
+    let source = ModelConfigView(Arc::new(ModelConfigSource {
+        file,
+        view,
+        sync,
+        operations: tokio::sync::Mutex::new(()),
+        world: world.closure_sender(app_runtime_plugin::RuntimePlugin::UPDATE),
+        lifetime: state.lifetime.clone(),
+    }));
+    world.insert_resource(source.clone());
+    let guard = state.lifetime.track();
+    world.send_async_closure(
+        app_runtime_plugin::RuntimePlugin::UPDATE,
+        move || async move {
+            let _guard = guard;
+            if let Err(e) = watch_model_config(source).await {
+                tracing::warn!(reason=%e,"model configuration monitor stopped");
+            }
+            Ok::<_, crate::types::DtoAsyncError>(())
+        },
+    );
+}
+async fn watch_model_config(source: ModelConfigView) -> Result<(), String> {
+    use notify::{EventKind, RecursiveMode, Watcher};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let dirty = Arc::new(AtomicBool::new(true));
+    let notify = Arc::new(tokio::sync::Notify::new());
+    let changed = dirty.clone();
+    let wake = notify.clone();
+    let path = source.0.file.path().to_path_buf();
+    let parent = path
+        .parent()
+        .ok_or("model configuration parent missing")?
+        .to_path_buf();
+    let mut watcher = notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
+        if event.map_or(true, |e| {
+            !matches!(e.kind, EventKind::Access(_))
+                && e.paths.iter().any(|candidate| candidate == &path)
+        }) {
+            changed.store(true, Ordering::Release);
+            wake.notify_one();
+        }
+    })
+    .map_err(|e| e.to_string())?;
+    watcher
+        .watch(&parent, RecursiveMode::NonRecursive)
+        .map_err(|e| e.to_string())?;
+    loop {
+        while !dirty.swap(false, Ordering::AcqRel) {
+            tokio::select! {_=source.0.lifetime.cancelled()=>return Ok(()),_=notify.notified()=>{}}
+        }
+        if source.0.lifetime.is_cancelled() {
+            return Ok(());
+        }
+        let _ = source.read().await;
+    }
+}

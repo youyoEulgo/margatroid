@@ -73,7 +73,7 @@ impl SyncSource {
             && self
                 .0
                 .revision
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |previous| {
+                .try_update(Ordering::AcqRel, Ordering::Acquire, |previous| {
                     (revision > previous).then_some(revision)
                 })
                 .is_ok()

@@ -12,7 +12,6 @@ base64 = "0.22"
 client_core = { path = "../../client/core" }
 config_core = { path = "../../config/core" }
 workspace_core = { path = "../../workspace/core" }
-lua_runtime_core = { path = "../../lua_runtime/core" }
 inference_core = { path = "../../inference/core" }
 mcl_core = { path = "../../mcl/core" }
 storage_core = { path = "../../storage/core" }
@@ -27,7 +26,6 @@ axum_plugin = { path = "../../axum_plugin" }
 axum = { version = "0.8", features = ["ws"] }
 tungstenite = "0.29"
 futures-util = "0.3"
-log_plugin = { path = "../../../mecs/log_plugin" }
 tracing = "0.1"
 serde_json = { workspace = true }
 tokio = { workspace = true }

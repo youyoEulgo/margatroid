@@ -634,8 +634,6 @@ dependencies = [
  "futures-util",
  "inference_core",
  "libc",
- "log_plugin",
- "lua_runtime_core",
  "margatroid_protocol",
  "mcl_core",
  "notify",

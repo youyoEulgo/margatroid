@@ -27,6 +27,7 @@ import {
   type MclData,
 } from '@/types/protocol';
 import { randomId } from '@/lib/id';
+import { parseModelRoutes } from '@/lib/modelConfig';
 
 export type ConnectionStatus = 'offline' | 'connecting' | 'online';
 const COMMAND_RESULT: Partial<Record<ClientMessage['type'], ServerMessage['type']>> = {
@@ -39,6 +40,7 @@ const COMMAND_RESULT: Partial<Record<ClientMessage['type'], ServerMessage['type'
   'agent.restart': 'agent.restart.result',
   'agent.turn.abort': 'agent.turn.abort.result',
   'mcl.execute': 'mcl.execute.result',
+  'model.config.update': 'model.config.update.result',
 };
 export type MessageRole = 'system' | 'user' | 'assistant' | 'compact' | 'tool' | 'error' | 'record';
 export interface ToolResult {
@@ -267,6 +269,32 @@ function decodeMessage(
       ];
   }
 }
+function mergeToolResults(entries: ConversationEntry[]): ConversationEntry[] {
+  const results = new Map<string, ToolResult>();
+  for (const entry of entries)
+    if (entry.role === 'tool' && entry.toolCallId)
+      results.set(entry.toolCallId, {
+        content: entry.content,
+        failed: entry.failed,
+        images: entry.images,
+      });
+  const callIds = new Set<string>();
+  const merged = entries.map((entry) => {
+    if ((entry.role !== 'assistant' && entry.role !== 'compact') || !entry.toolCalls.length)
+      return entry;
+    const attached = new Map<string, ToolResult>();
+    for (const call of entry.toolCalls) {
+      callIds.add(call.id);
+      const result = results.get(call.id);
+      if (result) attached.set(call.id, result);
+    }
+    return attached.size ? { ...entry, toolResults: attached } : entry;
+  });
+  // A tool result belongs to its call row; only unpaired results stay standalone.
+  return merged.filter(
+    (entry) => !(entry.role === 'tool' && entry.toolCallId && callIds.has(entry.toolCallId)),
+  );
+}
 export function historyEntries(history: AgentHistory): ConversationEntry[] {
   const entries: ConversationEntry[] = [...history.messages]
     .sort((a, b) => a.sequence - b.sequence)
@@ -303,29 +331,7 @@ export function historyEntries(history: AgentHistory): ConversationEntry[] {
             },
           ];
     });
-  const results = new Map<string, ToolResult>();
-  for (const entry of entries)
-    if (entry.role === 'tool' && entry.toolCallId)
-      results.set(entry.toolCallId, {
-        content: entry.content,
-        failed: entry.failed,
-        images: entry.images,
-      });
-  const callIds = new Set<string>();
-  for (const entry of entries) {
-    if (entry.role !== 'assistant' || !entry.toolCalls.length) continue;
-    const attached = new Map<string, ToolResult>();
-    for (const call of entry.toolCalls) {
-      callIds.add(call.id);
-      const result = results.get(call.id);
-      if (result) attached.set(call.id, result);
-    }
-    if (attached.size) entry.toolResults = attached;
-  }
-  // A tool result belongs to its call row; only unpaired results stay standalone.
-  return entries.filter(
-    (entry) => !(entry.role === 'tool' && entry.toolCallId && callIds.has(entry.toolCallId)),
-  );
+  return mergeToolResults(entries);
 }
 export function latestContextTokens(history: AgentHistory | undefined): number | null {
   let latest: number | null = null;
@@ -478,6 +484,11 @@ export const useWorkbenchStore = defineStore('workbench', () => {
   const logs = ref<RuntimeLog[]>([]);
   const lastFailures = ref(new Map<string, { message: string }>());
   const agentLogHistoryLoaded = ref(false);
+  const modelConfigContent = ref<string | null>(null);
+  const modelConfigError = ref('');
+  const modelConfigLoading = ref(false);
+  const modelConfigQueries = new Set<string>();
+  const modelOptions = computed(() => parseModelRoutes(modelConfigContent.value));
   let messageClock = 0;
   function currentMessageTime(): number {
     messageClock = Math.max(Date.now(), messageClock + 1);
@@ -606,10 +617,13 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     // A completed assistant can still be live while a later user message has
     // already arrived through its persisted full. Concatenating history before
     // live rows would put that newer user message above the older assistant.
-    return [...history, ...live].sort((left, right) => {
-      if (left.sequence !== null && right.sequence !== null) return left.sequence - right.sequence;
-      return left.timestamp - right.timestamp;
-    });
+    return mergeToolResults(
+      [...history, ...live].sort((left, right) => {
+        if (left.sequence !== null && right.sequence !== null)
+          return left.sequence - right.sequence;
+        return left.timestamp - right.timestamp;
+      }),
+    );
   });
   const selectedMclEntries = computed(() => {
     const target = currentTarget(false);
@@ -774,6 +788,8 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     listQueries.clear();
     registrationId = '';
     pendingWakes.clear();
+    modelConfigQueries.clear();
+    modelConfigLoading.value = false;
     streams.value = new Map();
     rejectPending('Backend WebSocket closed');
   }
@@ -825,6 +841,8 @@ export const useWorkbenchStore = defineStore('workbench', () => {
       streams.value = new Map();
       pendingWakes.clear();
       uiQueries.clear();
+      modelConfigQueries.clear();
+      modelConfigLoading.value = false;
       resourcesReset();
       rejectPending('Backend WebSocket disconnected');
       if (shouldReconnect)
@@ -1041,6 +1059,41 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     } finally {
       if (resourceWritePending.value === snapshot) resourceWritePending.value = '';
     }
+  }
+  function requestModelConfig(): void {
+    if (!connected()) return;
+    const id = randomId();
+    modelConfigQueries.add(id);
+    modelConfigLoading.value = true;
+    socket!.send(
+      JSON.stringify({
+        type: 'model.config.req',
+        id,
+        message: {},
+      } satisfies ClientMessage),
+    );
+  }
+  async function updateModelConfig(content: string): Promise<unknown> {
+    return request({
+      type: 'model.config.update',
+      id: randomId(),
+      message: { content },
+    });
+  }
+  async function selectModel(id: string): Promise<void> {
+    const target = currentTarget(false);
+    if (!target) throw new Error('Select a running agent explicitly');
+    const snapshot = resourceTargetSnapshot(target);
+    const saved = await executeFor(target, 'CONFIG SET ? ?', ['inference.model', id]);
+    requireUnit(saved, 'CONFIG SET inference.model');
+    assertTarget(target, snapshot);
+    const config = await executeFor(target, 'CONFIG GET');
+    const settings = isRecord(config) && isRecord(config.Config) ? config.Config : null;
+    if (!settings || !isRecord(settings.inference))
+      throw new Error('Inference settings are unavailable');
+    await executeFor(target, 'EFFECT model_set ?', [settings.inference]);
+    assertTarget(target, snapshot);
+    queryState();
   }
   async function compactContext(): Promise<void> {
     const target = currentTarget(false);
@@ -1498,6 +1551,7 @@ export const useWorkbenchStore = defineStore('workbench', () => {
         agentStateReady.value = false;
         reconnectAttempt = 0;
         queryState();
+        requestModelConfig();
         break;
       case 'workspace.res':
         if (listQueries.get(event.id) !== 'workspace.req') break;
@@ -1557,6 +1611,30 @@ export const useWorkbenchStore = defineStore('workbench', () => {
         if (!event.success) queryState();
         break;
       }
+      case 'model.config.res': {
+        if (!modelConfigQueries.delete(event.id)) break;
+        modelConfigLoading.value = false;
+        if (!event.success) {
+          modelConfigError.value = event.error.message;
+          addLog('ERROR', event.error.message, 'ui.models');
+          break;
+        }
+        modelConfigContent.value = event.content;
+        modelConfigError.value = '';
+        break;
+      }
+      case 'model.config.sync':
+        modelConfigContent.value = event.content;
+        if (event.error) {
+          modelConfigError.value = event.error.message;
+          addLog('ERROR', event.error.message, 'ui.models');
+        } else {
+          modelConfigError.value = '';
+        }
+        break;
+      case 'model.config.update.result':
+        settle(event.id, null, event.success ? undefined : event.error.message);
+        break;
       case 'agent.turn.res': {
         const query = queryTarget(event.id);
         if (!query) break;
@@ -1760,6 +1838,13 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     selectedMclEntries,
     agentLogHistoryLoaded,
     loadLogHistory,
+    modelConfigContent,
+    modelConfigError,
+    modelConfigLoading,
+    modelOptions,
+    requestModelConfig,
+    updateModelConfig,
+    selectModel,
     compactContext,
     selectedSessionLogs,
     selectedHistory,

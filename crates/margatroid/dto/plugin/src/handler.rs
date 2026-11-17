@@ -307,6 +307,8 @@ pub(crate) fn handle_dto_request(world: &mut World, request: DtoRequest) {
                 .ok_or_else(|| error("AgentMissing", "Agent tasks are missing"))
         }),
         "workspace.reload" => reload(world, object),
+        "model.config.req" => model_config(world, object, false),
+        "model.config.update" => model_config(world, object, true),
         "agent.history.req" | "agent.log.req" | "agent.mcl.req" => {
             records(world, &request.route, object)
         }
@@ -637,6 +639,57 @@ fn reload(world: &World, object: Box<dyn Any + Send>) {
         },
     );
 }
+fn model_config(world: &World, object: Box<dyn Any + Send>, write: bool) {
+    macro_rules! operation {
+        ($input:ty,$out:ty,$body:expr) => {{
+            let Ok(request) = object.downcast::<Prepared<$input, $out>>() else {
+                return;
+            };
+            if let Err(e) = client(world, request.ticket.connection) {
+                reject(*request, e);
+                return;
+            }
+            let Some(source) = world
+                .get_resource::<crate::probes::ModelConfigView>()
+                .cloned()
+            else {
+                reject(
+                    *request,
+                    error(
+                        "ModelConfigMissing",
+                        "model configuration file is unavailable",
+                    ),
+                );
+                return;
+            };
+            let guard = world.get_resource::<DtoState>().unwrap().lifetime.track();
+            world.send_async_closure(
+                app_runtime_plugin::RuntimePlugin::UPDATE,
+                move || async move {
+                    let _guard = guard;
+                    let result = ($body)(source, &request.input).await;
+                    deliver(&request.reply, result);
+                    Ok::<_, DtoAsyncError>(())
+                },
+            );
+        }};
+    }
+    if write {
+        operation!(
+            ModelConfigUpdateDto,
+            (),
+            |source: crate::probes::ModelConfigView, input: &ModelConfigUpdateDto| {
+                let content = input.content.clone();
+                async move { source.replace(content).await }
+            }
+        );
+    } else {
+        operation!((), String, |source: crate::probes::ModelConfigView,
+                                _: &()| async move {
+            source.read().await
+        });
+    }
+}
 fn records(world: &World, route: &str, object: Box<dyn Any + Send>) {
     macro_rules! page {
         ($record:ty,$function:path) => {{
@@ -776,6 +829,12 @@ async fn prepare_request(
             client_core::ClientError,
             |v| Ok(json!({"client":{"address":v.address,"client_type":v.client_type}}))
         ),
+        ClientMessage::ModelConfigReq { .. } => build!((), String, ProtocolErrorDto, |content| Ok(
+            json!({"content":content})
+        )),
+        ClientMessage::ModelConfigUpdate { message, .. } => {
+            build!(message, (), ProtocolErrorDto, minimal)
+        }
         ClientMessage::WorkspaceReq { .. } => {
             build!((), Vec<WorkspaceInfoDto>, ProtocolErrorDto, |v| Ok(
                 json!({"workspaces":v})
@@ -1274,6 +1333,8 @@ fn invalid_reply(text: &str) -> Option<Value> {
         "log.req"
             | "log.append"
             | "connection.register"
+            | "model.config.req"
+            | "model.config.update"
             | "workspace.req"
             | "workspace.start"
             | "workspace.stop"

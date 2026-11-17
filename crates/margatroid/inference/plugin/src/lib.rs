@@ -16,6 +16,7 @@ use types::HttpRuntime;
 pub struct InferencePlugin {
     schedule: String,
     routes: ModelRoutes,
+    path: Option<std::path::PathBuf>,
 }
 
 impl InferencePlugin {
@@ -23,6 +24,12 @@ impl InferencePlugin {
         Ok(Self {
             schedule: RuntimePlugin::UPDATE.into(),
             routes: handler::load_model_routes(path)?,
+            path: Some(std::path::absolute(path).map_err(|_| {
+                InferenceError::new(
+                    inference_core::InferenceErrorKind::InvalidModelRoute,
+                    "model configuration path unavailable",
+                )
+            })?),
         })
     }
 
@@ -67,6 +74,10 @@ impl Plugin for InferencePlugin {
             .connect_timeout(Duration::from_secs(30))
             .build()
             .expect("inference HTTP client creation failed");
+        if let Some(path) = self.path {
+            app.world_mut()
+                .insert_resource(handler::model_config_file(path));
+        }
         app.world_mut().insert_resource(self.routes);
         app.world_mut().insert_resource(HttpRuntime {
             client,

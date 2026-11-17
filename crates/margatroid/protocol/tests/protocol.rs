@@ -499,3 +499,55 @@ fn compact_message_roundtrips_with_assistant_fields_and_keeps_compact_type() {
     assert_eq!(wire["message"]["sequence"], 7);
     assert_eq!(wire["message"]["content"], "summary");
 }
+
+#[test]
+fn model_file_requests_and_replies_keep_content_and_do_not_accept_a_client_path() {
+    assert!(matches!(
+        parse("model.config.req", json!({})).unwrap(),
+        ClientMessage::ModelConfigReq { .. }
+    ));
+    assert!(matches!(
+        parse("model.config.update", json!({"content":"[[models]]"})).unwrap(),
+        ClientMessage::ModelConfigUpdate { .. }
+    ));
+    assert!(parse("model.config.req", json!({"path":"/tmp/other.toml"})).is_err());
+    assert!(
+        parse(
+            "model.config.update",
+            json!({"content":"text","path":"/tmp/other.toml"})
+        )
+        .is_err()
+    );
+    assert!(
+        parse(
+            "model.config.update",
+            json!({"content":"x".repeat(1024*1024+1)})
+        )
+        .is_err()
+    );
+    for raw in [
+        json!({"type":"model.config.res","id":"read","success":true,"content":"[[models]]"}),
+        json!({"type":"model.config.res","id":"read-failed","success":false,"error":{"code":"InvalidModelRoute","message":"unreadable"}}),
+        json!({"type":"model.config.sync","content":"[[models]]","error":null}),
+        json!({"type":"model.config.sync","content":null,"error":{"code":"InvalidModelRoute","message":"unreadable"}}),
+        json!({"type":"model.config.update.result","id":"write","success":true}),
+    ] {
+        let value: ServerMessage = serde_json::from_value(raw.clone()).unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&encode_server_message(&value).unwrap()).unwrap(),
+            raw
+        );
+    }
+    assert!(
+        serde_json::from_value::<ServerMessage>(
+            json!({"type":"model.config.res","id":"missing-content","success":true})
+        )
+        .is_err()
+    );
+    assert!(
+        serde_json::from_value::<ServerMessage>(
+            json!({"type":"model.config.sync","content":"source"})
+        )
+        .is_err()
+    );
+}

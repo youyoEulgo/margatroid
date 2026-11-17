@@ -84,6 +84,7 @@ impl Plugin for DtoPlugin {
         app.world_mut().insert_resource(SyncObservations::default());
         probes::initialize_agent_sources(app.world_mut());
         workspaces::install_workspace_monitor(app.world_mut());
+        probes::install_model_config_monitor(app.world_mut());
         app.add_axum_routes(
             axum::Router::new()
                 .route("/ws", axum::routing::get(handler::ws_handler))

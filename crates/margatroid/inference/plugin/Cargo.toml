@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+tempfile = "3"
 inference_core = { path = "../core" }
 agent_core = { path = "../../agent/core" }
 lua_runtime_core = { path = "../../lua_runtime/core" }

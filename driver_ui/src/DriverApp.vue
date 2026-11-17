@@ -21,7 +21,9 @@ import { storeToRefs } from "pinia";
 import { isRecord } from "@/types/protocol";
 import {
   Activity,
+  Archive,
   Check,
+  ChevronDown,
   ChevronRight,
   Copy,
   Circle,
@@ -30,6 +32,7 @@ import {
   ShieldOff,
   CloudOff,
   Command,
+  ImagePlus,
   Menu,
   MessageSquare,
   PanelRight,
@@ -37,6 +40,7 @@ import {
   Send,
   Square,
   Settings2,
+  SlidersHorizontal,
   UserRound,
   UsersRound,
   Wifi,
@@ -51,6 +55,8 @@ import {
   type ConversationEntry,
 } from "@/stores/workbench";
 import SidebarTree from "@/components/SidebarTree.vue";
+import ModelConfigPanel from "@/components/ModelConfigPanel.vue";
+import AdvancedPanel from "./components/AdvancedPanel.vue";
 import { formatToolPayload, inlineToolPayload } from "@/lib/format";
 import { renderMarkdown } from "@/lib/markdown";
 import { formatRecordTime } from "@/lib/time";
@@ -95,6 +101,7 @@ const {
   selectedMclEntries,
   selectedSessionLogs,
   agentLogHistoryLoaded,
+  modelOptions,
   lastFailures,
 } = storeToRefs(store);
 const canAbortTurn = computed(() => store.canAbortTurn);
@@ -130,6 +137,7 @@ watch(
     submittingMessage.value = false;
     sendStage.value = null;
     uploadMenuOpen.value = false;
+    modelMenuOpen.value = false;
     if (imagePicker.value) imagePicker.value.value = "";
   },
   { flush: "sync" },
@@ -197,11 +205,15 @@ const composerFooter = ref<HTMLElement | null>(null);
 let composerObserver: ResizeObserver | undefined;
 const toolManager = ref<HTMLElement | null>(null);
 const uploadControl = ref<HTMLElement | null>(null);
+const modelControl = ref<HTMLElement | null>(null);
+const modelMenuOpen = ref(false);
 const toolsOpen = ref(false);
+const advancedOpen = ref(false);
 const sidebarOpen = ref(false);
 const activityOpen = ref(false);
 const activityTab = ref<"activity" | "mcl">("activity");
 const settingsOpen = ref(false);
+const settingsTab = ref<"connection" | "models">("connection");
 const logFilter = ref<"all" | "errors">("all");
 const endpointDraft = ref(endpoint.value);
 const contextPathDraft = ref(driverContextPath.value);
@@ -274,17 +286,39 @@ const tokenUsageItems = computed(() => {
 });
 
 const selectedModel = computed(() => selectedAgentState.value?.model ?? null);
+const modelChoices = computed(() => {
+  const ids = modelOptions.value.map((route) => route.id);
+  if (selectedModel.value && !ids.includes(selectedModel.value.id))
+    ids.unshift(selectedModel.value.id);
+  return ids;
+});
+const modelSwitching = ref(false);
 const modelTitle = computed(() => {
   const model = selectedModel.value;
   if (!model) return "";
   const details = [
-    `${model.model} · ${model.provider}/${model.api_type}`,
+    `${model.id} · ${model.provider}/${model.api_type}`,
     `Context window: ${model.context_window_tokens.toLocaleString()} tokens`,
     model.thinking ? `Thinking: ${model.thinking}` : "",
     model.reasoning_effort ? `Reasoning effort: ${model.reasoning_effort}` : "",
   ].filter(Boolean);
   return details.join("\n");
 });
+
+async function chooseModel(id: string) {
+  modelMenuOpen.value = false;
+  if (!id || id === selectedModel.value?.id || modelSwitching.value) return;
+  if (!canEditComposer.value) return;
+  modelSwitching.value = true;
+  composerError.value = "";
+  try {
+    await store.selectModel(id);
+  } catch {
+    composerError.value = "Model change failed — see Activity logs";
+  } finally {
+    modelSwitching.value = false;
+  }
+}
 
 const contextWindowUsage = computed(() => {
   const used = contextTokens.value;
@@ -370,12 +404,20 @@ function closeFloatingOnOutsideClick(event: MouseEvent) {
     !uploadControl.value.contains(target)
   )
     uploadMenuOpen.value = false;
+  if (
+    modelMenuOpen.value &&
+    modelControl.value &&
+    !modelControl.value.contains(target)
+  )
+    modelMenuOpen.value = false;
 }
 
 function closeOverlaysOnEscape(event: KeyboardEvent) {
   if (event.key !== "Escape") return;
   settingsOpen.value = false;
   activityOpen.value = false;
+  advancedOpen.value = false;
+  modelMenuOpen.value = false;
   toolsOpen.value = false;
   uploadMenuOpen.value = false;
   sidebarOpen.value = false;
@@ -536,7 +578,12 @@ function selectMember(agent: string | null, key?: string) {
   nextTick(scrollMessages);
 }
 
+function openAdvanced() {
+  advancedOpen.value = true;
+}
+
 function openSettings() {
+  settingsTab.value = "connection";
   endpointDraft.value = endpoint.value;
   contextPathDraft.value = driverContextPath.value;
   formError.value = "";
@@ -582,20 +629,6 @@ function onMessageScroll() {
   if (!list || olderPending.value || list.scrollTop > 96) return;
   loadEarlierMessages();
 }
-
-watch(
-  () => conversationMessages.value.length,
-  async (next, previous) => {
-    if (!olderAnchor || next <= previous) return;
-    await nextTick();
-    const list = messageList.value;
-    if (list)
-      list.scrollTop = list.scrollHeight - olderAnchor.height + olderAnchor.top;
-    olderPending.value = false;
-    olderAnchor = null;
-    clearTimeout(olderTimer);
-  },
-);
 
 /** Let the wheel roll through the composer into the message list. */
 function handleComposerWheel(event: WheelEvent) {
@@ -698,6 +731,21 @@ const mclRecords = computed(() => selectedMclEntries.value);
 const conversationMessages = computed(() =>
   visibleMessages.value.filter((message) => !isMcLRecord(message)),
 );
+
+watch(
+  () => conversationMessages.value.length,
+  async (next, previous) => {
+    if (!olderAnchor || next <= previous) return;
+    await nextTick();
+    const list = messageList.value;
+    if (list)
+      list.scrollTop = list.scrollHeight - olderAnchor.height + olderAnchor.top;
+    olderPending.value = false;
+    olderAnchor = null;
+    clearTimeout(olderTimer);
+  },
+);
+
 
 function stopReason(message: ConversationEntry): string | null {
   const payload = message.payload;
@@ -1188,18 +1236,33 @@ const conversationRows = computed<ConversationRow[]>(() => {
               >
                 <Plus :size="19" />
               </button>
-              <div v-if="uploadMenuOpen" class="upload-menu">
-                <button type="button" @click="openImagePicker">
-                  Upload image
+              <div v-if="uploadMenuOpen" class="upload-menu" role="menu">
+                <button
+                  type="button"
+                  class="upload-menu-item"
+                  role="menuitem"
+                  @click="openImagePicker"
+                >
+                  <span class="upload-menu-icon"><ImagePlus :size="15" /></span>
+                  <span class="upload-menu-copy">
+                    <strong>Upload image</strong>
+                    <small>Attach an image to your next message</small>
+                  </span>
                 </button>
                 <button
                   type="button"
+                  class="upload-menu-item"
+                  role="menuitem"
                   :disabled="compacting"
                   @click="compactContext"
                 >
-                  {{
-                    compacting ? "Requesting compaction…" : "Compact context"
-                  }}
+                  <span class="upload-menu-icon"><Archive :size="15" /></span>
+                  <span class="upload-menu-copy">
+                    <strong>{{
+                      compacting ? "Requesting compaction…" : "Compact context"
+                    }}</strong>
+                    <small>Ask the Driver to compress early context</small>
+                  </span>
                 </button>
               </div>
             </div>
@@ -1222,16 +1285,50 @@ const conversationRows = computed<ConversationRow[]>(() => {
             <span v-if="abortPending" class="abort-pending-label"
               >Abort pending</span
             >
-            <span
+            <div
               v-if="selectedModel"
+              ref="modelControl"
               class="composer-model"
               :title="modelTitle"
             >
-              <span class="composer-model-name">{{ selectedModel.model }}</span>
-              <span class="composer-model-context">{{
-                compactTokenNumber(selectedModel.context_window_tokens)
-              }}</span>
-            </span>
+              <button
+                type="button"
+                class="composer-model-trigger"
+                :disabled="!canEditComposer || modelSwitching"
+                :aria-expanded="modelMenuOpen"
+                aria-haspopup="listbox"
+                @click="modelMenuOpen = !modelMenuOpen"
+              >
+                <span class="composer-model-name">{{ selectedModel.id }}</span>
+                <ChevronDown
+                  :class="[
+                    'composer-model-caret',
+                    { 'is-open': modelMenuOpen },
+                  ]"
+                  :size="12"
+                />
+                <span class="composer-model-context">{{
+                  compactTokenNumber(selectedModel.context_window_tokens)
+                }}</span>
+              </button>
+              <div v-if="modelMenuOpen" class="model-menu" role="listbox">
+                <button
+                  v-for="id in modelChoices"
+                  :key="id"
+                  type="button"
+                  :class="[
+                    'model-menu-item',
+                    { active: id === selectedModel.id },
+                  ]"
+                  role="option"
+                  :aria-selected="id === selectedModel.id"
+                  @click="chooseModel(id)"
+                >
+                  <span>{{ id }}</span>
+                  <Check v-if="id === selectedModel.id" :size="13" />
+                </button>
+              </div>
+            </div>
             <button
               v-if="selectedAgentWorking"
               class="send-button send-button--stop"
@@ -1287,6 +1384,14 @@ const conversationRows = computed<ConversationRow[]>(() => {
               :size="13"
             />
             <span class="tool-manager-empty">Resources Panel</span>
+          </button>
+          <button
+            class="advanced-trigger"
+            type="button"
+            title="Advanced tools, session and initialization"
+            @click="openAdvanced"
+          >
+            <SlidersHorizontal :size="13" /> Advanced
           </button>
           <div class="token-usage" aria-label="Agent token usage">
             <span
@@ -1535,7 +1640,7 @@ const conversationRows = computed<ConversationRow[]>(() => {
         <div class="dialog-header">
           <div>
             <span class="eyebrow">Daemon</span>
-            <h2 id="settings-title">Connection</h2>
+            <h2 id="settings-title">Settings</h2>
           </div>
           <button
             class="icon-button"
@@ -1545,38 +1650,64 @@ const conversationRows = computed<ConversationRow[]>(() => {
             <X :size="17" />
           </button>
         </div>
-        <label class="field-label" for="endpoint">WebSocket endpoint</label>
-        <input
-          id="endpoint"
-          v-model="endpointDraft"
-          class="field-input"
-          placeholder="ws://127.0.0.1:3939/ws"
-          @keydown.enter="saveSettings"
-        />
-        <label class="field-label" for="context-path"
-          >Driver context path</label
+        <div
+          class="settings-tabs"
+          role="tablist"
+          aria-label="Settings sections"
         >
-        <input
-          id="context-path"
-          v-model="contextPathDraft"
-          class="field-input"
-          placeholder="Path defined by your driver"
-          @keydown.enter="saveSettings"
-        />
-        <p class="field-label">
-          Driver-defined destination for messages. Change only if your driver
-          uses a different path.
-        </p>
-        <p v-if="formError" class="form-error">{{ formError }}</p>
-        <div class="dialog-actions">
-          <button class="secondary-button" @click="settingsOpen = false">
-            Cancel
+          <button
+            type="button"
+            :class="{ active: settingsTab === 'connection' }"
+            :aria-selected="settingsTab === 'connection'"
+            @click="settingsTab = 'connection'"
+          >
+            Connection
           </button>
-          <button class="primary-button" @click="saveSettings">
-            <Wifi :size="16" /> Connect
+          <button
+            type="button"
+            :class="{ active: settingsTab === 'models' }"
+            :aria-selected="settingsTab === 'models'"
+            @click="settingsTab = 'models'"
+          >
+            Models
           </button>
         </div>
+        <template v-if="settingsTab === 'connection'">
+          <label class="field-label" for="endpoint">WebSocket endpoint</label>
+          <input
+            id="endpoint"
+            v-model="endpointDraft"
+            class="field-input"
+            placeholder="ws://127.0.0.1:3939/ws"
+            @keydown.enter="saveSettings"
+          />
+          <label class="field-label" for="context-path"
+            >Driver context path</label
+          >
+          <input
+            id="context-path"
+            v-model="contextPathDraft"
+            class="field-input"
+            placeholder="Path defined by your driver"
+            @keydown.enter="saveSettings"
+          />
+          <p class="field-label">
+            Driver-defined destination for messages. Change only if your driver
+            uses a different path.
+          </p>
+          <p v-if="formError" class="form-error">{{ formError }}</p>
+          <div class="dialog-actions">
+            <button class="secondary-button" @click="settingsOpen = false">
+              Cancel
+            </button>
+            <button class="primary-button" @click="saveSettings">
+              <Wifi :size="16" /> Connect
+            </button>
+          </div>
+        </template>
+        <ModelConfigPanel v-else />
       </section>
     </div>
+    <AdvancedPanel v-if="advancedOpen" @close="advancedOpen = false" />
   </div>
 </template>

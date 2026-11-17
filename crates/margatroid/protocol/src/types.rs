@@ -12,6 +12,13 @@ pub enum ClientMessage {
         id: String,
         message: RegisterConnectionDto,
     },
+    #[serde(rename = "model.config.req")]
+    ModelConfigReq { id: String, message: EmptyDto },
+    #[serde(rename = "model.config.update")]
+    ModelConfigUpdate {
+        id: String,
+        message: ModelConfigUpdateDto,
+    },
     #[serde(rename = "workspace.req")]
     WorkspaceReq { id: String, message: EmptyDto },
     #[serde(rename = "workspace.start")]
@@ -72,6 +79,7 @@ impl ClientMessage {
     pub fn id(&self) -> &str {
         match self {
             Self::ConnectionRegister { id, .. } => id,
+            Self::ModelConfigReq { id, .. } | Self::ModelConfigUpdate { id, .. } => id,
             Self::WorkspaceReq { id, .. } => id,
             Self::WorkspaceStart { id, .. } => id,
             Self::WorkspaceStop { id, .. } => id,
@@ -98,6 +106,21 @@ pub enum ServerMessage {
         id: String,
         success: bool,
         client: Option<ClientInfoDto>,
+        error: Option<ProtocolErrorDto>,
+    },
+    ModelConfigRes {
+        id: String,
+        success: bool,
+        content: Option<String>,
+        error: Option<ProtocolErrorDto>,
+    },
+    ModelConfigSync {
+        content: Option<String>,
+        error: Option<ProtocolErrorDto>,
+    },
+    ModelConfigUpdateResult {
+        id: String,
+        success: bool,
         error: Option<ProtocolErrorDto>,
     },
     WorkspaceRes {
@@ -268,6 +291,27 @@ enum ServerWire {
         success: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         client: Option<ClientInfoDto>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<ProtocolErrorDto>,
+    },
+    #[serde(rename = "model.config.res")]
+    ModelConfigRes {
+        id: String,
+        success: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        content: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<ProtocolErrorDto>,
+    },
+    #[serde(rename = "model.config.sync")]
+    ModelConfigSync {
+        content: Option<String>,
+        error: Option<ProtocolErrorDto>,
+    },
+    #[serde(rename = "model.config.update.result")]
+    ModelConfigUpdateResult {
+        id: String,
+        success: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<ProtocolErrorDto>,
     },
@@ -498,6 +542,23 @@ impl From<ServerMessage> for ServerWire {
                 client,
                 error,
             },
+            ServerMessage::ModelConfigRes {
+                id,
+                success,
+                content,
+                error,
+            } => Self::ModelConfigRes {
+                id,
+                success,
+                content,
+                error,
+            },
+            ServerMessage::ModelConfigSync { content, error } => {
+                Self::ModelConfigSync { content, error }
+            }
+            ServerMessage::ModelConfigUpdateResult { id, success, error } => {
+                Self::ModelConfigUpdateResult { id, success, error }
+            }
             ServerMessage::WorkspaceRes {
                 id,
                 success,
@@ -717,6 +778,23 @@ impl From<ServerWire> for ServerMessage {
                 client,
                 error,
             },
+            ServerWire::ModelConfigRes {
+                id,
+                success,
+                content,
+                error,
+            } => Self::ModelConfigRes {
+                id,
+                success,
+                content,
+                error,
+            },
+            ServerWire::ModelConfigSync { content, error } => {
+                Self::ModelConfigSync { content, error }
+            }
+            ServerWire::ModelConfigUpdateResult { id, success, error } => {
+                Self::ModelConfigUpdateResult { id, success, error }
+            }
             ServerWire::WorkspaceRes {
                 id,
                 success,
@@ -961,6 +1039,8 @@ impl<'de> Deserialize<'de> for ServerMessage {
 impl ServerMessage {
     pub fn id(&self) -> Option<&str> {
         match self {
+            Self::ModelConfigRes { id, .. } | Self::ModelConfigUpdateResult { id, .. } => Some(id),
+            Self::ModelConfigSync { .. } => None,
             Self::ConnectionRegisterResult { id, .. } => Some(id),
             Self::WorkspaceRes { id, .. } => Some(id),
             Self::WorkspaceSync { .. } => None,
@@ -1312,4 +1392,10 @@ pub struct AgentUiFileDto {
     pub path: String,
     pub media_type: String,
     pub data: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelConfigUpdateDto {
+    pub content: String,
 }

@@ -6,6 +6,12 @@ import { createRenderer, h, markRaw, nextTick } from 'vue';
 import SidebarTree from '../components/SidebarTree.vue';
 import { workspaceFileUrl } from '../lib/workspaceUrl';
 import {
+  parseModelConfig,
+  parseModelRoutes,
+  serializeModelConfig,
+  validateModelRoute,
+} from '../lib/modelConfig';
+import {
   buildSidebarModel,
   contextInjection,
   parseArguments,
@@ -201,6 +207,42 @@ function page(id: string, records: unknown[]) {
   };
 }
 
+test('model config form round-trips route fields and enforces backend constraints', () => {
+  const source = `[[models]]\nid = 'route-a'\nmodel = 'internal-route'\nprovider = 'deepseek'\napi_type = 'chat_completions'\nbase_url = 'http://127.0.0.1:8000/v1'\napi_key = 'key-a'\ncontext_window = '128k'\nthinking = 'enabled'\nreasoning_effort = 'high'\n`;
+  const routes = parseModelConfig(source);
+  assert.equal(routes.length, 1);
+  assert.equal(routes[0]?.id, 'route-a');
+  assert.equal(routes[0]?.model, 'internal-route');
+  assert.equal(routes[0]?.contextWindow, '128k');
+  assert.equal(validateModelRoute(routes[0]!), null);
+  const roundTrip = parseModelConfig(serializeModelConfig(routes));
+  assert.deepEqual(roundTrip, routes);
+  assert.equal(
+    validateModelRoute({ ...routes[0]!, provider: 'openai', apiType: 'messages' }),
+    'openai does not support messages.',
+  );
+  assert.equal(
+    validateModelRoute({ ...routes[0]!, contextWindow: '128' }),
+    'Context window must be an integer followed by k, m, b or t.',
+  );
+  assert.equal(
+    validateModelRoute({ ...routes[0]!, reasoningEffort: 'max', provider: 'openrouter' }),
+    'Reasoning effort max is supported only by DeepSeek.',
+  );
+});
+test('model config routes expose ids without assuming the upstream model name', () => {
+  const routes = parseModelRoutes(
+    `[[models]]\nid = 'deepseek-v4.1-flash'\nmodel = 'deepseek-v4.1-flash-test'\nprovider = 'deepseek'\n\n[[models]]\nid = 'other/route'\nmodel = 'internal-route'\n`,
+  );
+  assert.deepEqual(
+    routes.map((route) => route.id),
+    ['deepseek-v4.1-flash', 'other/route'],
+  );
+  assert.deepEqual(
+    routes.map((route) => route.model),
+    ['deepseek-v4.1-flash-test', 'internal-route'],
+  );
+});
 test('Workspace Markdown resources map to the encoded HTTP file route', () => {
   const context = {
     workspace: 'workspace:local/demo:latest',
@@ -307,6 +349,28 @@ test('lifecycle status and turn stay independent', () => {
     assert.equal(e.store.selectedAgentState?.status, 'error');
     assert.equal(e.store.selectedAgentReady, false);
     assert.equal(e.store.selectedAgentWorking, false);
+  } finally {
+    e.cleanup();
+  }
+});
+test('model config updates settle on their result instead of staying pending', async () => {
+  const e = setup();
+  try {
+    const saved = e.store.updateModelConfig('[[models]]\n');
+    const request = e.sent.at(-1)!;
+    assert.equal(request.type, 'model.config.update');
+    assert.deepEqual(request.message, { content: '[[models]]\n' });
+    e.receive({ type: 'model.config.update.result', id: request.id, success: true });
+    await saved;
+    const rejected = e.store.updateModelConfig('bad');
+    const failed = e.sent.at(-1)!;
+    e.receive({
+      type: 'model.config.update.result',
+      id: failed.id,
+      success: false,
+      error: { code: 'InvalidModelRoute', message: 'invalid model route configuration' },
+    });
+    await assert.rejects(rejected, /invalid model route configuration/);
   } finally {
     e.cleanup();
   }
@@ -713,6 +777,38 @@ test('an older live assistant stays above a later persisted user message', () =>
       e.store.visibleMessages.map((message) => message.role),
       ['assistant', 'user'],
     );
+  } finally {
+    e.cleanup();
+  }
+});
+test('live tool results attach to a streaming assistant tool call', () => {
+  const e = setup();
+  try {
+    e.receive({
+      ...full(null),
+      message: {
+        type: 'assistant',
+        request_id: 'generation-1',
+        content: '',
+        reasoning: null,
+        tool_calls: [{ id: 'call-1', tool_name: 'bash', arguments: '{}' }],
+        stop_reason: 'tool_calls',
+      },
+    });
+    e.receive({
+      ...full(41, null),
+      message: {
+        type: 'tool_call',
+        sequence: 41,
+        tool_call_id: 'call-1',
+        tool_name: 'bash',
+        content: 'result',
+        failed: false,
+      },
+    });
+    assert.equal(e.store.visibleMessages.length, 1);
+    assert.equal(e.store.visibleMessages[0]?.role, 'assistant');
+    assert.equal(e.store.visibleMessages[0]?.toolResults?.get('call-1')?.content, 'result');
   } finally {
     e.cleanup();
   }

@@ -1162,3 +1162,218 @@ fn free_inference_still_rejects_error_stopping_and_precancelled_requests() {
         );
     }
 }
+
+#[test]
+fn each_inference_reads_the_model_file_instead_of_the_startup_routes() {
+    let first = HttpServer::new(trace("chat_completions"));
+    let mut fixture = Fixture::new(&first.url, "openai", "chat_completions");
+    let file = fixture.root.path().join("models.toml");
+    let (request, reply) = fixture.request("before-edit");
+    fixture.run(request, reply).unwrap();
+    fixture.idle();
+    let (_, headers, body) = first.received.recv_timeout(Duration::from_secs(1)).unwrap();
+    assert_eq!(body["model"], "upstream-model");
+    assert!(headers.contains("private-test-key"));
+    let second = HttpServer::new(trace("chat_completions"));
+    std::fs::write(&file,format!("[[models]]\nid='route'\nmodel='updated-model'\nprovider='openai'\napi_type='chat_completions'\nbase_url='{}'\napi_key='updated-key'\ncontext_window='256k'\n",second.url)).unwrap();
+    let (request, reply) = fixture.request("after-edit");
+    fixture.run(request, reply).unwrap();
+    fixture.idle();
+    let (_, headers, body) = second
+        .received
+        .recv_timeout(Duration::from_secs(1))
+        .unwrap();
+    assert_eq!(body["model"], "updated-model");
+    assert!(headers.contains("updated-key"));
+    assert!(!headers.contains("private-test-key"));
+    std::fs::write(&file, "invalid toml [").unwrap();
+    let (request, reply) = fixture.request("malformed-file");
+    let failed = fixture.run(request, reply).unwrap_err();
+    assert_eq!(failed.kind, Kind::InvalidModelRoute);
+    fixture.idle();
+    std::fs::write(&file,format!("[[models]]\nid='different-id'\nmodel='other-model'\nprovider='openai'\napi_type='chat_completions'\nbase_url='{}'\napi_key='key'\n",second.url)).unwrap();
+    let (request, reply) = fixture.request("removed-model-id");
+    assert_eq!(
+        fixture.run(request, reply).unwrap_err().kind,
+        Kind::ModelRouteMissing
+    );
+    fixture.idle();
+    std::fs::remove_file(&file).unwrap();
+    let (request, reply) = fixture.request("missing-model-file");
+    assert_eq!(
+        fixture.run(request, reply).unwrap_err().kind,
+        Kind::InvalidModelRoute
+    );
+}
+
+fn model_frame(
+    fixture: &mut Fixture,
+    runtime: &tokio::runtime::Runtime,
+    socket: &mut Socket,
+    seen: &mut Vec<Value>,
+    expected: impl Fn(&Value) -> bool,
+) -> Value {
+    use futures_util::StreamExt;
+    if let Some(value) = seen.iter().find(|value| expected(value)) {
+        return value.clone();
+    }
+    let deadline = Instant::now() + Duration::from_secs(8);
+    loop {
+        fixture.app.tick();
+        if let Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text)))) = runtime
+            .block_on(async { tokio::time::timeout(Duration::from_millis(5), socket.next()).await })
+        {
+            let value: Value = serde_json::from_str(&text).unwrap();
+            seen.push(value.clone());
+            if expected(&value) {
+                return value;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "model configuration update did not arrive: {seen:?}"
+        );
+    }
+}
+#[test]
+fn model_configuration_api_reads_replaces_and_syncs_external_edits_without_agent_or_turn() {
+    use futures_util::SinkExt;
+    use tokio_tungstenite::tungstenite::Message;
+    let mut fixture = Fixture::with_dto("http://127.0.0.1:1/v1");
+    let file = fixture.root.path().join("models.toml");
+    let original = std::fs::read_to_string(&file).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let address = loop {
+        fixture.app.tick();
+        if let Some(address) = fixture
+            .app
+            .world()
+            .get_resource::<axum_plugin::AxumHandle>()
+            .unwrap()
+            .local_address()
+        {
+            break address;
+        }
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(1));
+    };
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let (mut socket, _) = runtime
+        .block_on(tokio_tungstenite::connect_async(format!(
+            "ws://{address}/ws"
+        )))
+        .unwrap();
+    let mut seen = Vec::new();
+    let send = |socket: &mut Socket, kind: &str, id: &str, message: Value| {
+        runtime
+            .block_on(
+                socket.send(Message::Text(
+                    json!({"type":kind,"id":id,"message":message})
+                        .to_string()
+                        .into(),
+                )),
+            )
+            .unwrap()
+    };
+    send(
+        &mut socket,
+        "model.config.update",
+        "unregistered",
+        json!({"content":"invalid"}),
+    );
+    let denied = model_frame(&mut fixture, &runtime, &mut socket, &mut seen, |v| {
+        v["id"] == "unregistered"
+    });
+    assert_eq!(denied["success"], false);
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), original);
+    send(
+        &mut socket,
+        "connection.register",
+        "register-models",
+        json!({"client_type":"webui","name":"models-editor"}),
+    );
+    assert_eq!(
+        model_frame(&mut fixture, &runtime, &mut socket, &mut seen, |v| v["id"]
+            == "register-models")["success"],
+        true
+    );
+    send(&mut socket, "model.config.req", "read-models", json!({}));
+    assert_eq!(
+        model_frame(&mut fixture, &runtime, &mut socket, &mut seen, |v| v["id"]
+            == "read-models")["content"],
+        original
+    );
+    send(
+        &mut socket,
+        "model.config.update",
+        "invalid-models",
+        json!({"content":"[broken"}),
+    );
+    assert_eq!(
+        model_frame(&mut fixture, &runtime, &mut socket, &mut seen, |v| v["id"]
+            == "invalid-models")["success"],
+        false
+    );
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), original);
+    let replacement = original
+        .replace("upstream-model", "configured-model")
+        .replace("private-test-key", "new-secret");
+    send(
+        &mut socket,
+        "model.config.update",
+        "replace-models",
+        json!({"content":replacement}),
+    );
+    assert_eq!(
+        model_frame(&mut fixture, &runtime, &mut socket, &mut seen, |v| v["id"]
+            == "replace-models")["success"],
+        true
+    );
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), replacement);
+    model_frame(&mut fixture, &runtime, &mut socket, &mut seen, |v| {
+        v["type"] == "model.config.sync" && v["content"] == replacement
+    });
+    assert_eq!(
+        fixture
+            .app
+            .world()
+            .get_resource::<inference_core::ModelRoutes>()
+            .unwrap()
+            .get("route")
+            .unwrap()
+            .model,
+        "configured-model"
+    );
+    let external = replacement.replace("configured-model", "externally-edited-model");
+    let temporary = file.with_file_name("models-edited.toml");
+    std::fs::write(&temporary, &external).unwrap();
+    std::fs::rename(&temporary, &file).unwrap();
+    model_frame(&mut fixture, &runtime, &mut socket, &mut seen, |v| {
+        v["type"] == "model.config.sync" && v["content"] == external
+    });
+    std::fs::write(&file, "malformed external file [").unwrap();
+    model_frame(&mut fixture, &runtime, &mut socket, &mut seen, |v| {
+        v["type"] == "model.config.sync" && v["content"] == "malformed external file ["
+    });
+    send(&mut socket, "model.config.req", "read-malformed", json!({}));
+    assert_eq!(
+        model_frame(&mut fixture, &runtime, &mut socket, &mut seen, |v| v["id"]
+            == "read-malformed")["content"],
+        "malformed external file ["
+    );
+    std::fs::remove_file(&file).unwrap();
+    model_frame(&mut fixture, &runtime, &mut socket, &mut seen, |v| {
+        v["type"] == "model.config.sync" && v["content"].is_null() && v["error"].is_object()
+    });
+    std::fs::write(&file, &external).unwrap();
+    send(&mut socket, "model.config.req", "restored", json!({}));
+    assert_eq!(
+        model_frame(&mut fixture, &runtime, &mut socket, &mut seen, |v| v["id"]
+            == "restored")["content"],
+        external
+    );
+    runtime.block_on(socket.close(None)).unwrap();
+}

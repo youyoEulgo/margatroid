@@ -106,8 +106,8 @@ function execute(arguments, context)
             local initial = margatroid.data:decode("toml", margatroid.files:read(context.resource_dir .. "/setting.toml"))
             initialization = initial.initialization
         end
-        for _, instruction in ipairs(initialization.default) do command(instruction) end
-        for _, instruction in ipairs(initialization.custom or {}) do command(instruction) end
+        for _, instruction in ipairs(initialization.default) do command(instruction.command, instruction.arguments) end
+        for _, instruction in ipairs(initialization.custom or {}) do command(instruction.command, instruction.arguments) end
         command("EFFECT sandbox_use ?", {config.sandbox})
         command("CONFIG SET ? ?", {"driver_task", {agent = context.task_address, task_id = context.task_id}})
         command("EFFECT ready")
