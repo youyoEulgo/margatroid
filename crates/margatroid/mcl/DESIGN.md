@@ -17,7 +17,7 @@ method(args) -> xxx
 # lib        mcl/core/src/lib.rs；mcl/plugin/src/lib.rs  解析入口与队列扩展；Plugin安装
 # components mcl/core/src/components.rs                MclQueue
 # events     mcl/core/src/events.rs                    MclCommand
-# system     mcl/plugin/src/system.rs                  请求、闭包结果与队首路由
+# system     mcl/plugin/src/system.rs                  请求受理、队列分派与执行锁
 # handler    mcl/plugin/src/handler.rs                 参数求值及领域调用
 # types      mcl/plugin/src/types.rs                   执行上下文和异步载荷
 # types pub  mcl/core/src/types.rs                     指令、语法树、选择器与结果值
@@ -68,9 +68,11 @@ MclPlugin：MCL执行插件
 -- 公开
 MclQueue：目标Entity的命令队列，公开组件
     commands: VecDeque<MclCommand>
-    pending: Option<String>--当前队首id
+    locked: Arc<AtomicBool>--跨线程指令锁；Acquire读取，Release解锁
+    active: Arc<Mutex<BTreeMap<String,MclReply>>>--实际在途id及原回复身份，不是返回队列
     accepting: bool
     drain: MclDrain
+    cancel: CancellationToken
     impl Component for MclQueue
 ```
 
@@ -100,13 +102,11 @@ MclCommand：命令请求，公开事件
 -- crate公开
 mcl_command_system(world: &mut World)
     处理事件：MclCommand
-    接收闭包结果：Result<CommandOutput, CommandError>
-    提交闭包：execute_command(CommandContext) -> Future<Output = Result<CommandOutput, CommandError>>
+    提交闭包：execute_command(CommandContext) -> Future<Output = ()>
     产出事件：None
     oneshot回复：Result<MclValue, MclError>
     行为：
         MclCommand -> handle_command；
-        Result<CommandOutput, CommandError> -> handle_command_result；
         MclQueue -> handle_queue。
 ```
 
@@ -124,23 +124,21 @@ handle_command(world: &mut World, request: MclCommand)
 
 handle_queue(world: &mut World, target: Entity)
     行为：
-        队首无pending时解析一次，取得owned执行能力，设置pending并提交execute_command；
-        关闭的排队项完成取消收口，不提交业务动作。
-
-handle_command_result(world: &mut World, result: Result<CommandOutput, CommandError>)
-    行为：
-        核对目标、pending和队首id，回复原oneshot并移除队首；
-        异步任务及回执全部收口后通知drain。
+        目标locked为true时跳过；否则循环pop_front，取消/无效来源/语法错误直接原oneshot回复并drain.completed，继续下一条；
+        工具调用、推理及等待推理收口的finish_turn不持队列锁，其他操作先store(true)再提交异步闭包；
+        分派时登记active[id]=原reply、取得目标Session/turn/Prompt快照及CommandCompletion，构造owned CommandContext；
+        调用既有AsyncRuntimeHandle::spawn提交无返回事件的owned执行Future；不锁操作发出后继续分派下一条，锁操作发出后停止处理该队列；真实完成解锁时WorldClosureSender发送一次空闭包唤醒所属执行器；
+        不处理MCL返回事件，不在队列保留已分派命令，不实现隔离或多指令事务。
 ```
 
 ```text
 -- 私有
-execute_command(context: CommandContext) -> Future<Output = Result<CommandOutput, CommandError>>
+execute_command(context: CommandContext) -> Future<Output = ()>
     行为：
         执行execute_operation并等待真实收口，取消时通知执行能力后继续等待，不以丢弃Future结束操作；
         执行完成后独立追加一次MCL审计，记录来源、实例、指令、参数及真实执行结果；
         审计失败返回说明执行可能已提交的错误，不能伪称执行未发生；
-        包装CommandOutput或CommandError供handle_command_result回复，不在此直接发送原reply；
+        结果交context.completion.finish：移除active，持锁者解锁，直接消费原oneshot回复，然后完成drain计数，并唤醒执行器；不发MCL完成事件；
         不跨await借用World，不重复解析或审计。
 
 execute_import(context: CommandContext, kind: ImportKind, locator: String, alias: String)
@@ -223,8 +221,21 @@ execute_tools(context: &CommandContext, messages: Vec<Value>, turn: Option<Strin
 ```text
 -- 私有
 CommandContext：执行材料--原MclCommand、MclOperation、owned存储与执行能力、路径和取消能力
-CommandOutput：完成载荷--原请求关联、MclValue
-CommandError：失败载荷--原请求关联、MclError
+    completion: CommandCompletion--执行闭包持有的收尾guard
+CommandCompletion：执行收尾guard
+    request: MclCommand
+    active: Arc<Mutex<BTreeMap<String,MclReply>>>
+    locked: Arc<AtomicBool>
+    owns_lock: bool
+    drain: MclDrain
+    world: WorldClosureSender
+    settled: bool
+    finish(&mut self,result:Result<MclValue,MclError>)
+        行为：至多一次；记录CleanupFailed/CommitUnknown供drain，移除active，持锁者Release解锁，通过原reply回复后drain.completed；持锁者再提交一次World空闭包触发事件驱动执行器处理排队请求。
+    Drop
+        行为：没有确认结果则以CleanupFailed收尾，不留下锁或丢失原reply。
+check_action(world,request,cancel)
+    行为：复检取消及来源、目标受理门，active必须含同id且Arc::ptr_eq匹配原reply；不要求命令仍位于队首。
 ```
 
 # types pub
@@ -294,7 +305,7 @@ MclValue：命令返回值，公开枚举
 MclDrain：线程安全收口能力
     wait(&self) -> Future<Output = Result<(), MclError>>
         行为：
-            等待队列、在途操作及回执全部完成，未解决清理失败返回错误。
+            等待outstanding归零后才返回已记录清理错误或成功；不会因一个在途请求先失败而略过其他尚未完成请求。
 ```
 
 # error

@@ -1372,7 +1372,6 @@ dependencies = [
  "toml",
  "tool_core",
  "tool_resource_core",
- "tracing",
 ]
 
 [[package]]
@@ -1388,6 +1387,7 @@ dependencies = [
  "core_plugin",
  "futures-util",
  "libc",
+ "mcl_core",
  "reqwest",
  "serde",
  "serde_json",

@@ -193,12 +193,14 @@ mod mailbox_compaction {
                             .is_some_and(|calls| calls
                                 .iter()
                                 .any(|call| call["id"] == "delegate-child"))));
-                        let boundary = &messages[messages.len() - 2];
-                        assert_eq!(boundary["role"], "user");
-                        assert!(boundary["content"]
-                            .as_str()
-                            .unwrap()
-                            .starts_with("[inherit-boundary]"));
+                        assert_eq!(
+                            messages
+                                .iter()
+                                .filter(|message| message["role"] != "system")
+                                .count(),
+                            1,
+                            "child only receives its own delegated user message"
+                        );
                         entered.store(true, Ordering::Release);
                         while !release.load(Ordering::Acquire) {
                             std::thread::sleep(Duration::from_millis(1));
@@ -601,7 +603,7 @@ mod mailbox_compaction {
                 data.join(format!("workspaces/probe/agents/{child_name}/setting.toml"));
             let child_config: Value =
                 toml::from_str(&std::fs::read_to_string(child_settings).unwrap()).unwrap();
-            assert_eq!(child_config["inheritance_marker"], "from-parent");
+            assert!(child_config.get("inheritance_marker").is_none());
             assert_eq!(child_config["inference"]["model"], "offline");
             let history = request(
                 &mut socket,
@@ -734,6 +736,81 @@ mod mailbox_compaction {
                 .unwrap()
                 .starts_with("[subagent error] "));
             request(&mut socket,"mcl.execute","finish-failed-subdriver",json!({"address":address,"command":"EFFECT tool_call ?","arguments":[[{"id":"finish-failed-child","tool_name":"task_finish","arguments":json!({"task_id":failed_child["task_id"]}).to_string()}]]}),&mut seen).await;
+            let skill_dir = home.path().join("persisted-skill");
+            std::fs::create_dir(&skill_dir).unwrap();
+            std::fs::write(skill_dir.join("SKILL.md"),"---\nname: persisted-skill\ndescription: Startup registration fixture.\n---\nFixture instructions.\n").unwrap();
+            let register_arguments = json!({"path":skill_dir.join("SKILL.md")});
+            for iteration in 0..2 {
+                let registered=request(&mut socket,"mcl.execute",&format!("persist-skill-{iteration}"),json!({"address":address,"command":"EFFECT tool_call ?","arguments":[[{"id":format!("register-{iteration}"),"tool_name":"skill_register","arguments":register_arguments.to_string()}]]}),&mut seen).await;
+                assert_eq!(registered["data"]["value"][0]["failed"], iteration==1,"duplicate live registration retains existing AliasConflict semantics: {registered}");
+            }
+            let registered_config = request(
+                &mut socket,
+                "mcl.execute",
+                "registration-config",
+                json!({"address":address,"command":"CONFIG GET","arguments":[]}),
+                &mut seen,
+            )
+            .await;
+            let startup = registered_config["data"]["value"]["initialization"]["custom"]
+                .as_array()
+                .unwrap();
+            let persisted = startup
+                .iter()
+                .filter(|entry| {
+                    entry["command"] == "EFFECT tool_call ?"
+                        && entry["arguments"][0][0]["tool_name"] == "skill_register"
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(persisted.len(), 1);
+            assert_eq!(
+                persisted[0]["arguments"][0][0]["tool_name"],
+                "skill_register"
+            );
+            let settings = data.join(format!("workspaces/probe/agents/{name}/setting.toml"));
+            let before_restart = std::fs::read_to_string(&settings).unwrap();
+            request(
+                &mut socket,
+                "workspace.stop",
+                "registration-stop",
+                json!({"path":definition}),
+                &mut seen,
+            )
+            .await;
+            request(
+                &mut socket,
+                "workspace.start",
+                "registration-restart",
+                json!({"path":definition}),
+                &mut seen,
+            )
+            .await;
+            let restarted = request(
+                &mut socket,
+                "agent.req",
+                "replayed-tools",
+                json!({}),
+                &mut seen,
+            )
+            .await;
+            let restored = restarted["agents"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|agent| agent["address"] == address)
+                .unwrap();
+            assert!(restored["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|tool| tool["alias"] == "persisted-skill"));
+            let after_config: Value =
+                toml::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+            let before_config: Value = toml::from_str(&before_restart).unwrap();
+            assert_eq!(
+                after_config["initialization"]["custom"],
+                before_config["initialization"]["custom"]
+            );
             request(
                 &mut socket,
                 "workspace.stop",
@@ -886,79 +963,31 @@ mod mailbox_compaction {
 }
 
 #[test]
-fn subdriver_inherits_balanced_prefix_without_empty_delegating_assistants() {
-    use mlua::LuaSerdeExt;
-    use serde_json::json;
-    let tool = json!({"type":"assistant","tool_calls":[{"id":"delegate","tool_name":"subagent","arguments":"{}"}],"stop_reason":"tool_calls","sequence":15});
-    let result =
-        json!({"type":"tool_call","content":"result","tool_call_id":"delegate","sequence":16});
-    let earlier = json!([{"type":"user","content":"original","sequence":12},{"type":"assistant","content":"old response","tool_calls":[],"sequence":13},{"type":"user","content":"delegate","sequence":14}]);
-    let mut cases = Vec::new();
-    for count in [0, 1, 2] {
-        let mut context = earlier.as_array().unwrap().clone();
-        let mut request = tool.clone();
-        request["tool_calls"]=json!((0..count.max(1)).map(|index|json!({"id":format!("delegate-{index}"),"tool_name":"subagent","arguments":"{}"})).collect::<Vec<_>>());
-        context.push(request);
-        for index in 0..count {
-            let mut response = result.clone();
-            response["tool_call_id"] = json!(format!("delegate-{index}"));
-            context.push(response);
-        }
-        cases.push((json!(context), earlier.clone()));
-    }
-    let mut batch = tool.clone();
-    batch["tool_calls"] = json!([{"id":"delegate","tool_name":"subagent","arguments":"{}"},{"id":"other","tool_name":"read_file","arguments":"{}"}]);
-    cases.push((json!([batch, result.clone()]), json!([])));
-    cases.push((json!([tool.clone(), result.clone()]), json!([])));
-    cases.push((json!([tool.clone()]), json!([])));
-    cases.push((json!([]), json!([])));
-    cases.push((json!([{"type":"assistant","content":""}]), json!([])));
-    cases.push((
-        json!([{"type":"assistant","content":null,"tool_calls":null}]),
-        json!([]),
-    ));
-    cases.push((
-        json!([{"type":"assistant","content":"X","stop_reason":"max_tokens","sequence":4}]),
-        json!([{"type":"assistant","content":"X","stop_reason":"completed","sequence":4}]),
-    ));
-    cases.push((json!([{"type":"assistant","reasoning":"preserved","content":""}]),json!([{"type":"assistant","reasoning":"preserved","content":"","stop_reason":"completed"}])));
-    let mut nonempty = tool.clone();
-    nonempty["content"] = json!("parent delegation text");
-    nonempty["reasoning"] = json!("parent reasoning");
-    cases.push((json!([nonempty, result]), json!([])));
+fn subdriver_creates_fresh_agent_from_default_config_before_returning_task_id() {
     for source in [
         include_str!("../../../resources/agent-drivers/local/coder/latest/base.lua"),
         include_str!("../../../resources/agent-drivers/local/reviewer/latest/base.lua"),
     ] {
-        for (context, expected) in &cases {
-            let lua = mlua::Lua::new();
-            lua.globals()
-                .set("conversation", lua.to_value(context).unwrap())
-                .unwrap();
-            lua.load(r#"
-ctx={kind="tool",binding={parent_agent="agent:parent:latest"},resource_dir="/driver",task_id="task",arguments={instructions="delegated objective"}}
-margatroid={task={},mcl={},agent={}}
-function margatroid.agent:data_dir(address) assert(address=="agent:parent:latest") return "/parent" end
-function margatroid.task:return_result(value) assert(value.task_id=="task") end
-function margatroid.mcl:execute(address,text,args)
- assert(address=="agent:parent:latest" and text=="GET session.conversation")
- return {Array={Message=conversation}}
+        let lua = mlua::Lua::new();
+        lua.load(r#"
+ctx={kind="tool",resource_dir="/driver",task_id="task",arguments={instructions="delegated objective"}}
+margatroid={agent={}}
+function margatroid.agent:create(options)
+ assert(options.name=="subagent-task" and options.config_path=="/driver/setting.toml" and options.ui_path=="/driver/subagent-ui")
+ return {address="agent:test/subagent-task:latest"}
 end
 "#).exec().unwrap();
-            let prefix = source
-                .split("    local agent = margatroid.agent:create(")
-                .next()
-                .unwrap();
-            let program = format!("{prefix}\nreturn inherited\nend\nreturn execute(nil,ctx)");
-            let inherited: mlua::Value = lua.load(program).eval().unwrap();
-            let mut inherited: serde_json::Value = lua.from_value(inherited).unwrap();
-            let boundary = inherited.as_array_mut().unwrap().pop().unwrap();
-            assert_eq!(boundary["type"], "user");
-            let content = boundary["content"].as_str().unwrap();
-            assert!(content.starts_with("[inherit-boundary]"));
-            assert!(content.contains("agent:parent:latest"));
-            assert!(content.contains("subagent-task"));
-            assert_eq!(&inherited, expected, "input: {context}");
-        }
+        let prefix = source.split("    local active_model").next().unwrap();
+        lua.load(format!(
+            "{prefix}\nreturn agent\nend\nreturn execute(nil,ctx)"
+        ))
+        .eval::<mlua::Value>()
+        .unwrap();
+        assert!(!source
+            .contains("GET session.conversation")
+            .then_some(())
+            .is_some_and(|_| source.contains("inherited")));
+        assert!(!source.contains("binding.parent_agent"));
+        assert!(!source.contains("inherit-boundary"));
     }
 }

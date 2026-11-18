@@ -231,6 +231,26 @@ mod tests {
         Ok(request.0 * 2)
     }
 
+    #[test]
+    fn owned_future_replies_without_a_world_frame_or_completion_event() {
+        let mut app = closure_app();
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.world()
+            .get_resource::<crate::AsyncRuntimeHandle>()
+            .unwrap()
+            .spawn(async move {
+                tx.send(42).unwrap();
+            });
+        assert_eq!(rx.recv_timeout(Duration::from_secs(2)).unwrap(), 42);
+        app.tick();
+        assert!(app
+            .world()
+            .event_reader::<Result<(), AsyncTaskError>>()
+            .into_iter()
+            .next()
+            .is_none());
+    }
+
     fn event_app() -> App {
         let mut app = App::new();
         app.add_plugin(RuntimePlugin::default())

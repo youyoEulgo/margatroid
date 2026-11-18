@@ -65,7 +65,8 @@ mod linux {
             tools
                 .insert(
                     "mcp_register".into(),
-                    ToolEntry { owner_agent:None,
+                    ToolEntry {
+                        owner_agent: None,
                         path: imported.origin,
                         description: imported.description,
                         input_schema: imported.input_schema,
@@ -79,18 +80,39 @@ mod linux {
                 .add_plugin(AsyncRuntimePlugin)
                 .add_plugin(ClosurePlugin)
                 .add_closure_system(RuntimePlugin::UPDATE)
-                .add_plugin(ToolPlugin::new(crate::test_binding()).with_runner_path(std::env::current_exe().unwrap()));
+                .add_plugin(
+                    ToolPlugin::new(crate::test_binding())
+                        .with_runner_path(std::env::current_exe().unwrap()),
+                );
+            super::storage_fixture::config_system(&mut app);
             let workspace = app.world_mut().spawn();
-            app.world_mut().insert_component(workspace,address::Address::new("workspace:test/mcp").unwrap());
             app.world_mut().insert_component(
                 workspace,
-                workspace_core::Workspace::new("mcp-integration".into(), root.path().join("workspace.yaml"), root.path().to_owned(), WorkspaceState::Running, BTreeSet::new(), None, crate::test_workspace_context()),
+                address::Address::new("workspace:test/mcp").unwrap(),
+            );
+            app.world_mut().insert_component(
+                workspace,
+                workspace_core::Workspace::new(
+                    "mcp-integration".into(),
+                    root.path().join("workspace.yaml"),
+                    root.path().to_owned(),
+                    WorkspaceState::Running,
+                    BTreeSet::new(),
+                    None,
+                    crate::test_workspace_context(),
+                ),
             );
             let agent = app.world_mut().spawn();
             super::storage_fixture::mount(app.world_mut(), agent, root.path());
             app.world_mut().insert_component(
                 agent,
-                agent_core::Agent::new("mcp-integration".into(), workspace, AgentState::Running, Some("integration-turn".into()), crate::test_agent_context()),
+                agent_core::Agent::new(
+                    "mcp-integration".into(),
+                    workspace,
+                    AgentState::Running,
+                    Some("integration-turn".into()),
+                    crate::test_agent_context(),
+                ),
             );
             app.world_mut().insert_component(agent, tools);
             let (sender, mut reply) = oneshot::channel();
@@ -538,6 +560,75 @@ mod linux {
                 "{key} process {pid} survived owner cleanup"
             );
         }
+        let storage = f
+            .app
+            .world()
+            .get_component::<storage_core::AgentStorage>(f.agent)
+            .unwrap()
+            .clone();
+        let storage_core::StorageValue::Config(config) =
+            storage_core::execute_storage(&storage, storage_core::StorageOperation::ReadConfig)
+                .unwrap()
+        else {
+            panic!()
+        };
+        let config = serde_json::to_value(config).unwrap();
+        let startup = config["initialization"]["custom"].as_array().unwrap();
+        assert_eq!(startup.len(), 1);
+        let replay = &startup[0]["arguments"][0][0];
+        assert_eq!(replay["tool_name"], "mcp_register");
+        let replay_arguments: Value =
+            serde_json::from_str(replay["arguments"].as_str().unwrap()).unwrap();
+        assert_eq!(replay_arguments["alias_prefix"], "e2e_");
+        assert!(replay_arguments.get("task_id").is_none());
+        let resumed = f.execute("restarted-owner", "mcp_register", replay_arguments);
+        let resumed = f.response(resumed).unwrap();
+        assert!(!resumed.failed, "{}", resumed.content);
+        assert!(f.tasks().get("restarted-owner").is_ok());
+        let storage_core::StorageValue::Config(after) =
+            storage_core::execute_storage(&storage, storage_core::StorageOperation::ReadConfig)
+                .unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(
+            serde_json::to_value(after).unwrap(),
+            config,
+            "startup replay must not append a duplicate command"
+        );
+        f.finish("restarted-owner");
+        let storage_core::StorageValue::Config(table) =
+            storage_core::execute_storage(&storage, storage_core::StorageOperation::ReadConfig)
+                .unwrap()
+        else {
+            panic!()
+        };
+        storage_core::execute_storage(
+            &storage,
+            storage_core::StorageOperation::SetConfig {
+                path: "initialization.custom".into(),
+                value: table["compaction"]["threshold"].clone(),
+            },
+        )
+        .unwrap();
+        let replay_arguments: Value =
+            serde_json::from_str(replay["arguments"].as_str().unwrap()).unwrap();
+        let failed_save = f.execute("unsaved-owner", "mcp_register", replay_arguments);
+        let failed_save = f.response(failed_save).unwrap();
+        assert!(failed_save.failed);
+        assert!(failed_save.content.contains("registered for this session"));
+        assert!(failed_save.content.contains("not saved"));
+        assert!(f.tasks().get("unsaved-owner").is_ok());
+        let ping = f.execute(
+            "after-save-failure",
+            "e2e_echo",
+            json!({"text":"still-serving"}),
+        );
+        let ping = f.response(ping).unwrap();
+        assert!(!ping.failed);
+        assert_eq!(ping.content, "still-serving");
+        f.finish("unsaved-owner");
+
         assert!(f.root.path().exists());
         println!(
             "host_integration: actual resource registration, reverse concurrent calls, owner cleanup passed"
@@ -566,12 +657,26 @@ fn main() {
     println!("host_integration: Linux supervisor test skipped on this platform");
 }
 
-fn test_binding()->tool_core::TaskSyncBinding {
-    tool_core::TaskSyncBinding::new(client_core::Clients::default(), std::sync::Arc::from([]), |snapshot| serde_json::to_string(&snapshot).map(|text|std::sync::Arc::new(client_core::ClientFrame::Text(text))).map_err(|_|client_core::ClientPrepareError::EncodeFailed))
+fn test_binding() -> tool_core::TaskSyncBinding {
+    tool_core::TaskSyncBinding::new(
+        client_core::Clients::default(),
+        std::sync::Arc::from([]),
+        |snapshot| {
+            serde_json::to_string(&snapshot)
+                .map(|text| std::sync::Arc::new(client_core::ClientFrame::Text(text)))
+                .map_err(|_| client_core::ClientPrepareError::EncodeFailed)
+        },
+    )
 }
 
-fn test_agent_context()->agent_core::AgentUpdateContext{agent_core::AgentUpdateContext::new(|_,_,_|Vec::new(),|_,_|{})}
+fn test_agent_context() -> agent_core::AgentUpdateContext {
+    agent_core::AgentUpdateContext::new(|_, _, _| Vec::new(), |_, _| {})
+}
 
-fn test_workspace_context()->workspace_core::WorkspaceUpdateContext{workspace_core::WorkspaceUpdateContext::new(|_,_|{})}
+fn test_workspace_context() -> workspace_core::WorkspaceUpdateContext {
+    workspace_core::WorkspaceUpdateContext::new(|_, _| {})
+}
 
-fn test_probe<T>()->client_core::UpdateProbe<T>{client_core::UpdateProbe::new(|_|{})}
+fn test_probe<T>() -> client_core::UpdateProbe<T> {
+    client_core::UpdateProbe::new(|_| {})
+}

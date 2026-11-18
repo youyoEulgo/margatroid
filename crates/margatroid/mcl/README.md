@@ -88,7 +88,7 @@ start_turn和finish_turn调用agent_core同步扩展；ready和wake调用lua_run
 
 ## 队列与取消
 
-每个目标一个FIFO，一次只推进一个队首，异步等待不阻塞其他目标。System只路由，Handler完成校验和推进；闭包不跨await借用World。完成后通过原oneshot回复，不额外建立MclCommandResult中转事件。
+每个目标仍按FIFO分派。CONFIG、Block、IMPORT及普通状态effect先持Arc<AtomicBool>执行锁，真实执行及审计完成后解锁并直接oneshot回复；工具、推理及finish_turn异步不锁队列，工具内部可向同Agent调用MCL。active仅用于在途身份/重复id及关停核对，不承担结果队列。删除CommandOutput/CommandError完成事件及pending；完成guard负责移除active、更新drain和一次实际解锁唤醒，不跨await借World，不轮询等结果。
 
 插件仅允许UPDATE或POST_UPDATE，回合中止固定PRE_UPDATE同步控制，不进入FIFO，不关闭整个队列。中止先清目标turn，只取消绑定该turn的推理及未return工具；自由调用、其他回合和已return后台任务保留。finish_turn在World外等待本轮推理真实收口，再核对关联并清turn，不轮询重试，不移除其他请求的句柄。Agent关闭仍清理所有调用。
 
@@ -106,3 +106,5 @@ Agent创建注入接口为name/config_path/ui_path，拒绝旧resource_dir创建
 显式可选turn契约：start_turn取得并返回当前turn，已有回合返回同一标识；推理和工具显式携带turn时严格校验，省略为None自由调用，不自动继承当前turn。自由调用仍受实际会话、权限、生命周期、取消及原有并发限制；Starting允许初始化所需自由调用，Error/Stopping拒绝。回合中止/收尾只作用于明确绑定该turn的请求，Agent关闭仍监督全部调用。详见本域DESIGN。运行中的旧进程仍需使用新构建。
 
 推理领域的连接失败、HTTP错误、超时等通过Inference.message返回type=error的AgentMessage，附原request_id及stop_reason=error；不再提升为顶层MCL Error导致Driver退出。执行通道错误、MCL受理/参数/权限错误及真正的清理失败仍按各自原契约收口。压缩消息的历史写入、快照及上下文替换由compact调用方处理。
+
+GET和后续SET是两条独立命令，Lua编辑数组后整份SET覆盖最新键；中间其他SET的结果可能被覆盖，按当前契约接受，不提供隔离、token、CAS或upsert。配置单次实际提交仍原子，CONFIG/Block的单条顺序由执行锁保证。

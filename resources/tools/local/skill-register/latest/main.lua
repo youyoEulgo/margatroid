@@ -175,6 +175,31 @@ local function inventory(root)
     return files
 end
 
+
+-- Persist replay instructions through the existing CONFIG contract. GET/SET is
+-- intentionally a whole-array replacement, not a multi-command transaction.
+local function persist_registration(context, replay_arguments)
+    local function command(text, arguments)
+        local response = margatroid.mcl:execute(context.agent_info.address, text, arguments)
+        if response.Error then error(response.Error.message, 0) end
+        return response
+    end
+    local config = command("CONFIG GET").Config
+    local initialization = config.initialization or {}
+    local custom = initialization.custom or {}
+    if type(custom) ~= "table" then error("initialization.custom must be an array", 0) end
+    local replay = {command = "EFFECT tool_call ?", arguments = {{
+        {id = "startup-" .. context.alias, tool_name = context.alias,
+         arguments = margatroid.data:encode("json", replay_arguments)}
+    }}}
+    local encoded = margatroid.data:encode("json", replay)
+    for _, item in ipairs(custom) do
+        if margatroid.data:encode("json", item) == encoded then return end
+    end
+    custom[#custom + 1] = replay
+    command("CONFIG SET ? ?", {"initialization.custom", custom})
+end
+
 local function register_skill(arguments, context)
     local path = normalized(arguments.path)
     if path:sub(1, 1) ~= "/" and not (WINDOWS and path:match("^%a:/")) then
@@ -199,6 +224,8 @@ local function register_skill(arguments, context)
         },
         binding = { kind = "skill", skill_md = skill_md, files = files },
     } }})
+    local saved, save_error = pcall(persist_registration, context, {path = skill_md})
+    if not saved then fail("Skill registered for this session, but startup registration was not saved: " .. tostring(save_error)) end
     -- Static aliases survive this short task's finish without a task lifetime.
     return margatroid.data:encode("json", { alias = meta.name, skill_md = skill_md, files = files })
 end

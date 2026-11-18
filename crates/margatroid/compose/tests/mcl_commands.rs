@@ -1192,13 +1192,15 @@ async fn batch_collects_forced_abort_and_returned_background_replies_without_los
             .world()
             .get_component::<MclQueue>(fixture.owner)
             .unwrap()
-            .pending
-            .is_none()
+            .active
+            .lock()
+            .unwrap()
+            .is_empty()
     );
 }
 
 #[tokio::test]
-async fn fifo_waits_for_domain_reply_while_other_agents_keep_progressing() {
+async fn inference_does_not_block_same_agent_config_or_other_agents() {
     let mut fixture = Fixture::new();
     fixture.command("EFFECT start_turn", vec![]).await.unwrap();
     fixture.auto_inference.store(false, Ordering::Release);
@@ -1206,7 +1208,6 @@ async fn fifo_waits_for_domain_reply_while_other_agents_keep_progressing() {
     let mut queued = fixture.enqueue("CONFIG SET ? ?", vec![json!("ordered"), json!(true)]);
     let recorded = fixture.inference.clone();
     tick_until(&mut fixture.app, || !recorded.lock().unwrap().is_empty()).await;
-    assert!(queued.try_recv().is_err());
     let workspace = fixture
         .app
         .world()
@@ -1246,6 +1247,8 @@ async fn fifo_waits_for_domain_reply_while_other_agents_keep_progressing() {
         drive(&mut fixture.app, &mut other_reply).await.unwrap(),
         MclValue::Config(_)
     ));
+    drive(&mut fixture.app, &mut queued).await.unwrap();
+    assert!(first.try_recv().is_err());
     let request = fixture.inference.lock().unwrap()[0].clone();
     request
         .reply
@@ -1256,7 +1259,6 @@ async fn fifo_waits_for_domain_reply_while_other_agents_keep_progressing() {
         .send(Ok(response()))
         .unwrap();
     drive(&mut fixture.app, &mut first).await.unwrap();
-    drive(&mut fixture.app, &mut queued).await.unwrap();
 }
 
 #[tokio::test]
@@ -1265,11 +1267,12 @@ async fn closing_queue_cancels_domain_and_waits_for_reply_before_drain() {
     fixture.command("EFFECT start_turn", vec![]).await.unwrap();
     fixture.auto_inference.store(false, Ordering::Release);
     let mut first = fixture.enqueue("EFFECT inference ?", vec![json!([user("question")])]);
-    let mut queued = fixture.enqueue("CONFIG SET ? ?", vec![json!("must_not_exist"), json!(true)]);
     let recorded = fixture.inference.clone();
     tick_until(&mut fixture.app, || !recorded.lock().unwrap().is_empty()).await;
     let drain = fixture.app.world().mcl_drain(fixture.owner).unwrap();
     fixture.app.world_mut().mcl_close(fixture.owner).unwrap();
+    let mut queued = fixture.enqueue("CONFIG SET ? ?", vec![json!("must_not_exist"), json!(true)]);
+
     let request = fixture.inference.lock().unwrap()[0].clone();
     assert!(request.cancel.is_cancelled());
     let mut waiting = Box::pin(drain.wait());
@@ -1289,7 +1292,7 @@ async fn closing_queue_cancels_domain_and_waits_for_reply_before_drain() {
     drive(&mut fixture.app, &mut first).await.unwrap();
     assert_eq!(
         drive(&mut fixture.app, &mut queued).await.error_kind(),
-        MclErrorKind::Cancelled
+        MclErrorKind::Closed
     );
     waiting.await.unwrap();
     let storage = fixture
@@ -3149,4 +3152,80 @@ async fn compact_history_messages_are_assistant_aliases_at_the_inference_boundar
     assert!(
         matches!(&requests.last().unwrap().messages[0],InferenceMessage::Assistant{content:Some(text),..}if text=="compressed")
     );
+}
+
+#[tokio::test]
+async fn queued_config_updates_and_reads_wait_for_actual_prior_commit() {
+    let mut fixture = Fixture::new();
+    let mut first = fixture.enqueue("CONFIG SET ? ?", vec![json!("ordered_value"), json!(1)]);
+    let mut observed_first = fixture.enqueue("CONFIG GET", vec![]);
+    let mut second = fixture.enqueue("CONFIG SET ? ?", vec![json!("ordered_value"), json!(2)]);
+    let mut observed_second = fixture.enqueue("CONFIG GET", vec![]);
+    let last = drive(&mut fixture.app, &mut observed_second).await.unwrap();
+    assert!(
+        matches!(last,MclValue::Config(config)if config["ordered_value"].as_integer()==Some(2))
+    );
+    assert!(
+        matches!(observed_first.try_recv().unwrap().unwrap(),MclValue::Config(config)if config["ordered_value"].as_integer()==Some(1))
+    );
+    first.try_recv().unwrap().unwrap();
+    second.try_recv().unwrap().unwrap();
+    assert!(
+        !fixture
+            .app
+            .world()
+            .get_component::<MclQueue>(fixture.owner)
+            .unwrap()
+            .locked
+            .load(Ordering::Acquire)
+    );
+}
+
+#[tokio::test]
+async fn active_nonlocking_request_id_remains_reserved_until_direct_reply() {
+    let mut fixture = Fixture::new();
+    fixture.auto_inference.store(false, Ordering::Release);
+    let mut first = fixture.enqueue_as(
+        "active-id".into(),
+        fixture.client,
+        None,
+        fixture.owner,
+        "EFFECT inference ?",
+        vec![json!([user("question")])],
+    );
+    let recorded = fixture.inference.clone();
+    tick_until(&mut fixture.app, || !recorded.lock().unwrap().is_empty()).await;
+    let mut duplicate = fixture.enqueue_as(
+        "active-id".into(),
+        fixture.client,
+        None,
+        fixture.owner,
+        "CONFIG GET",
+        vec![],
+    );
+    assert_eq!(
+        drive(&mut fixture.app, &mut duplicate).await.error_kind(),
+        MclErrorKind::ParseFailed
+    );
+    fixture.inference.lock().unwrap()[0]
+        .reply
+        .lock()
+        .unwrap()
+        .take()
+        .unwrap()
+        .send(Ok(response()))
+        .unwrap();
+    drive(&mut fixture.app, &mut first).await.unwrap();
+    let mut reused = fixture.enqueue_as(
+        "active-id".into(),
+        fixture.client,
+        None,
+        fixture.owner,
+        "CONFIG GET",
+        vec![],
+    );
+    assert!(matches!(
+        drive(&mut fixture.app, &mut reused).await.unwrap(),
+        MclValue::Config(_)
+    ));
 }

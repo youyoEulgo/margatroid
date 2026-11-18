@@ -86,3 +86,5 @@ an optional server DELETE response. There is no synthesized timeout; the calling
 resource owns its time and cancellation policy.
 
 Transport reference: <https://modelcontextprotocol.io/specification/2025-06-18/basic/transports>.
+
+The Lua mcp-register resource persists its successful registration command in the target Agent initialization.custom through existing CONFIG GET/SET. Startup replays reconnect and recreate a serving task; identical instructions are not appended again. Save failure is reported as partial success while the current serving task remains alive. These policies remain in Lua; the mcp-client protocol and process have no Agent configuration responsibilities.

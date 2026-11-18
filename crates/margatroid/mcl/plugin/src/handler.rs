@@ -3,7 +3,7 @@ use crate::{InstalledMcl, MclImportConfig};
 use address::{Address, ParsedAddress, resolve_file};
 use agent_core::{Agent, AgentState, WorldAgentExt};
 use app_runtime_plugin::WorldEventExt;
-use async_runtime_plugin::WorldAsyncExt;
+use async_runtime_plugin::AsyncRuntimeHandle;
 use closure_plugin::{WorldClosureExt, WorldClosureSender};
 use core_plugin::{Entity, World};
 use futures_util::FutureExt;
@@ -32,7 +32,7 @@ fn error(kind: MclErrorKind, message: impl Into<String>) -> MclError {
     MclError::new(kind, message)
 }
 
-fn respond(request: &MclCommand, result: Result<MclValue, MclError>) {
+pub(crate) fn respond(request: &MclCommand, result: Result<MclValue, MclError>) {
     if let Some(sender) = lock(&request.reply).take() {
         let result = result.unwrap_or_else(|failed| {
             MclValue::Error(json!({
@@ -116,10 +116,8 @@ pub(crate) fn handle_command(world: &mut World, mut request: MclCommand) {
         if !queue.accepting || queue.cancel.is_cancelled() {
             return Err(error(MclErrorKind::Closed, "MCL queue is closed"));
         }
-        if queue
-            .commands
-            .iter()
-            .any(|pending| pending.id == request.id)
+        if queue.commands.iter().any(|queued| queued.id == request.id)
+            || queue.active.lock().unwrap().contains_key(&request.id)
         {
             return Err(error(MclErrorKind::ParseFailed, "duplicate MCL request id"));
         }
@@ -133,124 +131,112 @@ pub(crate) fn handle_command(world: &mut World, mut request: MclCommand) {
 }
 
 pub(crate) fn handle_queue(world: &mut World, target: Entity) {
-    let Some(queue) = world.get_component::<MclQueue>(target) else {
-        return;
-    };
-    if queue.pending.is_some() {
-        return;
-    }
-    let Some(request) = queue.commands.front().cloned() else {
-        return;
-    };
-    if !queue.accepting || queue.cancel.is_cancelled() || request.cancel.is_cancelled() {
-        settle_head(
-            world,
-            &request,
-            Err(error(
-                MclErrorKind::Cancelled,
-                "MCL command cancelled before execution",
-            )),
-        );
-        return;
-    }
-    if let Err(error) = validate_source(world, &request) {
-        settle_head(world, &request, Err(error));
-        return;
-    }
-    let operation = match parse_instruction(&request.instruction) {
-        Ok(operation) => operation,
-        Err(error) => {
-            settle_head(world, &request, Err(error));
+    loop {
+        let Some(queue) = world.get_component_mut::<MclQueue>(target) else {
+            return;
+        };
+        if queue.locked.load(Ordering::Acquire) {
             return;
         }
-    };
-    let settings = world
-        .get_resource::<InstalledMcl>()
-        .expect("MCL plugin is not installed");
-    let schedule = settings.schedule.clone();
-    let queue = world.get_component_mut::<MclQueue>(target).unwrap();
-    queue.pending = Some(request.id.clone());
-    let cancel = queue.cancel.child_token();
-    let instance = world
-        .get_component::<agent_core::AgentSession>(target)
-        .map(|session| session.0.clone());
-    let context = CommandContext {
-        request,
-        operation,
-        cancel,
-        events: world.event_sender(),
-        world: world.closure_sender(&schedule),
-        instance,
-        turn: world
-            .get_component::<Agent>(target)
-            .and_then(|agent| agent.turn().clone()),
-        prompts: world
-            .get_component::<Prompts>(target)
-            .map(|prompts| {
-                prompts
-                    .iter()
-                    .map(|(alias, path)| (alias.clone(), path.clone()))
-                    .collect()
-            })
-            .unwrap_or_default(),
-        imports: world.get_resource::<MclImportConfig>().unwrap().clone(),
-    };
-    world.send_async_closure(&schedule, move || execute_command(context));
-}
-
-pub(crate) fn handle_command_result(
-    world: &mut World,
-    result: Result<CommandOutput, CommandError>,
-) {
-    match result {
-        Ok(output) => {
-            settle_head(world, &output.request, Ok(output.value));
+        let Some(request) = queue.commands.pop_front() else {
+            return;
+        };
+        let rejected =
+            if !queue.accepting || queue.cancel.is_cancelled() || request.cancel.is_cancelled() {
+                Some(error(
+                    MclErrorKind::Cancelled,
+                    "MCL command cancelled before execution",
+                ))
+            } else {
+                None
+            };
+        if let Some(failed) = rejected {
+            respond(&request, Err(failed));
+            queue.drain.completed(None);
+            continue;
         }
-        Err(failed) => match failed.request {
-            Some(request) => settle_head(world, &request, Err(failed.error)),
-            None => {
-                tracing::error!(error = %failed.error, "MCL worker failed without a completion association")
+        if let Err(failed) = validate_source(world, &request) {
+            respond(&request, Err(failed));
+            world
+                .get_component::<MclQueue>(target)
+                .unwrap()
+                .drain
+                .completed(None);
+            continue;
+        }
+        let operation = match parse_instruction(&request.instruction) {
+            Ok(operation) => operation,
+            Err(failed) => {
+                respond(&request, Err(failed));
+                world
+                    .get_component::<MclQueue>(target)
+                    .unwrap()
+                    .drain
+                    .completed(None);
+                continue;
             }
-        },
-    }
-}
-
-fn settle_head(world: &mut World, request: &MclCommand, result: Result<MclValue, MclError>) {
-    let matched = world
-        .get_component::<MclQueue>(request.target)
-        .is_some_and(|queue| {
-            queue.commands.front().is_some_and(|front| {
-                front.id == request.id && Arc::ptr_eq(&front.reply, &request.reply)
-            }) && queue.pending.as_deref().is_none_or(|id| id == request.id)
-        });
-    if !matched {
-        respond(
+        };
+        let owns_lock = !matches!(&operation,MclOperation::Effect{name,..}if matches!(name.as_str(),"tool_call"|"inference"|"finish_turn"));
+        let schedule = world
+            .get_resource::<InstalledMcl>()
+            .expect("MCL plugin is not installed")
+            .schedule
+            .clone();
+        let queue = world.get_component_mut::<MclQueue>(target).unwrap();
+        if owns_lock {
+            queue.locked.store(true, Ordering::Release);
+        }
+        queue
+            .active
+            .lock()
+            .unwrap()
+            .insert(request.id.clone(), request.reply.clone());
+        let cancel = queue.cancel.child_token();
+        let completion = CommandCompletion {
+            request: request.clone(),
+            active: queue.active.clone(),
+            locked: queue.locked.clone(),
+            owns_lock,
+            drain: queue.drain.clone(),
+            world: world.closure_sender(&schedule),
+            settled: false,
+        };
+        let instance = world
+            .get_component::<agent_core::AgentSession>(target)
+            .map(|session| session.0.clone());
+        let context = CommandContext {
             request,
-            Err(error(
-                MclErrorKind::Closed,
-                "MCL queue changed before command completion",
-            )),
-        );
-        return;
+            operation,
+            cancel,
+            events: world.event_sender(),
+            world: world.closure_sender(&schedule),
+            instance,
+            turn: world
+                .get_component::<Agent>(target)
+                .and_then(|agent| agent.turn().clone()),
+            prompts: world
+                .get_component::<Prompts>(target)
+                .map(|prompts| {
+                    prompts
+                        .iter()
+                        .map(|(alias, path)| (alias.clone(), path.clone()))
+                        .collect()
+                })
+                .unwrap_or_default(),
+            imports: world.get_resource::<MclImportConfig>().unwrap().clone(),
+            completion,
+        };
+        world
+            .get_resource::<AsyncRuntimeHandle>()
+            .expect("MCL async runtime missing")
+            .spawn(execute_command(context));
+        if owns_lock {
+            return;
+        }
     }
-    let cleanup_error = result
-        .as_ref()
-        .err()
-        .filter(|error| {
-            matches!(
-                error.kind,
-                MclErrorKind::CleanupFailed | MclErrorKind::CommitUnknown
-            )
-        })
-        .cloned();
-    respond(request, result);
-    let queue = world.get_component_mut::<MclQueue>(request.target).unwrap();
-    queue.commands.pop_front();
-    queue.pending = None;
-    queue.drain.completed(cleanup_error);
 }
 
-async fn execute_command(context: CommandContext) -> Result<CommandOutput, CommandError> {
+async fn execute_command(mut context: CommandContext) {
     let request = context.request.clone();
     let outcome = AssertUnwindSafe(async {
         let operation = execute_operation(&context);
@@ -277,13 +263,7 @@ async fn execute_command(context: CommandContext) -> Result<CommandOutput, Comma
             ))),
         }
     }).catch_unwind().await.unwrap_or_else(|_| Err(error(MclErrorKind::CleanupFailed, "MCL execution panicked; cleanup could not be confirmed")));
-    match outcome {
-        Ok(value) => Ok(CommandOutput { request, value }),
-        Err(error) => Err(CommandError {
-            request: Some(request),
-            error,
-        }),
-    }
+    context.completion.finish(outcome);
 }
 
 async fn execute_operation(context: &CommandContext) -> Result<MclValue, MclError> {
@@ -665,11 +645,12 @@ fn check_action(
         .ok_or_else(|| error(MclErrorKind::Closed, "MCL queue is missing"))?;
     if !queue.accepting
         || queue.cancel.is_cancelled()
-        || queue.pending.as_deref() != Some(request.id.as_str())
         || !queue
-            .commands
-            .front()
-            .is_some_and(|front| Arc::ptr_eq(&front.reply, &request.reply))
+            .active
+            .lock()
+            .unwrap()
+            .get(&request.id)
+            .is_some_and(|reply| Arc::ptr_eq(reply, &request.reply))
     {
         return Err(error(
             MclErrorKind::Closed,

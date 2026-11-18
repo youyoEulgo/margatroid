@@ -594,7 +594,7 @@ async fn install_runtime(
             .get_component_mut::<ActiveInference>(agent)
             .and_then(|active| active.current.take());
         if let Some(queue) = world.get_component::<MclQueue>(agent) {
-            if !queue.commands.is_empty() || queue.pending.is_some() {
+            if !queue.commands.is_empty() || !queue.active.lock().unwrap().is_empty() {
                 return Err(error(
                     AgentErrorKind::CleanupFailed,
                     "old MCL commands have not drained",
@@ -852,10 +852,9 @@ async fn stop_runtime(context: &FlowContext, _require_vm: bool) -> Result<(), Ag
                 "tool activity remains after stop",
             ));
         }
-        if world
-            .get_component::<MclQueue>(agent)
-            .is_some_and(|queue| !queue.commands.is_empty() || queue.pending.is_some())
-        {
+        if world.get_component::<MclQueue>(agent).is_some_and(|queue| {
+            !queue.commands.is_empty() || !queue.active.lock().unwrap().is_empty()
+        }) {
             return Err(error(
                 AgentErrorKind::CleanupFailed,
                 "MCL commands have not fully drained",

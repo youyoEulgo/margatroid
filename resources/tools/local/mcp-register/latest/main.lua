@@ -98,6 +98,31 @@ local function call_remote(arguments, context)
     end
 end
 
+
+-- Persist replay instructions through the existing CONFIG contract. GET/SET is
+-- intentionally a whole-array replacement, not a multi-command transaction.
+local function persist_registration(context, replay_arguments)
+    local function command(text, arguments)
+        local response = margatroid.mcl:execute(context.agent_info.address, text, arguments)
+        if response.Error then error(response.Error.message, 0) end
+        return response
+    end
+    local config = command("CONFIG GET").Config
+    local initialization = config.initialization or {}
+    local custom = initialization.custom or {}
+    if type(custom) ~= "table" then error("initialization.custom must be an array", 0) end
+    local replay = {command = "EFFECT tool_call ?", arguments = {{
+        {id = "startup-" .. context.alias, tool_name = context.alias,
+         arguments = margatroid.data:encode("json", replay_arguments)}
+    }}}
+    local encoded = margatroid.data:encode("json", replay)
+    for _, item in ipairs(custom) do
+        if margatroid.data:encode("json", item) == encoded then return end
+    end
+    custom[#custom + 1] = replay
+    command("CONFIG SET ? ?", {"initialization.custom", custom})
+end
+
 local function register_server(arguments, context, state)
     local process = margatroid.process:start(context.resource_dir .. "/bin/mcp-client", {})
     state.process = process
@@ -222,9 +247,16 @@ local function register_server(arguments, context, state)
         -- The host validates and commits the entire batch to its existing Tools.
         margatroid.tools:register({tools=definitions})
         registered = true
-        -- Encode explicitly so an empty aliases list remains [] in the result.
-        margatroid.task:return_result('{"task_id":' .. margatroid.data:encode("json", context.task_id) .. ',"aliases":'
-            .. (#aliases == 0 and "[]" or margatroid.data:encode("json", aliases)) .. '}')
+        local replay_arguments = {server = arguments.server, alias_prefix = prefix}
+        local saved, save_error = pcall(persist_registration, context, replay_arguments)
+        if saved then
+            -- Keep the serving task alive after returning; aliases depend on it.
+            margatroid.task:return_result('{"task_id":' .. margatroid.data:encode("json", context.task_id) .. ',"aliases":'
+                .. (#aliases == 0 and "[]" or margatroid.data:encode("json", aliases)) .. '}')
+        else
+            margatroid.task:return_result(failure("Tools registered for this session, but startup registration was not saved: " .. tostring(save_error)
+                .. "; serving task_id=" .. context.task_id))
+        end
         state.returned = true
     end
 

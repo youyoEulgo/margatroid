@@ -202,3 +202,5 @@ Agent创建注入接口为name/config_path/ui_path，拒绝旧resource_dir创建
 
 任务绑定Agent生命周期已实现。自动Driver和工具创建的Agent都绑定创建者同一TaskScope，不再有AgentOwner，创建来源保存在同一AgentTaskBinding.creator中。任务正常execute结束、异常、超时或外部finish/cancel均停止所有绑定Agent，等待其推理、任务、子Agent、Block临时状态及监控真实收口并移除Entity后才能确认任务结束；return_result仅交付结果，不会停止Agent。Agent提前主动停止解除绑定，之后任务结束不重复关闭；Agent关闭其任务，任务scope停止自己创建的Agent；Workspace统一关闭所有Agent并等待实际移除，避免循环等待。
 Agent创建已提交后，Lua取消不能丢弃启动oneshot：宿主持有创建交接监督，创建完成后仍绑定并按已关闭scope清理，finish也先等待所有在途创建。停止无法确认时不宣称任务finish成功，不删除用户持久库，不增加专用子代理接口。该能力不实现子代理Driver分流、继承或输出策略。
+
+Bundled skill/MCP registrars now save successful registration commands to the target Agent initialization.custom using CONFIG GET then whole-key SET. Identical commands are not written again, including on startup replay; differing commands append, with no upsert or multi-command isolation. Skill saves canonical SKILL.md, MCP saves server/prefix, neither saves task handles. Failed persistence clearly reports current registration versus missing startup persistence; MCP keeps the existing serving task alive. The Tool host supplies no registration-specific persistence API.

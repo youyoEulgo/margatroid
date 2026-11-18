@@ -83,6 +83,7 @@ mod linux {
                     ToolPlugin::new(crate::test_binding())
                         .with_runner_path(env!("CARGO_BIN_EXE_tool_runner")),
                 );
+            super::storage_fixture::config_system(&mut app);
             let workspace = app.world_mut().spawn();
             app.world_mut().insert_component(
                 workspace,
@@ -227,6 +228,46 @@ mod linux {
             );
             response.content
         }
+    }
+
+    #[test]
+    fn registration_survives_failure_to_save_startup_and_reports_partial_success() {
+        let mut f = Fixture::new();
+        let skill = f.root.path().join("save-failure-skill");
+        std::fs::create_dir(&skill).unwrap();
+        std::fs::write(
+            skill.join("SKILL.md"),
+            "---\nname: save-failure-skill\ndescription: valid\n---\nInstructions\n",
+        )
+        .unwrap();
+        let storage = f
+            .app
+            .world()
+            .get_component::<storage_core::AgentStorage>(f.agent)
+            .unwrap();
+        let storage_core::StorageValue::Config(config) =
+            storage_core::execute_storage(storage, storage_core::StorageOperation::ReadConfig)
+                .unwrap()
+        else {
+            panic!()
+        };
+        let invalid = config["compaction"]["threshold"].clone();
+        storage_core::execute_storage(
+            storage,
+            storage_core::StorageOperation::SetConfig {
+                path: "initialization.custom".into(),
+                value: invalid,
+            },
+        )
+        .unwrap();
+        let message = f.failure(
+            "partial-save",
+            "skill_register",
+            json!({"path":skill.join("SKILL.md")}),
+        );
+        assert!(message.contains("registered for this session"));
+        assert!(message.contains("not saved"));
+        assert!(f.tools().contains_key("save-failure-skill"));
     }
 
     #[test]

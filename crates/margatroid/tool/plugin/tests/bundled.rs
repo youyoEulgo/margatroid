@@ -61,6 +61,7 @@ impl Fixture {
                     .with_runner_path(env!("CARGO_BIN_EXE_tool_runner"))
                     .with_limits(limits),
             );
+        storage_fixture::config_system(&mut app);
         let workspace = app.world_mut().spawn();
         app.world_mut().insert_component(
             workspace,

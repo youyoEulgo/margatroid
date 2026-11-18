@@ -87,15 +87,15 @@ AsyncRuntimeError：异步Runtime错误，公开枚举--描述异步基础设施
             获取错误来源：返回执行线程启动或Runtime构建的底层IO错误
             行为：其他变体返回None
 
-AsyncRuntimeHandle：异步Runtime句柄，公开结构体--由World持有，只通过受控扩展接口提交异步任务
+AsyncRuntimeHandle：异步Runtime句柄，公开结构体--由World持有，事件/闭包响应模式或无响应事件的owned任务均复用同一执行器
     sender: Option<UnboundedSender<ErasedExecutionTask>>--任务发送端，私有
     thread: Option<JoinHandle<()>>--异步线程，私有
     new(sender: UnboundedSender<ErasedExecutionTask>, thread: JoinHandle<()>) -> Self
         构造句柄：crate公开关联函数，sender和thread组成执行器所有权
         行为：将两个参数包装为Some
-    spawn(&self, task: ErasedExecutionTask)
-        提交任务：crate公开方法，task是类型擦除后的执行任务
-        行为：发送到异步线程；通道断开时报告AsyncRuntimeError::ExecutorDisconnected
+    spawn(&self, task: impl Future<Output = ()> + Send + 'static)
+        提交任务：公开方法，输入具体owned Future，内部Box::pin擦除类型
+        行为：发送到同一异步线程，不创建完成事件；调用者自行持有reply/cancel及真实清理guard。通道断开报告AsyncRuntimeError::ExecutorDisconnected
     impl Drop for AsyncRuntimeHandle
         Drop：公开trait实现
         drop(&mut self)

@@ -134,11 +134,8 @@ impl MclDrain {
             notified.as_mut().enable();
             {
                 let state = self.inner.state.lock().unwrap();
-                if let Some(error) = &state.error {
-                    return Err(error.clone());
-                }
                 if state.outstanding == 0 {
-                    return Ok(());
+                    return state.error.clone().map_or(Ok(()), Err);
                 }
             }
             notified.await;

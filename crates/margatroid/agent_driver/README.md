@@ -63,18 +63,16 @@ Driver任务目标保存在自身配置driver_task={agent=执行地址,task_id=�
 
 初始化default/custom统一使用对象条目，不混用旧字符串；无参数条目显式arguments=[]，有参数条目以arguments按顺序绑定?。参数保留TOML可表示的数组/对象/数字/布尔/字符串类型，不做文本替换或内联JSON拼接；tool_call对象内的arguments沿原协议为JSON字符串。现有用户持久设置不自动迁移；已有initialization段中的字符串条目需手动改为对象。
 
-内置coder/reviewer已在资源层实现subagent工具：同一base.lua按context.kind区分Workspace Driver与工具subdriver，description.md及input.schema.json由主Driver读取并通过现有tools:register登记，binding.parent_agent为父Agent Address，不指定lifetime。子模式不登记subagent；运行时动态注册工具不复制，只继承父配置并执行其default/custom初始化。
+内置coder/reviewer通过同一base.lua按context.kind区分主Driver和subdriver。主模式读取相邻description.md/schema注册subagent，不指定lifetime；子模式不注册subagent工具。
 
-subagent参数为{instructions:非空字符串}。工具先return_result({task_id})，然后自行向binding父地址GET session.conversation；父Driver不收集子任务、不发送启动邮箱交接。子侧从快照尾部裁剪：连续移除尾部tool_call结果及发起它们的整个assistant请求，不清空tool_calls后保留空壳；无正文、reasoning、请求的尾部assistant同样移除。遇到普通非空assistant则保留正文/reasoning/sequence并设stop_reason=completed停止；遇到其他消息类型停止。显式追加[inherit-boundary] user参考边界，说明父历史归属与当前子身份、以当前工具清单为准，再追加真实委托user消息。config_path直接引用margatroid.agent:data_dir(parent)/setting.toml，后端按初始文件读取并创建Workspace/agents/<子名>/setting.toml，不在Driver中拼子持久目录、生成临时配置快照或持久配置副本。注入处理后上下文、复用初始化，再按正常user路径追加委托instructions并推理。没有subagent.start协议、轮询或伪造工具结果。
+subagent采用全新对话：config_path固定资源目录setting.toml，不读取父Agent配置/上下文，不继承父initialization.custom或动态工具，不注入继承边界或父消息。默认配置初始化完成并ready后return_result({task_id})，再将委托instructions作为第一条user消息正常记录历史、开始子回合。只有Driver默认配置中定义的工具/初始化可用于子代理。
 
-继承对话按原字段（含可选sequence）写入独立Agent.session.conversation，再运行同一初始化，之后将instructions作为自己的user消息开始回合。子模式与主Driver一样调用history_append，保存本轮新产生的user/assistant/tool_call/error/compact及其真实sequence；继承父上下文不重复追加历史。任务输出正常仅append_output非空assistant.content；error消息另外追加[subagent error]前缀的运行时诊断，不冒充子assistant正文。reasoning、user、工具结果和compact不写任务输出。MCL审计、持久Block及已有推理WS同步仍遵循后端契约，不承诺零持久数据或隐藏Agent。
+子模式与主模式共用history_append记录本轮user/assistant/tool_call/error/compact及真实sequence。任务输出包含非空assistant.content，error额外追加[subagent error]运行时诊断；reasoning、工具结果、user及compact不写任务输出。子Agent结束回合后停止，但任务保留输出等待父task_finish；宿主异常沿既有task.error及真实清理路径交付，不自动重试。
 
-成功或推理error结束本轮时finish_turn并调用agent:stop，然后仅等待task邮箱，不自行finish，不清输出。父方通过task_read取得assistant正文和显式错误诊断字符串，task_finish才回收任务及输出；提前finish由既有创建者任务绑定清理子Agent。task_id返回仅代表后台任务已受理，setup/模型调用错误要通过任务状态/输出查收。主Driver和子Driver都复用模型/沙箱/指令初始化、工具批次、压缩判断与提示词刷新逻辑。本轮没有修改后端Rust运行实现或前端。
+主Agent创建时ui_path使用资源目录/ui，子模式使用/subagent-ui。两种UI来源均由原目录监控和agent.ui接口交付，不复制、不回退主UI。创建来源creator由真实任务绑定产生，不由脚本传owner。
 
-持久目录通过margatroid.agent:data_dir(Agent完整Address)显式查询，不从context隐式提供；子代理传binding.parent_agent取得父目录，直接使用父setting.toml作为初值来源；后端独立管理子Agent平级目录。
+skill_register与mcp_register在实际注册成功后，使用目标Agent CONFIG GET/SET向initialization.custom追加{command="EFFECT tool_call ?",arguments=[[{id="startup-<alias>",tool_name=<实际注册工具alias>,arguments=<注册参数JSON>}]]}。skill保存规范SKILL.md路径，MCP保存server及alias_prefix，不保存当次task_id、发现结果或进程句柄。启动重放如已存在完全相同命令参数则不追加、不SET，现有活跃alias冲突仍报错；参数不同的命令按追加处理，不提供身份upsert。
 
-UI按Driver模式分离：主Driver创建Agent时ui_path指向资源目录/ui，subdriver创建时指向资源目录/subagent-ui；精简版资源待前端开发者提供，本次不创建目录、不复制完整版、不做缺失回退，仍沿现有UI目录监控与agent.ui接口交付。
+CONFIG写入失败返回“本次已注册但启动命令未保存”的失败说明。skill静态工具保留；MCP返回失败说明及当前serving task_id，任务仍存活、维持已注册工具转发。后续启动重新执行已保存命令，建立新MCP连接/任务，不使用旧task_id。GET编辑SET之间不做隔离，整数组覆盖语义由调用方接受。
 
-2026-11-18实际日志排查：subagent-tool-279377-114-0的history sequence=42为InvalidMessages: invalid assistant history；其继承尾部assistant正文列为{}、tool_calls为空。父history sequence=2861/2909/2989的task_read均error=null、output=[]，说明领域error值被正文过滤隐藏，不能从MCL审计succeeded=true推断模型成功。另100-0/107-0历史确有子侧调用未注册subagent并误认自己是父Agent；这与114-0的本地消息校验失败是不同问题。
-
-当前修复是资源层消息配对与参考边界提示，不是DSH式turn/end事件日志、结构化sender来源或无条件settlement通知。session.conversation没有一等turn/end记录；后端历史/MCL仍有turn关联和start/finish审计，不能说整个系统没有turn概念。[inherit-boundary]不具有新协议语义，也不保证模型绝不会误认身份；任务输出中的错误诊断需父方读取，不会自动注入父会话。子Agent结束后任务等待手动finish是既定输出保留策略，保持不变。没有添加自动重试、伪造工具结果或修改用户既有历史。
+已有配置缺少initialization.default时，从资源默认配置只读取得default；如存在custom则仍执行并可追加注册命令，完全缺少initialization时沿原资源default/custom回退，不自动写回default。默认配置文件本身不因目标Agent注册而修改，子代理不继承父持久注册项。

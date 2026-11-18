@@ -27,11 +27,13 @@ impl AsyncRuntimeHandle {
         }
     }
 
-    pub(crate) fn spawn(&self, task: ErasedExecutionTask) {
+    /// Submit an owned future without projecting its completion into an ECS event.
+    /// The caller retains responsibility for replies, cancellation and cleanup.
+    pub fn spawn(&self, task: impl Future<Output = ()> + Send + 'static) {
         self.sender
             .as_ref()
             .expect("async executor sender must exist before drop")
-            .send(task)
+            .send(Box::pin(task))
             .unwrap_or_else(|_| AsyncRuntimeError::ExecutorDisconnected.panic());
     }
 }
