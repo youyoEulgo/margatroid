@@ -1824,7 +1824,7 @@ async fn run_tool_worker<R: AsyncBufRead + Unpin + Send + 'static>(
             .map_err(lua_failure)?,
         )
         .map_err(lua_failure)?;
-    for method in ["agent_create", "wait"] {
+    for method in ["agent_create", "agent_data_dir", "wait"] {
         let bridge = bridge.clone();
         callbacks
             .set(
@@ -2600,6 +2600,8 @@ mod world_sender_tests {
         let received: ToolContext = serde_json::from_slice(&wire).unwrap();
         let arguments = serde_json::json!({"message": "hello"});
         let public_context = received.public_value(&arguments).unwrap();
+        assert!(public_context.get("data_dir").is_none());
+        assert!(public_context.get("temp_dir").is_none());
         let LuaValue::Table(table) = data::to_lua(&lua, public_context.clone()).unwrap() else {
             panic!("context table");
         };

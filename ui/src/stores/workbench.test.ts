@@ -54,6 +54,7 @@ const ws: WorkspaceSnapshot = {
 const agent: AgentInfo = {
   address,
   workspace,
+  creator: { address: workspace, task_id: 'task:demo:driver' },
 
   status: 'running',
   tools: [
@@ -1203,6 +1204,47 @@ test('sidebar status uses runtime state and errors while preserving configured p
     null,
   );
   assert.equal(failed.workspaces[0]!.status, 'error');
+});
+
+test('sidebar nests agents under their creator and leaves unresolved parents at workspace root', () => {
+  const subAddress = 'agent:demo/subagent-one:latest';
+  const subagent = {
+    ...state.agents[0]!,
+    agent: subAddress,
+    creator: { address, task_id: 'tool:42' },
+  };
+  const model = buildSidebarModel(
+    state.workspace_definitions,
+    state.workspaces,
+    [...state.agents, subagent],
+    new Map(),
+    new Set([path]),
+    path,
+    address,
+  );
+  const rows = model.workspaces[0]!.agents;
+  assert.equal(rows.length, 2);
+  assert.equal(rows[0]!.id, address);
+  assert.equal(rows[0]!.depth, 0);
+  assert.equal(rows[1]!.id, subAddress);
+  assert.equal(rows[1]!.depth, 1);
+  assert.equal(rows[1]!.creator?.task_id, 'tool:42');
+
+  const orphan = {
+    ...subagent,
+    creator: { address: 'agent:demo/missing:latest', task_id: 'tool:9' },
+  };
+  const fallback = buildSidebarModel(
+    state.workspace_definitions,
+    state.workspaces,
+    [...state.agents, orphan],
+    new Map(),
+    new Set([path]),
+    path,
+    address,
+  );
+  const orphanRow = fallback.workspaces[0]!.agents.find((row) => row.id === subAddress)!;
+  assert.equal(orphanRow.depth, 0);
 });
 
 test('sidebar renders configured members without mutation menus and emits explicit runtime targets', async () => {

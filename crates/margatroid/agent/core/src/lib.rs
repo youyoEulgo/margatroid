@@ -164,6 +164,6 @@ impl WorldAgentExt for World {
 
 pub use sync::{AgentPublicUpdate, PublicModelInfo, PublicToolInfo};
 
-pub use components::AgentOwner;
+pub use components::{AgentCreator, AgentTaskBinding};
 
 pub use components::AgentSession;

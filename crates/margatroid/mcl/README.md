@@ -82,7 +82,7 @@ IMPORT校验种类、依赖和alias后，在对应资源领域登记；TOOL保�
 | ready | 无 | Unit |
 | wake | 无 | Unit |
 
-inference和tool_call将请求交给所属领域并等待oneshot。tool_call先发出整批带独立oneshot的请求，再通过join_all收齐并保持输入顺序；保留原调用ID，每个工具调用错误均转换为failed工具消息，包括配置、参数、执行、超时、清理、任务panic、回复丢失和关联错误；不因单个失败丢失整批结果。无法解析出有效工具调用的命令错误与其他非工具错误，通过唯一回复出口转换为Error值，形状为{"Error":{"type":"error","message":"错误种类: 说明","request_id":"本次命令id"}}，不抛Lua宿主异常终止Driver。原始执行失败仍在MCL审计中记录succeeded=false。清理尚未证明时及时返回错误并保留后台监督，不将任务伪报completed或安全退出。sandbox_use选择alias，不保存长期策略正文；实际执行读取选定路径的策略。history_append显式保存消息；其他操作不自动追加消息历史。指令审计与消息历史分别记录，不把审计参数投影成重复消息。两类历史以Agent内sequence标识并排序，不设历史key；消息按规范列拆装，payload仅保存剩余字段；带sequence的消息必须与实际历史记录一致，重复记录复用该序号。
+inference和tool_call将请求交给所属领域并等待oneshot。tool_call先发出整批带独立oneshot的请求，再通过join_all收齐并保持输入顺序；保留原调用ID，每个工具调用错误均转换为failed工具消息，包括配置、参数、执行、超时、清理、任务panic、回复丢失和关联错误；不因单个失败丢失整批结果。无法解析出有效工具调用的命令错误与其他非工具错误，通过唯一回复出口转换为Error值，形状为{"Error":{"type":"error","message":"错误种类: 说明","request_id":"本次命令id"}}，不抛Lua宿主异常终止Driver。原始执行失败仍在MCL审计中记录succeeded=false。清理尚未证明时及时返回错误并保留后台监督，不将任务伪报completed或安全退出。sandbox_use选择alias，不保存长期策略正文；实际执行读取选定路径的策略。history_append显式保存消息；其他操作不自动追加消息历史。指令审计与消息历史分别记录，不把审计参数投影成重复消息。两类历史以Agent内sequence标识并排序，不设历史key；消息按规范列拆装，payload仅保存剩余字段；历史追加每次产生新记录并返回新sequence；Block可选保留此字段，不做历史关联校验。关联、去重和查找策略由Driver自行决定，当前不提供额外关联查询。
 
 start_turn和finish_turn调用agent_core同步扩展；ready和wake调用lua_runtime_core扩展。ready只允许当前Driver对本人调用。wait是Lua宿主函数，不是MCL指令。上述调用由plugin组合，不让core之间互相依赖。
 
@@ -95,13 +95,13 @@ start_turn和finish_turn调用agent_core同步扩展；ready和wake调用lua_run
 关闭队列拒绝新命令、取消排队和在途操作，仍等待文件worker、领域任务和回执真实收口。drain成功不只表示发出了取消；清理失败保持错误，不以丢弃Future代替退出证明。
 
 
-当前工作树已实现统一Lua：复用既有资源挂载、Storage、MCL队列、任务监督、进程回收及同步入口。Workspace先启动独立Lua任务；Agent创建由公共Lua注入能力提交StartAgent，Agent不再启动/持有/终止Lua VM。执行者与目标分开，Agent归属Workspace或父Agent，配置按明确初值文件初始化持久化，UI按创建时传入目录直接监控，模型通过EFFECT model_set配置。公共mcl.execute指定目标，wait(agent)登记本次唤醒句柄；关闭Agent使用margatroid.agent:stop(address)注入方法提交原StopAgent并外部监督，不经过MCL。EFFECT tool_call只接收调用数组。Driver专用manifest依赖裁剪取消；工具发现元数据保持。初始化/委托/子代理应用未实现；前端源码不在本轮修改范围内。
+当前工作树已实现统一Lua：复用既有资源挂载、Storage、MCL队列、任务监督、进程回收及同步入口。Workspace先启动独立Lua任务；Agent创建由公共Lua注入能力提交StartAgent，Agent不再启动/持有/终止Lua VM。执行者与目标分开，Agent统一归属Workspace，创建来源由实际任务绑定记录，配置按明确初值文件初始化持久化，UI按创建时传入目录直接监控，模型通过EFFECT model_set配置。公共mcl.execute指定目标，wait(agent)登记本次唤醒句柄；关闭Agent使用margatroid.agent:stop(address)注入方法提交原StopAgent并外部监督，不经过MCL。EFFECT tool_call只接收调用数组。Driver专用manifest依赖裁剪取消；工具发现元数据保持。初始化/委托/子代理应用未实现；前端源码不在本轮修改范围内。
 
 四态契约：Agent/Workspace公开starting、running、error、stopping；Agent挂载完成不是ready，MCL允许starting/running，推理和工具显式携带turn时要求running且匹配，省略时为Starting/Running自由调用。Lua创建的Agent在返回信息前绑定创建者真实任务scope与AgentSession；return_result不结束生命周期，任务取消/退出会提交原StopAgent并等待全部绑定Agent实际移除后才确认任务清理。主动停止Agent会解绑；异常日志沿原Agent存储处理，正常结束和取消不误报故障。关闭使用Lua agent.stop注入，不提供MCL agent_stop。
 
 MCL状态门统一只允许Starting/Running，不根据effect判断回合。推理和工具调用只携带显式可选turn，省略为None，不抓取当前上下文自动绑定；Some时的Running/有效turn及匹配由Inference/Tool实际受理入口负责。MCL不伪造无turn的推理完成或工具中止结果，也不预先判断工具alias存在性。ready/start_turn/finish_turn的约束由Agent core统一方法承担。
 
-Agent创建注入接口为owner/name/config_path/ui_path，拒绝旧resource_dir创建参数。配置仅首次从config_path初始化至Agent持久setting.toml，后续重启保留已修改配置；ui_path始终直接引用与监控，不创建Agent本地UI，不复制、覆盖、删除已有UI副本，也不把旧副本作为回退来源。Lua程序加载只读取程序文件，不推导或读取同目录配置。
+Agent创建注入接口为name/config_path/ui_path，拒绝旧resource_dir创建参数。配置仅首次从config_path初始化至Agent持久setting.toml，后续重启保留已修改配置；ui_path始终直接引用与监控，不创建Agent本地UI，不复制、覆盖、删除已有UI副本，也不把旧副本作为回退来源。Lua程序加载只读取程序文件，不推导或读取同目录配置。
 
 显式可选turn契约：start_turn取得并返回当前turn，已有回合返回同一标识；推理和工具显式携带turn时严格校验，省略为None自由调用，不自动继承当前turn。自由调用仍受实际会话、权限、生命周期、取消及原有并发限制；Starting允许初始化所需自由调用，Error/Stopping拒绝。回合中止/收尾只作用于明确绑定该turn的请求，Agent关闭仍监督全部调用。详见本域DESIGN。运行中的旧进程仍需使用新构建。
 

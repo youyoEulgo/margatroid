@@ -510,15 +510,11 @@ converter!(
     agent_core::StartAgent,
     |world: &World, r: &Prepared<AgentInput, Entity, agent_core::AgentError>| {
         client(world, r.ticket.connection)?;
-        let (workspace, name, parameters) = parameters(world, &r.input)?;
-        Ok(agent_core::StartAgent {
-            owner: workspace,
-            id: request_id(&r.ticket),
-            workspace,
-            name,
-            parameters,
-            reply: r.reply.clone(),
-        })
+        let _ = parameters(world, &r.input)?;
+        Err(error(
+            "CreatorTaskRequired",
+            "Agent creation must run in a Workspace Driver or Agent tool task",
+        ))
     }
 );
 converter!(

@@ -110,6 +110,9 @@ export interface SidebarAgent {
   status: TreeStatus;
   reason: string;
   active: boolean;
+  depth: number;
+  creator: { address: string; task_id: string } | null;
+  children: SidebarAgent[];
 }
 export interface SidebarWorkspace {
   key: string;
@@ -383,7 +386,8 @@ export function buildSidebarModel(
       for (const id of advertised)
         if (!rows.some((row) => row.id === id))
           rows.push({ id, name: resourceName(id), driver: '' });
-      const agents: SidebarAgent[] = rows.map((member) => {
+      const rowsByAddress = new Map<string, SidebarAgent>();
+      const agentRows: SidebarAgent[] = rows.map((member) => {
         const state = ownedStates.find((candidate) => candidate.agent === member.id);
         const memberFailure = instance?.member_failures?.find(
           (failure) =>
@@ -396,15 +400,35 @@ export function buildSidebarModel(
           state?.error?.message ||
           (instance && member.id ? failures.get(`${instance.id}:${member.id}`)?.message : '') ||
           (state?.status === 'error' ? 'Agent error' : '');
-        return {
+        const row: SidebarAgent = {
           ...member,
           key: member.id ?? member.name,
           reason,
           status: reason ? 'error' : state?.status === 'running' ? 'running' : 'stopped',
           active:
             definition.path === selectedKey && member.id !== null && member.id === selectedAgent,
+          depth: 0,
+          creator: state?.creator ?? null,
+          children: [],
         };
+        if (row.id) rowsByAddress.set(row.id, row);
+        return row;
       });
+      const rootRows: SidebarAgent[] = [];
+      for (const row of agentRows) {
+        const parentAddress = row.creator?.address;
+        const parent =
+          parentAddress && parentAddress !== instance?.id ? rowsByAddress.get(parentAddress) : null;
+        if (parent && parent !== row) parent.children.push(row);
+        else rootRows.push(row);
+      }
+      const agents: SidebarAgent[] = [];
+      const appendAgent = (row: SidebarAgent, depth: number) => {
+        row.depth = depth;
+        agents.push(row);
+        for (const child of row.children) appendAgent(child, depth + 1);
+      };
+      for (const row of rootRows) appendAgent(row, 0);
       const reason =
         agents.find((agent) => agent.reason)?.reason ||
         instance?.error?.message ||
@@ -1384,6 +1408,7 @@ export const useWorkbenchStore = defineStore('workbench', () => {
         project_root: '',
       },
       agent: a.address,
+      creator: a.creator ?? null,
 
       status: a.status,
       turn: turnStates.value.get(`${a.address}`) ?? null,

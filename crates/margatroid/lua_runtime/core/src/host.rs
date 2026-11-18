@@ -135,6 +135,7 @@ const NAMESPACE_METHODS: &[(NamespaceKind, &str, &str, bool)] = &[
     (NamespaceKind::Mcl, "execute", "mcl_execute", true),
     (NamespaceKind::Agent, "create", "agent_create", true),
     (NamespaceKind::Agent, "stop", "agent_stop", true),
+    (NamespaceKind::Agent, "data_dir", "agent_data_dir", true),
     (NamespaceKind::Workspace, "agents", "workspace_agents", true),
     (NamespaceKind::Files, "read", "files_read", true),
     (NamespaceKind::Files, "write", "files_write", true),

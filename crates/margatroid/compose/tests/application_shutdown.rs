@@ -50,7 +50,7 @@ async fn shutdown_phase(phase: WorkspaceState) {
         root.path(),
         "agent-drivers/probe/shutdown/latest/base.lua",
         &format!(
-            "function configure()return {{timeout_ms=0}}end\nfunction execute(_,context)\nlocal agent=margatroid.agent:create({{owner=context.workspace.address,name=context.name,config_path=context.resource_dir..'/setting.toml',ui_path=context.resource_dir..'/ui'}})\n{tail}\nend"
+            "function configure()return {{timeout_ms=0}}end\nfunction execute(_,context)\nlocal agent=margatroid.agent:create({{name=context.name,config_path=context.resource_dir..'/setting.toml',ui_path=context.resource_dir..'/ui'}})\n{tail}\nend"
         ),
     );
     write(

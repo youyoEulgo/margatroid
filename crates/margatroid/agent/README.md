@@ -15,7 +15,7 @@ stop_agent_system、restart_agent_system、start_agent_system依次挂载于同�
 
 ## 请求
 
-StartAgent携带owner/id/workspace/name/parameters/reply，RestartAgent携带id/workspace/name/parameters/reply。启动创建Entity；重启在指定Workspace内按名称定位成员，随后固定使用完整Entity。网络单独启动Agent先重载定义；重启从目标AgentResources取得原创建参数，不在关闭前重载定义或校验新启动条件。关闭失败不启动；启动失败沿普通StartAgent原错误路径返回。
+StartAgent携带id/workspace/name/parameters/reply，RestartAgent携带id/workspace/name/parameters/reply。启动创建Entity；重启在指定Workspace内按名称定位成员，随后固定使用完整Entity。网络单独启动Agent先重载定义；重启从目标AgentResources取得原创建参数，不在关闭前重载定义或校验新启动条件。关闭失败不启动；启动失败沿普通StartAgent原错误路径返回。
 
 ## 异步流程
 
@@ -23,7 +23,7 @@ StartAgent携带owner/id/workspace/name/parameters/reply，RestartAgent携带id/
 
 启动受理后创建Starting实体，并保留明确的AgentStartParameters。持久配置不存在时，受监督blocking worker从initial_settings_path读取并校验初值，通过原open_storage持久化；配置已存在时不再读取或覆盖初值。ui_path仅是实际UI目录引用，每个Agent直接监控这一路径，不复制UI，不依赖程序目录或旧Agent本地UI。Agent不创建Lua VM，挂载完成仍须显式ready。配置和UI引用随原创建参数保留，网络重启不会用Workspace成员的程序目录替换它们。
 
-关闭受理时同步关闭新操作受理。关闭闭包只请求Agent自有任务/推理取消，递归停止直接子Agent，不终止创建者VM，等待活动真实退出及MCL收口；结果Handler确认后销毁Entity。
+关闭受理时同步关闭新操作受理。关闭闭包只请求Agent自有任务/推理取消，由任务scope停止其创建的Agent，不终止创建者VM，等待活动真实退出及MCL收口；结果Handler确认后销毁Entity。
 
 重启直接调用普通StopAgent并等待其真实清理和Entity销毁，成功后提交普通StartAgent创建新Entity及AgentSession；资源挂载完成不代替ready。StartAgent建立StartupBarrier；StopAgent先等待在途初始化的blocking worker及全部领域回复真正完成，不能提前销毁宿主。
 
@@ -46,12 +46,16 @@ Agent的同步可见状态改为共享只读视图，状态、turn、故障及�
 StartTurn、FinishTurn和AbortTurn同属唯一Agent更新入口，turn变化和完整Agent列表变化直接投递共享槽位。错误、资源导入、动态工具移除、沙箱选择及模型公共信息提交也必须更新同一派生视图。来源替换先失效旧租约并等待UI/记录监控真实结束，不能使旧实例迟到更新复活。
 
 
-当前工作树已实现统一Lua：复用既有资源挂载、Storage、MCL队列、任务监督、进程回收及同步入口。Workspace先启动独立Lua任务；Agent创建由公共Lua注入能力提交StartAgent，Agent不再启动/持有/终止Lua VM。执行者与目标分开，Agent归属Workspace或父Agent，配置按明确初值文件初始化持久化，UI按创建时传入目录直接监控，模型通过EFFECT model_set配置。公共mcl.execute指定目标，wait(agent)登记本次唤醒句柄；关闭Agent使用margatroid.agent:stop(address)注入方法提交原StopAgent并外部监督，不经过MCL。EFFECT tool_call只接收调用数组。Driver专用manifest依赖裁剪取消；工具发现元数据保持。初始化/委托/子代理应用未实现；前端源码不在本轮修改范围内。
+当前工作树已实现统一Lua：复用既有资源挂载、Storage、MCL队列、任务监督、进程回收及同步入口。Workspace先启动独立Lua任务；Agent创建由公共Lua注入能力提交StartAgent，Agent不再启动/持有/终止Lua VM。执行者与目标分开，Agent统一归属Workspace，创建来源由实际任务绑定记录，配置按明确初值文件初始化持久化，UI按创建时传入目录直接监控，模型通过EFFECT model_set配置。公共mcl.execute指定目标，wait(agent)登记本次唤醒句柄；关闭Agent使用margatroid.agent:stop(address)注入方法提交原StopAgent并外部监督，不经过MCL。EFFECT tool_call只接收调用数组。Driver专用manifest依赖裁剪取消；工具发现元数据保持。初始化/委托/子代理应用未实现；前端源码不在本轮修改范围内。
 
 四态契约：Agent/Workspace公开starting、running、error、stopping；Agent挂载完成不是ready，MCL允许starting/running，推理和工具显式携带turn时要求running且匹配，省略时为Starting/Running自由调用。Lua创建的Agent在返回信息前绑定创建者真实任务scope与AgentSession；return_result不结束生命周期，任务取消/退出会提交原StopAgent并等待全部绑定Agent实际移除后才确认任务清理。主动停止Agent会解绑；异常日志沿原Agent存储处理，正常结束和取消不误报故障。关闭使用Lua agent.stop注入，不提供MCL agent_stop。
 
 agent_ready作为Agent领域统一入口验证状态和turn，MCL只转交；回合开始/结束/中止也由Agent core方法验证。MCL不按具体指令维护第二套受理条件。
 
-Agent创建注入接口为owner/name/config_path/ui_path，拒绝旧resource_dir创建参数。配置仅首次从config_path初始化至Agent持久setting.toml，后续重启保留已修改配置；ui_path始终直接引用与监控，不创建Agent本地UI，不复制、覆盖、删除已有UI副本，也不把旧副本作为回退来源。Lua程序加载只读取程序文件，不推导或读取同目录配置。
+Agent创建注入接口为name/config_path/ui_path，拒绝旧resource_dir创建参数。配置仅首次从config_path初始化至Agent持久setting.toml，后续重启保留已修改配置；ui_path始终直接引用与监控，不创建Agent本地UI，不复制、覆盖、删除已有UI副本，也不把旧副本作为回退来源。Lua程序加载只读取程序文件，不推导或读取同目录配置。
 
 显式可选turn契约：start_turn取得并返回当前turn，已有回合返回同一标识；推理和工具显式携带turn时严格校验，省略为None自由调用，不自动继承当前turn。自由调用仍受实际会话、权限、生命周期、取消及原有并发限制；Starting允许初始化所需自由调用，Error/Stopping拒绝。回合中止/收尾只作用于明确绑定该turn的请求，Agent关闭仍监督全部调用。详见本域DESIGN。运行中的旧进程仍需使用新构建。
+
+所有Agent（包括子Agent）地址统一为agent:<Workspace作用域>/<显式name>:latest，创建者不参与地址作用域计算，不生成父地址哈希。创建关系由AgentTaskBinding.creator表达，同一作用域同名地址按现有唯一性检查拒绝。
+
+AgentOwner及Lua owner参数已移除。全部Agent使用同一Workspace作用域和Workspace/agents/<name>平级持久路径，同名地址统一拒绝。任务绑定组件AgentTaskBinding在内存中保存只读creator={address,task_id}；宿主从真实执行来源产生，禁止Lua指定，不落数据库、不从创建者反推目录。creator安装与Changed发布使用同一core入口，agent.res/sync读取同一绑定数据；StartAgent必须携带真实creator，在实体注册前保存；不存在绑定前null或无来源创建兜底。关闭传播仅沿Agent自己的ToolTasks及创建者scope，不再查询owner树。

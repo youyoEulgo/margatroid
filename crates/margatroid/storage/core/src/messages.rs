@@ -1,5 +1,5 @@
 use super::*;
-use rusqlite::{OptionalExtension, Row};
+use rusqlite::Row;
 use serde_json::{Map, Value};
 
 pub(crate) const COLUMNS: &str = "sequence,role,content,data,tool_call,payload";
@@ -168,28 +168,6 @@ pub(crate) fn join(row: MessageRow, with_sequence: bool) -> Result<Value, Storag
     Ok(value)
 }
 
-pub(crate) fn validate_sequence(db: &Connection, message: &Value) -> Result<(), StorageError> {
-    let row = split(message)?;
-    let Some(sequence) = row.sequence else {
-        return Ok(());
-    };
-    let stored = db
-        .query_row(
-            &format!("SELECT {COLUMNS} FROM agent_messages WHERE sequence=?1"),
-            [sequence],
-            |r| from_row(r, 0),
-        )
-        .optional()
-        .map_err(read_err)?
-        .ok_or_else(|| err(K::InvalidRecord, "message history sequence does not exist"))?;
-    if join(stored, false)? != join(row, false)? {
-        return Err(err(
-            K::InvalidRecord,
-            "message history sequence content mismatch",
-        ));
-    }
-    Ok(())
-}
 pub(crate) fn next_sequence(db: &Connection) -> Result<i64, StorageError> {
     let last:i64=db.query_row("SELECT max(sequence) FROM (SELECT coalesce(max(sequence),0) AS sequence FROM agent_messages UNION ALL SELECT coalesce(max(sequence),0) FROM mcl_records)",[],|r|r.get(0)).map_err(read_err)?;
     last.checked_add(1)
@@ -201,12 +179,9 @@ pub(crate) fn append(
     turn: Option<&str>,
     timestamp: i64,
 ) -> Result<Value, StorageError> {
-    validate_sequence(db, message)?;
     let mut row = split(message)?;
-    if row.sequence.is_none() {
-        row.sequence = Some(next_sequence(db)?);
-        db.execute("INSERT INTO agent_messages(sequence,turn,role,content,data,tool_call,payload,created_at_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",params![row.sequence,turn,row.role,row.content,row.data,row.tool_call,row.payload,timestamp]).map_err(write_err)?;
-    }
+    row.sequence = Some(next_sequence(db)?);
+    db.execute("INSERT INTO agent_messages(sequence,turn,role,content,data,tool_call,payload,created_at_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",params![row.sequence,turn,row.role,row.content,row.data,row.tool_call,row.payload,timestamp]).map_err(write_err)?;
     join(row, true)
 }
 

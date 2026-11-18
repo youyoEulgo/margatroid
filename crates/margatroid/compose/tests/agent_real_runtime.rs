@@ -172,7 +172,10 @@ impl Fixture {
     fn start(&mut self) -> Entity {
         let (sender, mut receiver) = oneshot::channel();
         self.app.world().emit_event(StartAgent {
-            owner: self.workspace,
+            creator: agent_core::AgentCreator {
+                address: "workspace:local/test:latest".into(),
+                task_id: "fixture-driver-task".into(),
+            },
             id: "start".into(),
             workspace: self.workspace,
             name: "coder".into(),

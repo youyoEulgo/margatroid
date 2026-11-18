@@ -119,38 +119,28 @@ fn normalized_columns_round_trip_every_role_without_redundant_payload() {
     );
 }
 #[test]
-fn only_real_history_sequences_are_accepted_and_array_positions_are_independent() {
+fn history_appends_are_new_and_block_sequences_are_optional_driver_metadata() {
     let d = tempfile::tempdir().unwrap();
     let storage = open(d.path());
-    let messages = append_message_history(
+    let saved = append_message_history(
         &storage,
-        &[
-            json!({"type":"user","content":"a"}),
-            json!({"type":"user","content":"b"}),
-        ],
+        &[json!({"type":"user","content":"original"})],
         None,
     )
     .unwrap();
-    assert_eq!(
-        append_message_history(&storage, &messages, None).unwrap(),
-        messages
-    );
-    let StorageValue::HistoryEntries(entries) =
-        execute_storage(&storage, StorageOperation::ReadAgentMessages).unwrap()
-    else {
-        panic!()
-    };
-    assert_eq!(entries.len(), 2);
-    for message in [
-        json!({"type":"user","content":"forged","sequence":1}),
-        json!({"type":"user","content":"a","sequence":99}),
-    ] {
-        assert_eq!(
-            append_message_history(&storage, &[message], None)
-                .unwrap_err()
-                .kind,
-            StorageErrorKind::InvalidRecord
-        );
+    assert_eq!(saved[0]["sequence"], 1);
+    let edited = json!({"type":"user","content":"edited","sequence":1});
+    for (index, message) in [
+        saved[0].clone(),
+        edited.clone(),
+        json!({"type":"user","content":"foreign","sequence":99}),
+    ]
+    .iter()
+    .enumerate()
+    {
+        let row = append_message_history(&storage, std::slice::from_ref(message), None).unwrap();
+        assert_eq!(row[0]["sequence"], index + 2);
+        assert_eq!(row[0]["content"], message["content"]);
     }
     execute_storage(
         &storage,
@@ -161,15 +151,15 @@ fn only_real_history_sequences_are_accepted_and_array_positions_are_independent(
         },
     )
     .unwrap();
-    let ordered = vec![
-        messages[1].clone(),
-        json!({"type":"user","content":"not yet history"}),
-        messages[0].clone(),
+    let values = vec![
+        edited,
+        json!({"type":"user","content":"no sequence"}),
+        json!({"type":"user","content":"foreign","sequence":99}),
     ];
     execute_storage(
         &storage,
         StorageOperation::ReplaceMessages {
-            sources: vec![MessageSource::Literal(ordered.clone())],
+            sources: vec![MessageSource::Literal(values.clone())],
             target: selector(),
         },
     )
@@ -182,18 +172,25 @@ fn only_real_history_sequences_are_accepted_and_array_positions_are_independent(
             }
         )
         .unwrap(),
-        StorageValue::Messages(ordered)
+        StorageValue::Messages(values)
     );
+    let StorageValue::HistoryEntries(history) =
+        execute_storage(&storage, StorageOperation::ReadAgentMessages).unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(history.len(), 4);
+    assert_eq!(history[0].record.payload["content"], "original");
     let db =
         Connection::open(d.path().join("state.sqlite.blocks/session/timeline.sqlite")).unwrap();
-    let seq: Vec<Option<i64>> = db
+    let sequence: Vec<Option<i64>> = db
         .prepare("SELECT sequence FROM f0 ORDER BY position")
         .unwrap()
-        .query_map([], |r| r.get(0))
+        .query_map([], |row| row.get(0))
         .unwrap()
         .collect::<Result<_, _>>()
         .unwrap();
-    assert_eq!(seq, [Some(2), None, Some(1)]);
+    assert_eq!(sequence, [Some(1), None, Some(99)]);
     for bad in [
         json!({"type":"assistant","content":"x","replay":{}}),
         json!({"type":"user","content":"x","images":[]}),

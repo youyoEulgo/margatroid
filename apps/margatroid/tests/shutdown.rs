@@ -151,7 +151,7 @@ fn fixture(home: &Path, address: std::net::SocketAddr) -> PathBuf {
         r#"
 function configure()return {timeout_ms=0}end
 function execute(_,context)
-local agent=margatroid.agent:create({owner=context.workspace.address,name=context.name,config_path=context.resource_dir..'/setting.toml',ui_path=context.resource_dir..'/ui'})
+local agent=margatroid.agent:create({name=context.name,config_path=context.resource_dir..'/setting.toml',ui_path=context.resource_dir..'/ui'})
 local function command(text)
     local result = margatroid.mcl:execute(agent.address, text)
     assert(type(result)~='table' or not result.Error, 'shutdown fixture MCL failed')
@@ -536,7 +536,7 @@ async fn non_running_shutdown_case(starting: bool, name: &str) {
         r#"
 function configure()return {timeout_ms=0}end
 function execute(_,context)
- local agent=margatroid.agent:create({owner=context.workspace.address,name=context.name,config_path=context.resource_dir..'/setting.toml',ui_path=context.resource_dir..'/ui'})
+ local agent=margatroid.agent:create({name=context.name,config_path=context.resource_dir..'/setting.toml',ui_path=context.resource_dir..'/ui'})
  local child=margatroid.process:start('/bin/sleep',{'600'})
  margatroid.files:write('initializing','ready')
  margatroid.task:receive()

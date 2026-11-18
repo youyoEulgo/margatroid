@@ -3,6 +3,7 @@ import { ref, watch } from 'vue';
 import {
   Bot,
   ChevronRight,
+  CornerDownRight,
   FolderKanban,
   LoaderCircle,
   Pause,
@@ -133,16 +134,29 @@ function stopWorkspace(workspace: SidebarWorkspace) {
           <li
             v-for="agent in workspace.agents"
             :key="agent.key"
-            :class="['tree-row', 'tree-row--agent', { 'tree-row--active': agent.active }]"
+            :class="[
+              'tree-row',
+              'tree-row--agent',
+              { 'tree-row--active': agent.active, 'tree-row--child': agent.depth > 0 },
+            ]"
             role="treeitem"
+            :aria-level="agent.depth + 1"
             :aria-selected="agent.active"
+            :style="{ paddingLeft: `${8 + agent.depth * 18}px` }"
           >
             <button
               class="tree-main tree-main--agent"
               type="button"
               :disabled="!agent.id"
               :title="
-                agent.reason ? 'Agent error' : agent.id || `${agent.name}: workspace is not running`
+                agent.reason
+                  ? 'Agent error'
+                  : [
+                      agent.id || `${agent.name}: workspace is not running`,
+                      agent.creator?.task_id ? `task ${agent.creator.task_id}` : '',
+                    ]
+                      .filter(Boolean)
+                      .join(' · ')
               "
               @click="agent.id && emit('selectAgent', agent.id, workspace.path)"
             >
@@ -150,6 +164,7 @@ function stopWorkspace(workspace: SidebarWorkspace) {
                 :class="['status-dot', `status-dot--${agent.status}`]"
                 aria-hidden="true"
               ></span>
+              <CornerDownRight v-if="agent.depth > 0" class="tree-branch" :size="12" />
               <Bot class="tree-icon" :size="15" />
               <span class="tree-name">{{ agent.name }}</span>
             </button>

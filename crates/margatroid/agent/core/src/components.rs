@@ -79,9 +79,66 @@ impl Drop for Agent {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
-pub struct AgentOwner(pub core_plugin::Entity);
-impl Component for AgentOwner {}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentCreator {
+    pub address: String,
+    pub task_id: String,
+}
+/// Runtime task ownership and its immutable public creation reference.
+pub struct AgentTaskBinding {
+    creator: AgentCreator,
+    _guard: Option<Box<dyn Send + Sync>>,
+}
+impl AgentTaskBinding {
+    pub fn reserve(
+        world: &mut core_plugin::World,
+        entity: core_plugin::Entity,
+        creator: AgentCreator,
+    ) {
+        world.insert_component(
+            entity,
+            Self {
+                creator,
+                _guard: None,
+            },
+        );
+    }
+    pub fn install(
+        world: &mut core_plugin::World,
+        entity: core_plugin::Entity,
+        creator: AgentCreator,
+        guard: Box<dyn Send + Sync>,
+    ) -> Result<(), crate::AgentError> {
+        let updates = world
+            .get_component::<Agent>(entity)
+            .ok_or_else(|| {
+                crate::AgentError::new(
+                    crate::AgentErrorKind::AgentMissing,
+                    "Agent task binding target missing",
+                )
+            })?
+            .updates();
+        let binding = world.get_component_mut::<Self>(entity).ok_or_else(|| {
+            crate::AgentError::new(
+                crate::AgentErrorKind::InvalidRequest,
+                "Agent creator was not reserved",
+            )
+        })?;
+        if binding.creator != creator {
+            return Err(crate::AgentError::new(
+                crate::AgentErrorKind::InvalidRequest,
+                "Agent creator task mismatch",
+            ));
+        }
+        binding._guard = Some(guard);
+        updates.notify(world, entity, crate::AgentUpdateKind::Changed);
+        Ok(())
+    }
+    pub fn creator(&self) -> &AgentCreator {
+        &self.creator
+    }
+}
+impl Component for AgentTaskBinding {}
 
 #[derive(Clone, Debug)]
 pub struct AgentSession(pub String);

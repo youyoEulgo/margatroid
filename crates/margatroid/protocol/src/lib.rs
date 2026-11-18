@@ -427,7 +427,7 @@ pub(crate) fn validate_server_value(value: &Value) -> Result<(), ProtocolError> 
                     if expected == "workspace" {
                         &["address", "error"]
                     } else {
-                        &["sandboxes", "sandbox", "model", "error"]
+                        &["creator", "sandboxes", "sandbox", "model", "error"]
                     },
                 )?;
                 if expected == "workspace" {
@@ -462,6 +462,19 @@ pub(crate) fn validate_server_value(value: &Value) -> Result<(), ProtocolError> 
                         Some("starting" | "running" | "error" | "stopping")
                     ) {
                         return Err(invalid("invalid active agent status"));
+                    }
+                    if let Some(creator) = item.get("creator").filter(|value| !value.is_null()) {
+                        let address = creator["address"]
+                            .as_str()
+                            .ok_or_else(|| invalid("creator address missing"))?;
+                        if address.starts_with("workspace:") {
+                            validate_address(address, "workspace")?;
+                        } else {
+                            validate_address(address, "agent")?;
+                        }
+                        if !creator["task_id"].as_str().is_some_and(valid_request_id) {
+                            return Err(invalid("invalid creator task id"));
+                        }
                     }
                     if let Some(model) = item.get("model").filter(|value| !value.is_null()) {
                         require_fields(model, &["thinking", "reasoning_effort"])?;

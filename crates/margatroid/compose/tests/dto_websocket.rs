@@ -144,6 +144,14 @@ impl Harness {
         app.world_mut()
             .insert_component(workspace, Address::new("workspace:local/demo").unwrap());
         let agent = app.world_mut().spawn();
+        agent_core::AgentTaskBinding::reserve(
+            app.world_mut(),
+            agent,
+            agent_core::AgentCreator {
+                address: "workspace:local/demo:latest".into(),
+                task_id: "driver-first".into(),
+            },
+        );
         let agent_updates = dto_plugin::agent_sync_context(
             app.world()
                 .get_resource::<client_core::Clients>()
@@ -512,7 +520,7 @@ fn websocket_registration_mcl_reply_and_audit_use_original_network_identity() {
 }
 
 #[test]
-fn agent_start_and_restart_reload_members_and_only_confirm_operation_results() {
+fn agent_start_without_creator_task_is_rejected_and_restart_preserves_parameters() {
     let mut harness = Harness::new();
     let mut socket = harness.connect();
     harness.register(&mut socket, "webui", "browser");
@@ -522,55 +530,23 @@ fn agent_start_and_restart_reload_members_and_only_confirm_operation_results() {
         "start",
         json!({"workspace":"workspace:local/demo","name":"coder"}),
     );
-    harness.wait(|harness| !harness.starts.lock().unwrap().is_empty());
-    assert!(harness.restarts.lock().unwrap().is_empty());
-    let request = harness.starts.lock().unwrap()[0].clone();
-    assert!(
-        request
-            .parameters
-            .database_path
-            .ends_with("workspaces/demo/agents/coder/state.sqlite")
-    );
-    assert!(
-        request
-            .parameters
-            .settings_path
-            .ends_with("workspaces/demo/agents/coder/setting.toml")
-    );
-    assert_eq!(
-        request.parameters.initial_settings_path,
-        harness
-            .root
-            .path()
-            .join("agent-drivers/local/new/latest/setting.toml")
-    );
-    assert_eq!(
-        request.parameters.ui_path,
-        harness
-            .root
-            .path()
-            .join("agent-drivers/local/new/latest/ui")
-    );
-    let creation = request.parameters.clone();
-    harness.app.world_mut().insert_component(
-        harness.agent,
-        agent_core::AgentResources {
-            parameters: creation.clone(),
-        },
-    );
-    request
-        .reply
-        .lock()
-        .unwrap()
-        .take()
-        .unwrap()
-        .send(Ok(harness.agent))
-        .unwrap();
     let result = harness.next(&mut socket, |value| value["id"] == "start");
-    assert_eq!(
-        result,
-        json!({"type":"agent.start.result","id":"start","success":true})
+    assert_eq!(result["success"], false);
+    assert_eq!(result["error"]["code"], "InvalidRequest");
+    assert!(
+        result["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("Workspace Driver or Agent tool task")
     );
+    assert!(harness.starts.lock().unwrap().is_empty());
+    let creation = harness
+        .app
+        .world()
+        .get_component::<agent_core::AgentResources>(harness.agent)
+        .unwrap()
+        .parameters
+        .clone();
     std::fs::write(harness.definition(), format!(
         "name: demo\nproject_root: {}\nmembers:\n  - name: coder\n    driver: driver:local/refreshed:latest\n    home_root: {}\n",
         harness.root.path().display(), harness.root.path().join("fresh-home").display()

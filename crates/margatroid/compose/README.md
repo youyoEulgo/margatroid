@@ -16,6 +16,6 @@ shutdown_app(&mut App)在请求Axum停止后继续推进World，按原领域流�
 装配时先创建唯一Clients，再取得DTO提供的具体typed绑定工厂，分别注入领域插件。异步监控和统一写入口都克隆同一槽位；删除dto_sync_system及同步中转事件，不新增sync总线或另一套执行器。Workspace磁盘监控归应用，UI/记录监控归实际Agent来源，关停先取消并等待真实join，再释放运行设施。
 
 
-Agent创建注入接口为owner/name/config_path/ui_path，拒绝旧resource_dir创建参数。配置仅首次从config_path初始化至Agent持久setting.toml，后续重启保留已修改配置；ui_path始终直接引用与监控，不创建Agent本地UI，不复制、覆盖、删除已有UI副本，也不把旧副本作为回退来源。Lua程序加载只读取程序文件，不推导或读取同目录配置。
+Agent创建注入接口为name/config_path/ui_path，拒绝旧resource_dir创建参数。配置仅首次从config_path初始化至Agent持久setting.toml，后续重启保留已修改配置；ui_path始终直接引用与监控，不创建Agent本地UI，不复制、覆盖、删除已有UI副本，也不把旧副本作为回退来源。Lua程序加载只读取程序文件，不推导或读取同目录配置。
 
 未绑定Agent的日志直接通过既有tracing输出，遵守配置的日志级别和过滤器；不创建独立运行日志数据库、不强制保存运行级报告。绑定Agent的日志沿原AgentStorage及提交探针处理。

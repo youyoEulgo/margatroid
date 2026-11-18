@@ -95,7 +95,18 @@ async fn invoke(
     let agents=world(sender,move|world|{validate_execution(world,&identity)?;let agents=world.get_resource::<ExecutionBindings>().unwrap().0.lock().unwrap().get(&identity.instance).map(|agents|agents.values().cloned().collect::<Vec<_>>()).unwrap_or_default();Ok(agents.into_iter().map(|agent|{let context=bound_context(world,&agent);(agent,context)}).collect::<Vec<_>>())}).await?;
     let count=agents.len();for (agent,context) in agents{let mut record=record.clone();let mut full=record.context_json.take().unwrap_or_else(||json!({}));full.as_object_mut().ok_or_else(||failure("log context must be object"))?.extend(context.as_object().unwrap().clone());record.context_json=Some(full);tokio::task::spawn_blocking(move||storage_core::append_agent_log(&agent.storage,record)).await.map_err(failure)?.map_err(failure)?;}Ok(json!(count))
    }
-  "agent_stop"=>{
+  "agent_data_dir"=>{
+     let target=arguments.as_str().filter(|value|!value.trim().is_empty()).ok_or_else(||failure("agent.data_dir requires an Agent address"))?.to_owned();
+     world(sender,move|world|{
+       validate_execution(world,&identity)?;
+       let address=address::Address::new(&target).map_err(failure)?;
+       let entity=world.query_with::<agent_core::Agent>().result().into_iter().find(|entity|world.get_component::<address::Address>(*entity)==Some(&address)).ok_or_else(||failure("Agent data directory target missing"))?;
+       if world.get_component::<agent_core::Agent>(entity).unwrap().workspace()!=identity.workspace{return Err(failure("Agent data directory target outside Workspace"));}
+       let storage=world.get_component::<storage_core::AgentStorage>(entity).ok_or_else(||failure("Agent storage missing"))?;
+       Ok(json!(storage.data_dir()))
+     }).await
+   }
+   "agent_stop"=>{
     let target=arguments.as_str().ok_or_else(||failure("agent.stop requires Agent address"))?.to_owned();let(tx,rx)=oneshot::channel();
     world(sender,move|world|{validate_execution(world,&identity)?;let parsed=address::Address::new(&target).map_err(failure)?;
      let entity=world.query_with::<agent_core::Agent>().result().into_iter().find(|entity|world.get_component::<address::Address>(*entity)==Some(&parsed)).ok_or_else(||failure("stop Agent missing"))?;
@@ -106,28 +117,23 @@ async fn invoke(
     }).await?;Ok(json!({}))
    }
   "agent_create"=>{
-   let owner=arguments.get("owner").and_then(Value::as_str).ok_or_else(||failure("Agent owner address required"))?.to_owned();
+
    let name=arguments.get("name").and_then(Value::as_str).ok_or_else(||failure("Agent name required"))?.to_owned();
    let config_path=arguments.get("config_path").and_then(Value::as_str).ok_or_else(||failure("Agent config_path required"))?.to_owned();
     let ui_path=arguments.get("ui_path").and_then(Value::as_str).ok_or_else(||failure("Agent ui_path required"))?.to_owned();
-    if arguments.as_object().is_none_or(|fields|fields.keys().any(|key|!matches!(key.as_str(),"owner"|"name"|"config_path"|"ui_path"))){return Err(failure("unknown Agent creation parameter"));}
+    if arguments.as_object().is_none_or(|fields|fields.keys().any(|key|!matches!(key.as_str(),"name"|"config_path"|"ui_path"))){return Err(failure("unknown Agent creation parameter"));}
    let cancel=identity.cancel.clone();let(tx,rx)=oneshot::channel();let(info_tx,info_rx)=oneshot::channel();
    let sender_for_info=sender.clone();let execution=identity.instance.clone();let creator=identity.source;
    world(sender,move|world|{validate_execution(world,&identity)?;
-    let requested=address::Address::new(&owner).map_err(failure)?;
-    let owner=world.query_with::<address::Address>().result().into_iter().find(|entity|world.get_component::<address::Address>(*entity)==Some(&requested)).ok_or_else(||failure("Agent owner missing"))?;
+     let creator_reference=creator_task(world,identity.source,&identity.instance)?.1;
     let root=world.get_component::<workspace_core::Workspace>(identity.workspace).ok_or_else(||failure("Workspace missing"))?;
-    if root.state==workspace_core::WorkspaceState::Stopping{return Err(failure("Workspace closing"));}
-    let parent=if owner==identity.workspace{root.definition_path.parent().unwrap().to_path_buf()}else{
-     let parent=world.get_component::<agent_core::Agent>(owner).ok_or_else(||failure("owner is not Workspace or Agent"))?;
-     if parent.workspace()!=identity.workspace||matches!(parent.state(),agent_core::AgentState::Stopping|agent_core::AgentState::Error){return Err(failure("parent Agent unavailable"));}
-     world.get_component::<agent_core::AgentResources>(owner).and_then(|source|source.parameters.settings_path.parent()).ok_or_else(||failure("parent Agent resources missing"))?.to_path_buf()
-    };
-    if name.is_empty()||matches!(name.as_str(),"."|"..")||name.chars().any(|c|matches!(c,'/'|'\\'|':')||c.is_control()){return Err(failure("invalid Agent name"));}
+     if root.state==workspace_core::WorkspaceState::Stopping{return Err(failure("Workspace closing"));}
+     let parent=root.definition_path.parent().ok_or_else(||failure("Workspace data directory missing"))?.to_path_buf();
+     if name.is_empty()||matches!(name.as_str(),"."|"..")||name.chars().any(|c|matches!(c,'/'|'\\'|':')||c.is_control()){return Err(failure("invalid Agent name"));}
     let home=parent.join("agents").join(&name);let parameters=agent_core::AgentStartParameters{initial_settings_path:config_path.into(),ui_path:ui_path.into(),project_root:root.project_root.clone(),home_root:home.clone(),database_path:home.join("state.sqlite"),settings_path:home.join("setting.toml")};
     let(completed,completion)=tokio::sync::watch::channel(false);
      world.get_resource::<ExecutionBindings>().unwrap().2.lock().unwrap().entry(execution.clone()).or_default().push(completion);
-     world.send_event(agent_core::StartAgent{owner,id:format!("lua-create:{}",next()),workspace:identity.workspace,name,parameters,reply:Arc::new(std::sync::Mutex::new(Some(tx)))});
+     world.send_event(agent_core::StartAgent{creator:creator_reference,id:format!("lua-create:{}",next()),workspace:identity.workspace,name,parameters,reply:Arc::new(std::sync::Mutex::new(Some(tx)))});
      async_runtime_plugin::WorldAsyncExt::send_async_closure(world,RuntimePlugin::UPDATE,move||async move{
         let result=async{
             let entity=rx.await.map_err(failure)?.map_err(failure)?;
@@ -257,12 +263,11 @@ struct ExecutionBindings(
         >,
     >,
 );
-struct AgentTaskBinding {
+struct AgentTaskGuard {
     _binding: Option<tool_core::TaskBinding>,
     unlink: Option<Box<dyn FnOnce() + Send + Sync>>,
 }
-impl core_plugin::Component for AgentTaskBinding {}
-impl Drop for AgentTaskBinding {
+impl Drop for AgentTaskGuard {
     fn drop(&mut self) {
         if let Some(unlink) = self.unlink.take() {
             unlink();
@@ -270,32 +275,62 @@ impl Drop for AgentTaskBinding {
     }
 }
 impl core_plugin::Resource for ExecutionBindings {}
+fn creator_task(
+    world: &World,
+    source: core_plugin::Entity,
+    instance: &str,
+) -> Result<(tool_core::ToolTaskHandle, agent_core::AgentCreator), LuaRuntimeError> {
+    let pair = if let Some(task) = world
+        .get_component::<tool_core::LuaExecutionTask>(source)
+        .filter(|_| {
+            world
+                .get_component::<lua_runtime_core::DriverLuaVm>(source)
+                .is_some_and(|vm| vm.instance.start_id == instance)
+        }) {
+        let address = world
+            .get_component::<address::Address>(task.workspace)
+            .ok_or_else(|| failure("creator Workspace address missing"))?
+            .as_str()
+            .to_owned();
+        (
+            task.handle.clone(),
+            agent_core::AgentCreator {
+                address,
+                task_id: instance.to_owned(),
+            },
+        )
+    } else {
+        let (id, task) = world
+            .get_component::<tool_core::ToolTasks>(source)
+            .and_then(|tasks| {
+                tasks
+                    .list()
+                    .into_iter()
+                    .find(|(_, task)| task.execution_id() == instance)
+            })
+            .ok_or_else(|| failure("Agent creator task missing"))?;
+        let address = world
+            .get_component::<address::Address>(source)
+            .ok_or_else(|| failure("creator Agent address missing"))?
+            .as_str()
+            .to_owned();
+        (
+            task,
+            agent_core::AgentCreator {
+                address,
+                task_id: id,
+            },
+        )
+    };
+    Ok(pair)
+}
 fn bind_agent(
     world: &mut World,
     source: core_plugin::Entity,
     instance: &str,
     entity: core_plugin::Entity,
 ) -> Result<(), LuaRuntimeError> {
-    let creator = world
-        .get_component::<tool_core::LuaExecutionTask>(source)
-        .filter(|_| {
-            world
-                .get_component::<lua_runtime_core::DriverLuaVm>(source)
-                .is_some_and(|vm| vm.instance.start_id == instance)
-        })
-        .map(|task| task.handle.clone())
-        .or_else(|| {
-            world
-                .get_component::<tool_core::ToolTasks>(source)
-                .and_then(|tasks| {
-                    tasks
-                        .list()
-                        .into_iter()
-                        .map(|(_, task)| task)
-                        .find(|task| task.execution_id() == instance)
-                })
-        })
-        .ok_or_else(|| failure("Agent creator task missing"))?;
+    let (creator, reference) = creator_task(world, source, instance)?;
     let removal = world
         .get_component::<agent_core::Agent>(entity)
         .ok_or_else(|| failure("created Agent missing"))?
@@ -388,9 +423,11 @@ fn bind_agent(
     };
     let weak_lifetimes = Arc::downgrade(&lifetimes);
     let execution = instance.to_owned();
-    world.insert_component(
+    agent_core::AgentTaskBinding::install(
+        world,
         entity,
-        AgentTaskBinding {
+        reference,
+        Box::new(AgentTaskGuard {
             _binding: binding,
             unlink: Some(Box::new(move || {
                 if let Some(lifetimes) = weak_lifetimes.upgrade() {
@@ -403,8 +440,9 @@ fn bind_agent(
                     }
                 }
             })),
-        },
-    );
+        }),
+    )
+    .map_err(failure)?;
     let weak = Arc::downgrade(&registry);
     let instance = instance.to_owned();
     world.insert_component(

@@ -629,14 +629,7 @@ async fn stop_members_and_join(
                 "workspace state changed before stop",
             ));
         }
-        let members = members(world, workspace)?
-            .into_iter()
-            .filter(|entity| {
-                world
-                    .get_component::<agent_core::AgentOwner>(*entity)
-                    .is_none_or(|owner| owner.0 == workspace)
-            })
-            .collect::<BTreeSet<_>>();
+        let members = members(world, workspace)?;
         let close = world
             .get_component::<WorkspaceExecutor>(workspace)
             .map(|executor| {

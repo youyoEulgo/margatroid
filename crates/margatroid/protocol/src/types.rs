@@ -1160,6 +1160,7 @@ pub struct AgentStateDto {
     pub address: AddressDto,
     pub workspace: AddressDto,
 
+    pub creator: AgentCreatorDto,
     pub status: String,
     pub tools: Vec<AgentToolDto>,
     pub sandboxes: Vec<AgentSandboxDto>,
@@ -1398,4 +1399,11 @@ pub struct AgentUiFileDto {
 #[serde(deny_unknown_fields)]
 pub struct ModelConfigUpdateDto {
     pub content: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentCreatorDto {
+    pub address: AddressDto,
+    pub task_id: String,
 }

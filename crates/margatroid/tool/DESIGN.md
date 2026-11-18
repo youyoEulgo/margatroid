@@ -361,7 +361,7 @@ margatroid.agent:stop(target: String) -> Future<Value>
     行为：共享Lua服务验证同Workspace目标，提交原StopAgent，并通过既有异步World闭包监督原reply；返回{}表示已提交清理，不表示实体已销毁。调用者可能正是目标自有工具，因此不在调用栈中等待自身退出。
 margatroid:wait(target: String) -> Future<()>
     行为：在明确Agent上等待一次唤醒，与自动Lua相同，不把等待目标作为VM所有者。
-margatroid.agent:create({owner: String, name: String, config_path: String, ui_path: String}) -> Future<Value>
+margatroid.agent:create({name: String, config_path: String, ui_path: String}) -> Future<Value>
     行为：发送原StartAgent，owner指向Workspace或父Agent，资源挂载完成返回实际信息，创建者执行独立。
         config_path是明确的初始化TOML文件地址，仅首次初始化持久配置；ui_path是明确目录引用，每个Agent直接监控，不复制。拒绝旧resource_dir创建参数和未知字段。
 margatroid.tools:register(registration: RegisterToolsRequest) -> Future<Output = ()>
@@ -460,23 +460,29 @@ LuaServices安装（tool/plugin/src/services.rs）
     install_on(app: &mut App, schedule: &str)
         行为：应用内唯一服务表，Weak World发送能力避免环；自动执行和tool bin转发使用同一invoke。
     ExecutionBindings：Resource，三份Arc<Mutex<HashMap<执行实例,...>>>：诊断MonitoredAgent登记、Agent实际移除watch Receiver登记、在途创建完成watch Receiver列表
-    AgentTaskBinding：私有Component，保留Option<TaskBinding>及unlink闭包；真实Agent销毁时Drop注销任务scope回调并退休生命周期登记，提前主动StopAgent同样解除绑定
+    AgentTaskGuard：私有非Component，保留Option<TaskBinding>及unlink闭包；作为Box交给agent_core::AgentTaskBinding，真实Agent销毁时Drop注销scope回调并退休生命周期登记
+    AgentTaskBinding：agent_core公开只读Component，保存creator={address,task_id}及opaque guard，DTO只读creator
     MonitoredAgent：实际Entity、AgentSession、owned AgentStorage
     bound_context(world, agent) -> Value
         行为：在真实调用时从World取得Agent/Workspace Address、当前turn和实际AgentSession；与可信执行instance/source_address组合保留完整日志关联，不缓存启动时的回合。
     bind_agent(world, source, instance, entity)
         行为：从确切source上的LuaExecutionTask/DriverLuaVm或ToolTasks.execution_id找到创建者真实任务；登记实际AgentSession、owned日志存储和Agent::removal完成观察。
-        同一TaskScope::bind回调持Weak服务World发送器，scope关闭时只对匹配完整Entity/Session且未Stopping的Agent提交原StopAgent；已有Stopping由原监督清理，等待仍以实际移除为准。
+        自动Driver创建引用为Workspace Address及LuaExecutionTask实际task_id；工具创建引用为source Agent Address及匹配execution_id的ToolTasks集合key，不把execution_id当task_id。
+        调用agent_core::AgentTaskBinding::install统一挂载创建引用及guard并发布Changed；同一TaskScope::bind回调持Weak服务World发送器，scope关闭时只对匹配完整Entity/Session且未Stopping的Agent提交原StopAgent；已有Stopping由原监督清理，等待仍以实际移除为准。
         回调不持Agent或任务强引用环，作用域已关闭则立即排队停止；AgentTaskBinding保留撤销凭证至实际Agent销毁。LuaAgentMonitor继续独立承担日志关联，资源停止时移除不会提前丢生命周期等待。
     finish_execution(sender, identity, diagnostic)
         行为：先取走并等待本执行全部已受理Agent创建交接完成，防止Lua await被取消后StartAgent继续产生无归属实例。
         精确取走诊断登记，关闭创建者任务scope，取走本执行Agent移除观察并逐一等待实际移除；watch丢失不冒充完成。正常/受控取消不写故障日志，绑定清理仍执行；异常保留原日志提交及仍匹配存活会话的AgentException处理。
         任务finish、超时、异常、正常execute返回均沿此收口；return_result本身不关闭scope或停止Agent。调用失败时工具监督保留未清理任务并报告CleanupFailed，自动Lua将真实cleanup_result/ended标为错误，不确认task.complete_cleanup。
         持久日志提交驱动现有record probe直接投Clients；日志写入失败也不能遗漏其他Agent的error报告，聚合诊断错误。
+    ToolContext::public_value(arguments) -> Result<Value,serde_json::Error>
+        行为：输出resource_dir，不隐式输出data_dir；不向Lua暴露内部temp_dir，内部沙箱staging仍由宿主监督使用。
     invoke(sender, identity, method, arguments) -> LuaServiceFuture
         行为：所有实际World读取/修改处validate_execution核对source Address、实际VM或唯一task-instance及取消状态。
         execution_log将自动执行的主动日志投递给实际绑定Agent存储，沿原提交探针发布；无Agent的诊断由Lua宿主直接按原级别输出tracing，受既有日志级别及过滤配置控制。
+        agent_data_dir要求Agent Address字符串，validate_execution后定位同Workspace真实Agent，返回其AgentStorage::data_dir字符串；目标不存在、跨Workspace或未挂载storage明确失败，不退回资源/工作目录、不创建目录。
         agent_stop提交原StopAgent并在调用栈外监督原reply；
+        agent_create仅接收name/config_path/ui_path，拒绝owner；所属Workspace由实际LuaExecutionIdentity取得，持久路径统一Workspace定义父目录/agents/name，不依赖创建者层级。
         agent_create在World受理时先登记在途创建watch、发送原StartAgent；另一个受监督异步闭包持有原启动oneshot，等资源挂载后bind_agent再发布创建完成并回复Lua；调用方Future取消不丢弃此闭包。创建者取消后不返回可用Agent，已创建实例仍通过scope关闭自动Stop并等待清理；mcl_execute通过原MclCommand/oneshot；wait使用AgentWaitSlot；其他工具、成员、任务服务复用原入口。
     acknowledge_execution(world: &World, identity: &LuaExecutionIdentity)
         行为：自动Lua首次wait或Return交接启动；短任务正常执行结束也可成功，Agent.ready不控制VM寿命。

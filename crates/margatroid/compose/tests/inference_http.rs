@@ -227,6 +227,14 @@ impl Fixture {
             ),
         );
         let agent = app.world_mut().spawn();
+        agent_core::AgentTaskBinding::reserve(
+            app.world_mut(),
+            agent,
+            agent_core::AgentCreator {
+                address: "workspace:local/test:latest".into(),
+                task_id: "fixture-driver".into(),
+            },
+        );
         let agent_updates = app
             .world()
             .get_resource::<agent_core::AgentUpdateContext>()

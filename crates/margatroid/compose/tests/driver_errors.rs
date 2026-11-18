@@ -6,6 +6,7 @@ use lua_runtime_core::*;
 use lua_runtime_plugin::LuaRuntimePlugin;
 use mcl_core::{MclCommand, MclValue, MessageArray};
 use serde_json::{Value, json};
+use std::path::PathBuf;
 use std::{
     collections::{BTreeMap, VecDeque},
     sync::{Arc, Mutex},
@@ -91,7 +92,7 @@ impl Fixture {
         let closures = app.world().closure_sender(RuntimePlugin::UPDATE);
         app.world_mut().insert_resource(LuaServices::new(move|identity,method,args|{let events=events.clone();let closures=closures.clone();Box::pin(async move{
             match method.as_str(){
-                "execution_finished"=>Ok(json!({})),
+                "execution_finished"|"tools_register"=>Ok(json!({})),
                 "agent_create"=>Ok(json!({"address":"agent:local/driver-errors:latest"})),
                 "wait"=>{let(tx,rx)=oneshot::channel();closures.send(move|world|{let _=tx.send(world.get_component::<DriverLuaVm>(owner).unwrap().wake.clone());});let slot=rx.await.unwrap();tokio::select!{_=identity.cancel.cancelled()=>Err(LuaRuntimeError::new(LuaRuntimeErrorKind::Cancelled,"cancelled")),result=DriverWakeSlot::wait(slot)=>{result?;Ok(serde_json::Value::Null)}}},
                 "task_receive"=>std::future::pending::<Result<Value,LuaRuntimeError>>().await,
@@ -208,7 +209,7 @@ impl Fixture {
         };
         self.app.world().send_event(StartDriverLuaVm {
             owner:self.owner, workspace:self.workspace,
-            program:LuaProgram {source, origin:"shipped-driver.lua".into(), },
+            program:LuaProgram {source, origin:PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../resources/agent-drivers/local/coder/latest/shipped-driver.lua"), },
             environment:LuaEnvironment {globals:BTreeMap::from([("execution_context".into(), LuaBinding::Value(LuaValue::from_json(json!({"workspace":{"address":"workspace:test/unit:latest"},"name":"test","resource_dir":"/tmp"})).unwrap()))]), modules:BTreeMap::new()},
             reply:Arc::new(Mutex::new(Some(sender))),
         });

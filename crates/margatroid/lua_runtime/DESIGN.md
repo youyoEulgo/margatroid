@@ -278,7 +278,8 @@ LuaHostContext字段约定：JSON对象保存真实执行元数据
     call_id, alias: Option<String>--有模型调用时提供
     owner_task_id: Option<String>
     binding: Option<LuaValue>
-    resource_dir, temp_dir: Option<PathBuf>
+    resource_dir: Option<PathBuf>--实际Lua资源来源目录
+    不公开data_dir或temp_dir；持久目录通过margatroid.agent:data_dir(address)按明确Agent查询
 
 LuaFailureDiagnostic：从类型化Lua错误提取的诊断
     class: LuaFailureClass
@@ -331,7 +332,7 @@ margatroid.mcl:execute(target: String, instruction: String, arguments: Option<Ve
         成功始终返回结果对象，Unit返回空JSON对象{}，在Lua中保留object标记；MCL执行失败返回Error对象，可由Lua检查后继续。
 margatroid.agent:stop(target: String) -> Future<Value>
     行为：同工具bin公共注入服务，不走MCL，提交原StopAgent并外部监督，不拥有或终止创建者VM。
-margatroid.agent:create({owner: String, name: String, config_path: String, ui_path: String}) -> Future<Value>
+margatroid.agent:create({name: String, config_path: String, ui_path: String}) -> Future<Value>
     行为：无需既有MCL队列，公共服务发送StartAgent并等待资源安装返回，Agent归属与Lua执行生命周期独立；config_path只初始化持久配置，ui_path只保存引用并直接监控，均不从执行程序路径推导。
 margatroid:wait(agent_address: String) -> Future<()>
     行为：公共服务在目标AgentWaitSlot上登记一次等待，复用DriverWakeSlot防丢失唤醒及取消guard；初次等待交接自动执行启动，Agent.ready不拥有VM。
@@ -365,6 +366,8 @@ LuaRuntimeConfig：执行预算
 NamespaceKind::Workspace
     name: "workspace"
     agents()--异步，只在执行能力安装后提供，工具端经RunnerFrame::WorkspaceAgents请求实时成员
+margatroid.agent:data_dir(address: String) -> Future<Output = String>
+    行为：必须提供实际Agent完整Address，通过公共agent_data_dir服务按确切执行身份和同Workspace边界查询AgentStorage::data_dir；不创建目录，不读取配置正文，不公开临时目录。
 margatroid.context.workspace
     address: String
     name: String

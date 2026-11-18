@@ -737,9 +737,6 @@ pub(crate) fn execute(
         }
         StorageOperation::ReplaceMessages { sources, target } => {
             let replacement = source_values(db, root, memory, sources)?;
-            for value in &replacement {
-                messages::validate_sequence(db, value)?;
-            }
             if let Some(block) =
                 memory_block_mut(memory, &target.block, target.instance.as_deref())?
             {

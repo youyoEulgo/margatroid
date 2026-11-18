@@ -298,7 +298,10 @@ impl Fixture {
     fn request_start(&self, id: &str) -> oneshot::Receiver<Result<Entity, AgentError>> {
         let (sender, receiver) = oneshot::channel();
         self.app.world().emit_event(StartAgent {
-            owner: self.workspace,
+            creator: agent_core::AgentCreator {
+                address: "workspace:local/test:latest".into(),
+                task_id: "fixture-driver-task".into(),
+            },
             id: id.into(),
             workspace: self.workspace,
             name: "coder".into(),
@@ -390,15 +393,6 @@ fn startup_mounts_resources_in_parallel_without_creating_or_configuring_a_vm() {
     let domains = fixture.app.world().get_resource::<FakeDomains>().unwrap();
     assert_eq!(domains.tool_frames, domains.inference_frames);
     assert!(domains.vm_starts.is_empty());
-    assert_eq!(
-        fixture
-            .app
-            .world()
-            .get_component::<AgentOwner>(agent)
-            .unwrap()
-            .0,
-        fixture.workspace
-    );
     let mut stop = fixture.request_stop(agent, "stop");
     assert_eq!(wait(&mut fixture.app, &mut stop).unwrap(), agent);
     assert!(!fixture.app.world().is_alive(agent));

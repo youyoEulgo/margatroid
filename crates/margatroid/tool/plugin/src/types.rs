@@ -70,6 +70,7 @@ impl ToolContext {
         if let Some(context) = value.as_object_mut() {
             context.insert("arguments".into(), arguments.clone());
             context.remove("source_origin");
+            context.remove("temp_dir");
             context.remove("agent_name");
             context.insert("kind".into(), Value::String("tool".into()));
             context.insert(

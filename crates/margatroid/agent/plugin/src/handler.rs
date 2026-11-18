@@ -61,7 +61,6 @@ fn validate_request(id: &str, name: &str) -> Result<(), AgentError> {
 fn validate_parameters(
     world: &World,
     workspace: Entity,
-    owner: Entity,
     name: &str,
     parameters: &AgentStartParameters,
 ) -> Result<String, AgentError> {
@@ -106,34 +105,6 @@ fn validate_parameters(
                 "Workspace home has no valid name",
             )
         })?;
-    let home = if owner == workspace {
-        home.to_path_buf()
-    } else {
-        let parent = world.get_component::<Agent>(owner).ok_or_else(|| {
-            error(
-                AgentErrorKind::InvalidRequest,
-                "owner is neither Workspace nor Agent",
-            )
-        })?;
-        if parent.workspace() != workspace
-            || matches!(parent.state(), AgentState::Stopping | AgentState::Error)
-        {
-            return Err(error(
-                AgentErrorKind::StateRejected,
-                "parent Agent is closing",
-            ));
-        }
-        world
-            .get_component::<agent_core::AgentResources>(owner)
-            .and_then(|source| source.parameters.settings_path.parent())
-            .ok_or_else(|| {
-                error(
-                    AgentErrorKind::InvalidRequest,
-                    "parent Agent resources missing",
-                )
-            })?
-            .to_path_buf()
-    };
     let directory = home.join("agents").join(name);
     if parameters.database_path != directory.join("state.sqlite")
         || parameters.settings_path != directory.join("setting.toml")
@@ -162,21 +133,7 @@ fn validate_parameters(
             ));
         }
     }
-    if owner == workspace {
-        Ok(scope.to_owned())
-    } else {
-        use sha2::Digest;
-        let address = world.get_component::<Address>(owner).ok_or_else(|| {
-            error(
-                AgentErrorKind::InvalidRequest,
-                "parent Agent address missing",
-            )
-        })?;
-        Ok(format!(
-            "child-{:x}",
-            sha2::Sha256::digest(address.as_str().as_bytes())
-        ))
-    }
+    Ok(scope.to_owned())
 }
 fn context(
     world: &World,
@@ -244,24 +201,21 @@ pub(crate) fn handle_start_agent(world: &mut World, request: StartAgent) {
     };
     let prepared = (|| {
         validate_request(&request.id, &request.name)?;
-        let scope = validate_parameters(
-            world,
-            request.workspace,
-            request.owner,
-            &request.name,
-            &request.parameters,
-        )?;
+        if request.creator.address.trim().is_empty() || request.creator.task_id.trim().is_empty() {
+            return Err(error(
+                AgentErrorKind::InvalidRequest,
+                "Agent creator address and task_id are required",
+            ));
+        }
+        let scope =
+            validate_parameters(world, request.workspace, &request.name, &request.parameters)?;
         if world
             .query_with::<Agent>()
             .result()
             .into_iter()
             .any(|entity| {
                 world.get_component::<Agent>(entity).is_some_and(|agent| {
-                    agent.workspace() == request.workspace
-                        && agent.name() == &request.name
-                        && world
-                            .get_component::<agent_core::AgentOwner>(entity)
-                            .is_some_and(|owner| owner.0 == request.owner)
+                    agent.workspace() == request.workspace && agent.name() == &request.name
                 })
             })
         {
@@ -284,12 +238,12 @@ pub(crate) fn handle_start_agent(world: &mut World, request: StartAgent) {
             ));
         }
         let agent = world.spawn();
+        AgentTaskBinding::reserve(world, agent, request.creator.clone());
         world.insert_component(
             agent,
             StartupBarrier(Arc::new(StartupCompletion::default())),
         );
         world.insert_component(agent, address);
-        world.insert_component(agent, agent_core::AgentOwner(request.owner));
         world.insert_component(
             agent,
             AgentResources {
@@ -403,9 +357,11 @@ pub(crate) fn handle_restart_agent(world: &mut World, request: RestartAgent) {
         );
         return;
     };
-    let owner = world
-        .get_component::<agent_core::AgentOwner>(agent)
-        .map_or(request.workspace, |owner| owner.0);
+    let creator = world
+        .get_component::<AgentTaskBinding>(agent)
+        .expect("Agent creator is required")
+        .creator()
+        .clone();
     let (sender, receiver) = oneshot::channel();
     handle_stop_agent(
         world,
@@ -424,7 +380,7 @@ pub(crate) fn handle_restart_agent(world: &mut World, request: RestartAgent) {
     world.send_async_closure(&schedule, move || async move {
         match receiver.await {
             Ok(Ok(_)) => events.send_event(StartAgent {
-                owner,
+                creator,
                 id: request.id,
                 workspace: request.workspace,
                 name: request.name,
@@ -793,73 +749,6 @@ async fn stop_runtime(context: &FlowContext, _require_vm: bool) -> Result<(), Ag
     let agent = context.agent;
     let workspace = context.workspace;
     let state = context.state;
-    let children = with_world(context, move |world| {
-        Ok(world
-            .query_with::<agent_core::AgentOwner>()
-            .result()
-            .into_iter()
-            .filter(|entity| {
-                world
-                    .get_component::<agent_core::AgentOwner>(*entity)
-                    .is_some_and(|owner| owner.0 == agent)
-                    && world.get_component::<Agent>(*entity).is_some()
-            })
-            .collect::<Vec<_>>())
-    })
-    .await?;
-    for child in children {
-        let id = format!("{}:child:{}", context.id, child.index());
-        let pending = with_world(context, move |world| {
-            let Some(component) = world.get_component::<Agent>(child) else {
-                return Ok(None);
-            };
-            let removal = component.removal();
-            if component.state() == AgentState::Stopping {
-                return Ok(Some((removal, None)));
-            }
-            let (tx, rx) = oneshot::channel();
-            world.send_event(StopAgent {
-                id,
-                agent: child,
-                reply: Arc::new(Mutex::new(Some(tx))),
-            });
-            Ok(Some((removal, Some(rx))))
-        })
-        .await?;
-        if let Some((mut removal, reply)) = pending {
-            if let Some(reply) = reply {
-                if let Err(failure) = reply
-                    .await
-                    .map_err(|e| error(AgentErrorKind::ReplyClosed, e))?
-                {
-                    let concurrent = if matches!(
-                        failure.kind,
-                        AgentErrorKind::StateRejected | AgentErrorKind::AgentMissing
-                    ) {
-                        with_world(context, move |world| {
-                            Ok(world
-                                .get_component::<Agent>(child)
-                                .is_none_or(|agent| agent.state() == AgentState::Stopping))
-                        })
-                        .await?
-                    } else {
-                        false
-                    };
-                    if !concurrent {
-                        return Err(failure);
-                    }
-                }
-            }
-            while !*removal.borrow_and_update() {
-                removal.changed().await.map_err(|_| {
-                    error(
-                        AgentErrorKind::CleanupFailed,
-                        "child Agent removal was not confirmed",
-                    )
-                })?;
-            }
-        }
-    }
     let snapshot = with_world(context, move |world| {
         check_agent(world, agent, workspace, state)?;
         cancel_runtime(world, agent);

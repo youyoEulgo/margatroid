@@ -189,6 +189,7 @@ fn record_change_watch_notifies_only_after_new_records_commit() {
     assert!(changes.has_changed().unwrap());
     assert_eq!(changes.borrow_and_update().message, 1);
     append_message_history(&storage, &messages, None).unwrap();
+    assert_eq!(changes.borrow_and_update().message, 2);
     read_message_page(&storage, query(None, None, 50)).unwrap();
     read_record_watermarks(&storage).unwrap();
     execute_storage(
@@ -224,7 +225,7 @@ fn record_change_watch_notifies_only_after_new_records_commit() {
     assert!(!changes.has_changed().unwrap());
     assert_eq!(read_record_watermarks(&storage).unwrap().mcl, 0);
     append_mcl(&storage);
-    assert_eq!(changes.borrow_and_update().mcl, 2);
+    assert_eq!(changes.borrow_and_update().mcl, 3);
     append_agent_log(
         &storage,
         AgentLogRecord {
@@ -250,5 +251,5 @@ fn record_change_watch_notifies_only_after_new_records_commit() {
     .unwrap();
     assert!(storage.same_database(&reopened));
     append_mcl(&reopened);
-    assert_eq!(changes.borrow_and_update().mcl, 3);
+    assert_eq!(changes.borrow_and_update().mcl, 4);
 }

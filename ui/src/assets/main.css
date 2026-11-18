@@ -3604,3 +3604,16 @@ textarea:focus-visible {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+
+.tree-row--agent {
+  transition: background-color 120ms var(--mg-ease);
+}
+
+.tree-row--agent.tree-row--child .tree-name {
+  color: var(--mg-text-tertiary);
+}
+
+.tree-branch {
+  flex: 0 0 auto;
+  color: var(--mg-text-quaternary);
+}

@@ -1882,7 +1882,8 @@ async fn bundled_drivers_record_inference_error_messages_and_keep_running_while_
             owner: fixture.owner,
             workspace,
             program: LuaProgram {
-                source: source.replace("task = function() return margatroid.task:receive() end,", "").replace("local agent = margatroid.agent:create({\n        owner = context.workspace.address,\n        name = context.name,\n        config_path = context.resource_dir .. \"/setting.toml\",\n        ui_path = context.resource_dir .. \"/ui\",\n    })", "local agent = {address='agent:local/test:latest'}"),
+                source: source.replace("task = function() return margatroid.task:receive() end,", "").replace("if not subdriver then\n            margatroid.tools:register", "if false then\n            margatroid.tools:register").replace("local agent = margatroid.agent:create({\n        name = child_name,\n        config_path = config_path,\n        ui_path = context.resource_dir .. (subdriver and \"/subagent-ui\" or \"/ui\"),\n    })", "local agent = {address='agent:local/test:latest'}"),
+
                 origin: "bundled-driver".into(),
 
             },
@@ -2855,7 +2856,31 @@ async fn recorded_message_sequence_survives_context_snapshot_and_restore() {
         vec![json!("session")],
     )
     .await;
-    snapshot_write(&mut fixture, "session.conversation", "changed").await;
+    let edited = json!({"type":"user","content":"changed","sequence":sequence});
+    snapshot_command_unit(
+        &mut fixture,
+        "INJECT ? TO session.conversation",
+        vec![json!([edited.clone()])],
+    )
+    .await;
+    assert_eq!(
+        messages(
+            fixture
+                .command("GET session.conversation", vec![])
+                .await
+                .unwrap()
+        ),
+        vec![edited]
+    );
+    assert_eq!(
+        fixture
+            .history()
+            .into_iter()
+            .find(|record| record.kind == "message")
+            .unwrap()
+            .payload["content"],
+        "original"
+    );
     snapshot_command_unit(
         &mut fixture,
         "EFFECT block_restore ? ?",
@@ -2876,23 +2901,26 @@ async fn recorded_message_sequence_survives_context_snapshot_and_restore() {
             .await
             .unwrap(),
     );
-    assert_eq!(again[0]["sequence"], sequence);
+    assert_ne!(again[0]["sequence"], sequence);
     assert_eq!(
         fixture
             .history()
             .iter()
             .filter(|v| v.kind == "message")
             .count(),
-        1
+        2
     );
     let mut forged = again[0].clone();
     forged["content"] = json!("forged");
     assert!(matches!(
         fixture
-            .command("INJECT ? TO session.conversation", vec![json!([forged])])
+            .command(
+                "INJECT ? TO session.conversation",
+                vec![json!([forged.clone()])]
+            )
             .await
             .unwrap(),
-        MclValue::Error(_)
+        MclValue::Unit
     ));
     let current = messages(
         fixture
@@ -2900,7 +2928,7 @@ async fn recorded_message_sequence_survives_context_snapshot_and_restore() {
             .await
             .unwrap(),
     );
-    assert_eq!(current, again);
+    assert_eq!(current, vec![forged]);
 }
 
 fn test_binding() -> tool_core::TaskSyncBinding {

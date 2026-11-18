@@ -61,7 +61,7 @@ async fn lua_creation_persists_only_configuration_and_each_agent_monitors_its_ex
         r#"
 function configure()return {timeout_ms=0}end
 function execute(_,context)
- local agent=margatroid.agent:create({owner=context.workspace.address,name=context.name,config_path=context.workspace.project_root..'/initial/'..context.name..'.toml',ui_path=context.workspace.project_root..'/interfaces/'..context.name})
+ local agent=margatroid.agent:create({name=context.name,config_path=context.workspace.project_root..'/initial/'..context.name..'.toml',ui_path=context.workspace.project_root..'/interfaces/'..context.name})
  local result=margatroid.mcl:execute(agent.address,'EFFECT ready');assert(not result.Error)
  margatroid.task:return_result(agent.address)
  margatroid.task:receive()

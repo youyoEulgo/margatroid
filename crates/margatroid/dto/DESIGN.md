@@ -104,7 +104,7 @@ handle_abort_control(world: &mut World, event: AbortTurnControl)
 projection::address(world: &World, entity: Entity) -> Option<String>
 projection::workspaces(world: &World) -> Vec<WorkspaceInfoDto>
 projection::agents(world: &World) -> Vec<AgentStateDto>
-    行为：逐字投影starting/running/error/stopping，不将资源挂载或无turn误报ready；turn通过独立投影发布。
+    行为：从agent_core::AgentTaskBinding只读投影creator={address,task_id}，从实体注册前必需的创建引用读取，不允许缺失，不查任务集合、不持有工具插件私有结构；逐字投影starting/running/error/stopping，不将资源挂载或无turn误报ready；turn通过独立投影发布。
 projection::turn(world: &World, entity: Entity) -> Option<AgentTurnStateDto>
 projection::tasks(world: &World, entity: Entity) -> Option<AgentTaskStateDto>
     行为：仅服务req的非破坏性只读查询，从所属领域共享状态取得完整快照；不创建观察、不推进脚本cursor、不触发sync或IO调查。

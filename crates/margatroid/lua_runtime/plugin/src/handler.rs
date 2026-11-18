@@ -893,6 +893,7 @@ async fn execute_lua(
             ("mcl_execute", "mcl_execute"),
             ("agent_create", "agent_create"),
             ("agent_stop", "agent_stop"),
+            ("agent_data_dir", "agent_data_dir"),
             ("wait", "wait"),
             ("workspace_agents", "workspace_agents"),
             ("tools_register", "tools_register"),

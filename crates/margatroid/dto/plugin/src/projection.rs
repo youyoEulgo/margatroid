@@ -82,7 +82,16 @@ pub(crate) fn agents(world: &World) -> Vec<AgentStateDto> {
             Some(AgentStateDto {
                 address: address(world, entity)?,
                 workspace: address(world, agent.workspace())?,
-
+                creator: {
+                    let reference = world
+                        .get_component::<agent_core::AgentTaskBinding>(entity)
+                        .expect("public Agent must have creator")
+                        .creator();
+                    AgentCreatorDto {
+                        address: reference.address.clone(),
+                        task_id: reference.task_id.clone(),
+                    }
+                },
                 status: format!("{:?}", agent.state()).to_lowercase(),
                 tools: world
                     .get_component::<Tools>(entity)

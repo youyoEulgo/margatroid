@@ -34,7 +34,7 @@ execute_storage(storage: &AgentStorage, operation: StorageOperation) -> Result<S
         按StorageOperation分派；Block操作通过共享受理门解析timeline，管理库操作使用管理库事务，设置操作使用设置文件锁
         CreateBlock的TEMP只在DatabaseState.temporary创建内存集合，已存在仅比较子项名，不清空；持久Block调用blocks::create发布工作库及timeline
         ReadMessages/ReadMessageSources固定各来源工作文件视图，读取期间阻止内部写入及回档穿过操作边界
-        ReplaceMessages先读取全部来源并验证消息sequence关联；TEMP在受理门内完成范围替换，持久目标在单个写事务内读取、校验范围并替换
+        ReplaceMessages先读取全部来源，不按sequence查历史或比较内容；TEMP在受理门内完成范围替换，持久目标在单个写事务内读取、校验范围并替换
         跨文件来源不修改，失败不改目标，不宣称跨文件SQL写事务；普通写入不访问snapshot文件
         DropTemporaryBlocks仅移除temporary中指定VM的Block及内存快照，不读写管理库或文件；其余变体保持历史、日志和设置各自契约
         等待写入及必要清理确认后返回，不让旧工作连接绕过回档受理门；raw Connection不外借。
@@ -91,7 +91,7 @@ snapshot_block(storage: &AgentStorage, name: &str, instance: Option<&str>) -> Re
 append_message_history(storage: &AgentStorage, messages: &[serde_json::Value], turn: Option<&str>) -> Result<Vec<serde_json::Value>, StorageError>
     行为：
         取得管理连接锁并检查retired，BEGIN IMMEDIATE后逐条调用messages::append，全部完成才提交
-        未带sequence按消息/MCL共享历史MAX分配真实序号；已有sequence校验实际消息记录一致则复用，不再追加
+        每次显式调用按消息/MCL共享历史MAX分配新的真实序号并返回，不依据输入sequence复用旧记录
         返回带真实sequence的完整内部消息，错误回滚整个批次，不修改Block或MCL审计
         仅在事务提交且实际新增消息时调用publish_record_changes；复用已有sequence的读取结果不产生更新通知。
 
@@ -191,8 +191,6 @@ page<T>(db: &Connection, table: &str, query: RecordRange, decode: impl Fn(&Conne
         行为：从sequence、role、content、data、tool_call、payload六列读取，不把position当sequence
     join(row, with_sequence) -> Value
         行为：先拒绝payload重复保留字段，再按角色重建内部消息并验证；根据标志恢复真实sequence
-    validate_sequence(db, message)
-        行为：无sequence只校验消息；有序号必须存在于agent_messages且重建消息去sequence完全一致，否则InvalidRecord
     next_sequence(db) -> i64
         行为：从agent_messages及mcl_records最大序号加1，溢出报错
     append(db, message, turn, timestamp) -> Value
@@ -260,6 +258,8 @@ AgentStorage：Agent持久存储，公开组件
     settings_lock: Arc<Mutex<()>>--私有，协调该文件读写
     impl Component for AgentStorage
     impl Clone for AgentStorage
+    data_dir(&self) -> &Path
+        行为：返回本Agent实际绝对settings_path的父目录，不创建其他目录或缓存配置。
     same_database(&self, other: &Self) -> bool
         行为：比较管理库共享状态Arc身份，供来源生命周期核对。
         行为：共享连接及设置锁，不复制数据；Driver与工具的host持有owned克隆作为日志能力，仅依赖storage_core；生命周期覆盖Driver及工具清理和最后一次日志写入的真实join，再释放句柄。

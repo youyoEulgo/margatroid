@@ -121,13 +121,13 @@ AgentSession(String)：Component
 ```text
 -- 公开
 StartAgent：启动请求，公开事件
-    owner: Entity--实际Workspace或父Agent
     id: String
     workspace: Entity
     name: String
     parameters: AgentStartParameters
     reply: Arc<Mutex<Option<oneshot::Sender<Result<Entity, AgentError>>>>>
     impl Event for StartAgent
+    creator: AgentCreator--真实创建任务，非可选；宿主受理时确定，实体注册前保存
 
 StopAgent：关闭请求，公开事件
     id: String
@@ -215,7 +215,7 @@ wait_observers(observers: Vec<AgentObservationWait>) -> Future<Output = Result<(
 
 handle_start_agent(world: &mut World, request: StartAgent)
     行为：
-        校验Workspace和成员创建请求；
+        校验Workspace和成员创建请求；所有owner统一使用Workspace作用域，构造agent:<scope>/<request.name>:latest并检查Address唯一，不计算父Agent地址哈希；
         同步创建Agent Entity并经update_agent(Register)登记Starting公共视图，再提交start_flow；
         拒绝时发送启动错误。
 
@@ -226,8 +226,8 @@ handle_stop_agent(world: &mut World, request: StopAgent)
         拒绝时发送关闭错误。
 
 handle_restart_agent(world: &mut World, request: RestartAgent)
-    行为：按workspace/name定位既有Agent，捕获实际AgentOwner和请求parameters；直接调用handle_stop_agent，停止使用普通StopAgent的状态/取消/清理规则。
-        仅await真正StopAgent.reply；成功后提交普通StartAgent，携带原owner/workspace/name/parameters及原重启reply；新Agent Entity和Session由StartAgent创建。
+    行为：按workspace/name定位既有Agent，保留请求parameters；直接调用handle_stop_agent，停止使用普通StopAgent的状态/取消/清理规则。
+        仅await真正StopAgent.reply；成功后提交普通StartAgent，携带原workspace/name/parameters及原重启reply；新Agent Entity和Session由StartAgent创建。
         停止失败或回执丢失立即回复，不提交StartAgent；不检查ToolTasks是否非空、不提前校验启动参数、不额外改状态/装Barrier/重载定义、不保留旧Entity。
 
 handle_agent_exception(world: &mut World, event: AgentException)
@@ -267,8 +267,7 @@ install_runtime(context: &FlowContext, storage: AgentStorage, source: AgentResou
 start_steps(context: &FlowContext) -> Future<Output = Result<(), StartFailure>>
     行为：prepare与install_runtime后同时提交InitToolTasks/InitInference并收齐原oneshot；失败不提前丢弃另一项，不启动VM。
 stop_runtime(context: &FlowContext, _require_vm: bool) -> Future<Output = Result<(), AgentError>>
-    行为：关闭Agent受理、等待槽、推理及工具；按AgentOwner精确找到直接子Agent并通过原StopAgent逐个等待其递归清理。
-        对子Agent先经World核对完整Entity；已移除跳过，Stopping等待Agent::removal；其他状态提交原StopAgent并等待reply及实际移除。与创建者task scope触发停止并发时不重复Stop、不反向等待创建者VM。
+    行为：关闭Agent受理、等待槽、推理及自己ToolTasks内任务；任务scope负责停止自己创建的Agent并等待实际移除，不读取creator做递归扫描、不反向等待创建者VM。
         复用原tasks.finish、inference.wait_finished及MclDrain真实等待；之后按AgentSession调用DropTemporaryBlocks，保留持久Block和历史。
         移除AgentResources并等待实际UI/记录监控收口；不读取或终止创建者VM，不销毁协调Entity。
 
@@ -313,7 +312,17 @@ StartError / StopError：对应闭包的失败载荷
 
 ```text
 
-AgentOwner(Entity)：Component--指向实际Workspace或父Agent
+AgentCreator：公开只读创建来源值
+    address: String--实际Workspace或调用方Agent Address
+    task_id: String--公开真实任务id，不是execution_id
+AgentTaskBinding：公开Component，字段私有
+    creator: AgentCreator
+    _guard: Option<Box<dyn Send+Sync>>--启动时creator先保存；runtime guard匹配同一引用后安装，内部guard阶段不影响公开creator非空性
+    reserve(world:&mut World,entity:Entity,creator:AgentCreator)
+        行为：仅在实体注册前保存必需创建来源，初始状态发布之前完成。
+    creator(&self) -> &AgentCreator
+    install(world:&mut World, entity:Entity, creator:AgentCreator, guard:Box<dyn Send+Sync>) -> Result<(),AgentError>
+        行为：校验目标Agent存在，取得其必需AgentUpdateContext，同一入口挂载绑定后notify Changed提交创建来源投影；不把工具私有类型引入agent_core，不存数据库，不允许调用方改写创建引用。
 AgentStartParameters
     initial_settings_path: PathBuf--初始化配置文件，非运行配置位置
     ui_path: PathBuf--直接引用的UI目录
@@ -323,7 +332,7 @@ AgentStartParameters
     settings_path: PathBuf--Agent持久配置
     行为：显式设置配置/UI来源材料、项目/存储路径；不读取driver.toml或启动VM。
 Agent
-    行为：AgentOwner为独立组件，不在Agent中持有VM。
+    行为：AgentTaskBinding与Agent并列挂载，不在Agent中持有VM；绑定实际移除后其guard注销任务scope登记。
     行为：归属决定持久路径及清理树，workspace始终表示根Workspace；不持DriverLuaVm或VM生命周期责任。
 StartAgent
     owner: Entity

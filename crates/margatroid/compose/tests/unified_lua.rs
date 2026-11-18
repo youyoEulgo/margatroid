@@ -16,7 +16,14 @@ function execute(_,context)
  local child=context.arguments and context.arguments.child
  if not child then assert(context.agent_info==nil) end
  local owner=child and context.agent_info.address or context.workspace.address
- local agent=margatroid.agent:create({owner=owner,name=child and 'child' or context.name,config_path=context.resource_dir..'/setting.toml',ui_path=context.resource_dir..'/ui'})
+ assert(not pcall(function()return margatroid.agent:create({owner=owner,name='rejected-owner',config_path=context.resource_dir..'/setting.toml',ui_path=context.resource_dir..'/ui'})end))
+ local agent=margatroid.agent:create({name=child and 'child' or context.name,config_path=context.resource_dir..'/setting.toml',ui_path=context.resource_dir..'/ui'})
+ local data_dir=margatroid.agent:data_dir(agent.address)
+ assert(type(data_dir)=='string' and data_dir:sub(1,1)=='/')
+ assert(data_dir:sub(-#(child and '/agents/child' or '/agents/parent'))==(child and '/agents/child' or '/agents/parent'))
+ assert(context.data_dir==nil and context.temp_dir==nil)
+ assert(not pcall(function() return margatroid.agent:data_dir() end))
+ assert(not pcall(function() return margatroid.agent:data_dir('agent:missing/none:latest') end))
  local function command(text,args)
   local result=margatroid.mcl:execute(agent.address,text,args)
   if type(result)=='table' and result.Error then error(result.Error.message) end
@@ -219,11 +226,24 @@ fn identical_lua_programs_create_independent_agents_and_stop_without_owning_the_
         .unwrap();
     assert_eq!(
         app.world()
-            .get_component::<agent_core::AgentOwner>(child)
+            .get_component::<address::Address>(parent)
             .unwrap()
-            .0,
-        parent
+            .as_str(),
+        "agent:test/parent:latest"
     );
+    assert_eq!(
+        app.world()
+            .get_component::<address::Address>(child)
+            .unwrap()
+            .as_str(),
+        "agent:test/child:latest"
+    );
+    let binding = app
+        .world()
+        .get_component::<agent_core::AgentTaskBinding>(child)
+        .unwrap();
+    assert_eq!(binding.creator().address, "agent:test/parent:latest");
+    assert!(!binding.creator().task_id.starts_with("task-instance:"));
     let execution = app
         .world()
         .query_with::<lua_runtime_core::WorkspaceLuaTask>()
@@ -259,8 +279,35 @@ fn identical_lua_programs_create_independent_agents_and_stop_without_owning_the_
         )
         .is_err()
     );
+    let parent_creator = app
+        .world()
+        .get_component::<agent_core::AgentTaskBinding>(parent)
+        .unwrap()
+        .creator();
+    assert_eq!(parent_creator.address, "workspace:local/test:latest");
+    assert_eq!(
+        parent_creator.task_id,
+        app.world()
+            .get_component::<lua_runtime_core::DriverLuaVm>(execution)
+            .unwrap()
+            .instance
+            .start_id
+    );
+    assert!(
+        app.world()
+            .get_component::<tool_core::ToolTasks>(parent)
+            .unwrap()
+            .get(
+                &app.world()
+                    .get_component::<agent_core::AgentTaskBinding>(child)
+                    .unwrap()
+                    .creator()
+                    .task_id
+            )
+            .is_ok()
+    );
     let parent_home = root.path().join("workspaces/test/agents/parent");
-    let child_home = parent_home.join("agents/child");
+    let child_home = root.path().join("workspaces/test/agents/child");
     assert!(parent_home.join("state.sqlite").is_file());
     assert!(child_home.join("state.sqlite").is_file());
     assert!(!parent_home.join("ui").exists());
@@ -403,7 +450,7 @@ fn creator_tasks_own_agents_until_explicit_stop_or_actual_task_cleanup() {
             r#"
 function configure()return {timeout_ms=0}end
 function execute(_,ctx)
- local agent=margatroid.agent:create({owner=ctx.workspace.address,name=ctx.name,config_path=ctx.resource_dir..'/setting.toml',ui_path=ctx.resource_dir..'/ui'})
+ local agent=margatroid.agent:create({name=ctx.name,config_path=ctx.resource_dir..'/setting.toml',ui_path=ctx.resource_dir..'/ui'})
  assert(not margatroid.mcl:execute(agent.address,'IMPORT TOOL tool:probe/child:latest AS spawn_child').Error)
  assert(not margatroid.mcl:execute(agent.address,'EFFECT ready').Error)
  margatroid.task:return_result(agent.address)
@@ -435,7 +482,7 @@ function configure()return {timeout_ms=0}end
 function execute(_,ctx)
  local agents={}
  for i=1,2 do
-  agents[i]=margatroid.agent:create({owner=ctx.agent_info.address,name='child'..i,config_path=ctx.resource_dir..'/setting.toml',ui_path=ctx.resource_dir..'/ui'})
+  agents[i]=margatroid.agent:create({name='child'..i,config_path=ctx.resource_dir..'/setting.toml',ui_path=ctx.resource_dir..'/ui'})
   assert(not margatroid.mcl:execute(agents[i].address,'EFFECT ready').Error)
  end
  margatroid.task:return_result({task_id=ctx.task_id})

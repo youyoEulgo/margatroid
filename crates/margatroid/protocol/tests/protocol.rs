@@ -245,7 +245,7 @@ fn complete_workspace_agent_tool_and_mcl_business_data_are_preserved() {
     let workspace = json!({"type":"workspace.sync","workspaces":[{"path":"/project/workspace.yaml","definition":{"name":"demo","project_root":"/project","agents":[{"name":"coder","driver":"driver:local/coder","home_root":"/agent"}]},"status":"inactive","address":null,"error":null}]});
     let message: ServerMessage = serde_json::from_value(workspace.clone()).unwrap();
     assert_eq!(serde_json::to_value(message).unwrap(), workspace);
-    let agent = json!({"type":"agent.sync","agents":[{"address":"agent:demo/coder","workspace":"workspace:local/demo","status":"running","sandboxes":[],"sandbox":null,"model":null,"tools":[{"alias":"read","path":"/tools/read","description":"Read","input_schema":{"type":"object"},"owner_task_id":null,"binding":{"opaque":true}}],"error":null}]});
+    let agent = json!({"type":"agent.sync","agents":[{"address":"agent:demo/coder","workspace":"workspace:local/demo","creator":{"address":"workspace:local/demo:latest","task_id":"driver-fixture"},"status":"running","sandboxes":[],"sandbox":null,"model":null,"tools":[{"alias":"read","path":"/tools/read","description":"Read","input_schema":{"type":"object"},"owner_task_id":null,"binding":{"opaque":true}}],"error":null}]});
     let message: ServerMessage = serde_json::from_value(agent.clone()).unwrap();
     assert_eq!(serde_json::to_value(message).unwrap(), agent);
     let result = json!({"type":"mcl.execute.result","id":"r","success":true,"data":{"kind":"block_snapshots","value":{"timeline":{},"snapshots":[]}}});
@@ -371,10 +371,10 @@ fn public_targets_reject_internal_vm_identity_fields() {
 
 #[test]
 fn agent_resources_and_public_model_fields_are_strict_and_nullable() {
-    let mut value = json!({"type":"agent.sync","agents":[{"address":"agent:demo/coder","workspace":"workspace:local/demo","status":"running","tools":[],"sandboxes":[{"alias":"read_only","path":"/sandbox/read-only.toml"}],"sandbox":"read_only","model":{"id":"model-route","model":"model-name","provider":"openai","api_type":"responses","context_window_tokens":131072,"thinking":null,"reasoning_effort":"high"},"error":null}]});
+    let mut value = json!({"type":"agent.sync","agents":[{"address":"agent:demo/coder","workspace":"workspace:local/demo","creator":{"address":"workspace:local/demo:latest","task_id":"driver-fixture"},"status":"running","tools":[],"sandboxes":[{"alias":"read_only","path":"/sandbox/read-only.toml"}],"sandbox":"read_only","model":{"id":"model-route","model":"model-name","provider":"openai","api_type":"responses","context_window_tokens":131072,"thinking":null,"reasoning_effort":"high"},"error":null}]});
     let message: ServerMessage = serde_json::from_value(value.clone()).unwrap();
     assert_eq!(serde_json::to_value(message).unwrap(), value);
-    for field in ["sandboxes", "sandbox", "model"] {
+    for field in ["creator", "sandboxes", "sandbox", "model"] {
         let mut missing = value.clone();
         missing["agents"][0].as_object_mut().unwrap().remove(field);
         assert!(serde_json::from_value::<ServerMessage>(missing).is_err());
@@ -550,4 +550,38 @@ fn model_file_requests_and_replies_keep_content_and_do_not_accept_a_client_path(
         )
         .is_err()
     );
+}
+
+#[test]
+fn agent_creator_is_a_workspace_or_agent_address_and_a_real_task_reference() {
+    let mut raw = json!({"type":"agent.sync","agents":[{"address":"agent:demo/child:latest","workspace":"workspace:local/demo:latest","creator":{"address":"agent:demo/parent:latest","task_id":"tool:1:2:0"},"status":"running","tools":[],"sandboxes":[],"sandbox":null,"model":null,"error":null}]});
+    let message: ServerMessage = serde_json::from_value(raw.clone()).unwrap();
+    assert_eq!(serde_json::to_value(message).unwrap(), raw);
+    raw["agents"][0]["creator"] =
+        json!({"address":"workspace:local/demo:latest","task_id":"driver-task"});
+    assert!(serde_json::from_value::<ServerMessage>(raw.clone()).is_ok());
+    for creator in [
+        json!({"address":"execution:1/driver:latest","task_id":"x"}),
+        json!({"address":"agent:demo/parent:latest","task_id":""}),
+        json!({"address":"agent:demo/parent:latest","task_id":"task","instance":"internal"}),
+    ] {
+        let mut invalid = raw.clone();
+        invalid["agents"][0]["creator"] = creator;
+        assert!(serde_json::from_value::<ServerMessage>(invalid).is_err());
+    }
+}
+
+#[test]
+fn creator_cannot_be_null_or_missing() {
+    let valid = json!({"type":"agent.sync","agents":[{"address":"agent:demo/coder:latest","workspace":"workspace:local/demo:latest","creator":{"address":"workspace:local/demo:latest","task_id":"driver-task"},"status":"starting","tools":[],"sandboxes":[],"sandbox":null,"model":null,"error":null}]});
+    assert!(serde_json::from_value::<ServerMessage>(valid.clone()).is_ok());
+    let mut null = valid.clone();
+    null["agents"][0]["creator"] = Value::Null;
+    assert!(serde_json::from_value::<ServerMessage>(null).is_err());
+    let mut missing = valid;
+    missing["agents"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("creator");
+    assert!(serde_json::from_value::<ServerMessage>(missing).is_err());
 }

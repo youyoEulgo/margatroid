@@ -51,6 +51,8 @@ logical_name / validate_path / validate_target / validate_address / validate_ima
 公开：
 ```text
 AddressDto = String
+AgentCreatorDto { address: AddressDto, task_id: String }
+    行为：address仅Workspace或Agent地址，task_id为真实公开任务标识；字段严格拒绝未知值及内部execution_id替代，不从名称或路径推断创建关系。
 ModelConfigUpdateDto { content: String }--无路径参数；UTF-8最多1MiB
     行为：model.config.res成功必有content，失败省略；sync必有content/error且不带id，可选值均nullable，content为文本时error必须为null；update.result只有success/error，沿原请求id关联。
 
@@ -178,6 +180,7 @@ AgentStateDto
     行为：status严格为starting/running/error/stopping，turn通过独立消息提供，不保留旧ready/working/restarting/failed枚举。
     address: AddressDto
     workspace: AddressDto
+    creator: AgentCreatorDto--必有非空，首次公开前已从真实任务取得
     status: String
     tools: Vec<AgentToolDto>
     sandboxes: Vec<AgentSandboxDto>
@@ -238,7 +241,7 @@ AgentMessageDto：厂商无关消息枚举，各variant均有sequence:Option<u64
     Inject { sequence: Option<u64>, messages: Vec<AgentMessageDto> }
     Error { sequence: Option<u64>, message: String, request_id: Option<String> }
     行为：
-        JSON type分别为system/user/assistant/compact/tool_call/inject/error；缺省sequence不输出，存在时必须为真实持久历史正序号
+        JSON type分别为system/user/assistant/compact/tool_call/inject/error；缺省sequence不输出，存在时校验正整数形状；Block不据此校验历史存在性/内容，历史接口输出本次真实记录序号
         data数组可省略为空；reasoning和content各保存一份，禁止replay、api_format和images兼容字段
         数据库sequence/role/content/data/tool_call/payload由存储codec可逆重建本枚举；SQL payload只含剩余字段，不是wire完整消息
         inject是显式消息包装，其messages保持结构化数组；角色转换及解包不属于协议解析器

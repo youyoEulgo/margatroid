@@ -69,7 +69,7 @@ fn automatic_lua_failure_persists_and_pushes_logs_and_error_without_ready_or_ref
 function configure()return {timeout_ms=0}end
 function execute(_,context)
  if context.name=='control' then margatroid.task:return_result('ready');margatroid.task:receive();return end
- local agent=margatroid.agent:create({owner=context.workspace.address,name=context.name,config_path=context.resource_dir..'/setting.toml',ui_path=context.resource_dir..'/ui'})
+ local agent=margatroid.agent:create({name=context.name,config_path=context.resource_dir..'/setting.toml',ui_path=context.resource_dir..'/ui'})
  margatroid:log('info','starting-probe')
  margatroid:wait(agent.address)
  local text='EFFECT model_set ?'

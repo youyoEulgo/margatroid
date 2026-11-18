@@ -51,7 +51,6 @@ dependencies = [
  "prompt_resource_core",
  "sandbox_resource_core",
  "serde_json",
- "sha2 0.10.9",
  "storage_core",
  "tempfile",
  "tokio",

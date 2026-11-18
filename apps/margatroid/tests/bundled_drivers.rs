@@ -129,6 +129,10 @@ mod mailbox_compaction {
             let stopped = stop.clone();
             let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let observed_attempts = attempts.clone();
+            let child_entered = Arc::new(AtomicBool::new(false));
+            let child_release = Arc::new(AtomicBool::new(false));
+            let entered = child_entered.clone();
+            let release = child_release.clone();
             let model = std::thread::spawn(move || {
                 while !stopped.load(Ordering::Acquire) {
                     let (mut socket, _) = match listener.accept() {
@@ -160,16 +164,62 @@ mod mailbox_compaction {
                     let mut body = vec![0; length];
                     socket.read_exact(&mut body).unwrap();
                     let body: Value = serde_json::from_slice(&body).unwrap();
-                    assert!(body["messages"]
-                        .as_array()
-                        .unwrap()
-                        .iter()
-                        .any(|message| message["content"] == "old question"));
-                    if observed_attempts.fetch_add(1, Ordering::AcqRel) == 0 {
+                    let attempt = observed_attempts.fetch_add(1, Ordering::AcqRel);
+                    if attempt == 0 {
                         socket.write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}").unwrap();
                         continue;
                     }
-                    let trace="data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"manual summary\"},\"finish_reason\":null}]}\n\ndata: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+                    let messages = body["messages"].as_array().unwrap();
+                    let last = messages.last().unwrap();
+                    let is_parent = body["tools"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|tool| tool["function"]["name"] == "subagent");
+                    if last["content"] == "child failure" {
+                        socket.write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}").unwrap();
+                        continue;
+                    }
+                    let delta = if last["content"] == "spawn failing subagent" {
+                        json!({"role":"assistant","tool_calls":[{"index":0,"id":"delegate-failure","type":"function","function":{"name":"subagent","arguments":"{\"instructions\":\"child failure\"}"}}]})
+                    } else if last["content"] == "spawn subagent" {
+                        json!({"role":"assistant","tool_calls":[{"index":0,"id":"delegate-child","type":"function","function":{"name":"subagent","arguments":"{\"instructions\":\"child objective\"}"}}]})
+                    } else if last["content"] == "child objective" {
+                        assert!(!is_parent, "subdriver must not register subagent");
+                        assert!(!messages.iter().any(|message| message["role"] == "tool"
+                            && message["tool_call_id"] == "delegate-child"));
+                        assert!(!messages.iter().any(|message| message["tool_calls"]
+                            .as_array()
+                            .is_some_and(|calls| calls
+                                .iter()
+                                .any(|call| call["id"] == "delegate-child"))));
+                        let boundary = &messages[messages.len() - 2];
+                        assert_eq!(boundary["role"], "user");
+                        assert!(boundary["content"]
+                            .as_str()
+                            .unwrap()
+                            .starts_with("[inherit-boundary]"));
+                        entered.store(true, Ordering::Release);
+                        while !release.load(Ordering::Acquire) {
+                            std::thread::sleep(Duration::from_millis(1));
+                        }
+                        json!({"role":"assistant","tool_calls":[{"index":0,"id":"child-read","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"initialization-result.txt\"}"}}]})
+                    } else if !is_parent {
+                        assert_eq!(last["role"], "tool");
+                        assert_eq!(last["tool_call_id"], "child-read");
+                        json!({"role":"assistant","content":"child completed"})
+                    } else {
+                        json!({"role":"assistant","content":"manual summary"})
+                    };
+                    let reason = if delta.get("tool_calls").is_some() {
+                        "tool_calls"
+                    } else {
+                        "stop"
+                    };
+                    let trace = format!(
+                        "data: {}\n\ndata: [DONE]\n\n",
+                        json!({"choices":[{"index":0,"delta":delta,"finish_reason":reason}]})
+                    );
                     write!(socket,"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",trace.len(),trace).unwrap();
                 }
             });
@@ -180,6 +230,13 @@ mod mailbox_compaction {
                 driver.join("base.lua"),
             )
             .unwrap();
+            for metadata in ["description.md", "input.schema.json"] {
+                std::fs::copy(
+                    resources.join(format!("agent-drivers/local/{name}/latest/{metadata}")),
+                    driver.join(metadata),
+                )
+                .unwrap();
+            }
             std::fs::write(driver.join("setting.toml"),format!("sandbox=[]\n[inference]\nmodel='offline'\n[compaction]\nthreshold=0.8\nkeep_messages=2\n[initialization]{}",std::fs::read_to_string(resources.join(format!("agent-drivers/local/{name}/latest/setting.toml"))).unwrap().split_once("[initialization]").unwrap().1)).unwrap();
 
             let settings_file = driver.join("setting.toml");
@@ -436,6 +493,247 @@ mod mailbox_compaction {
             )
             .await;
             tokio::time::timeout(Duration::from_secs(10),async{loop{let context=request(&mut socket,"mcl.execute","post-mailbox-context",json!({"address":address,"command":"GET session.conversation","arguments":[]}),&mut seen).await;if context["data"]["value"].as_array().unwrap().last().unwrap()["content"]=="after-mailbox"{break;}tokio::time::sleep(Duration::from_millis(5)).await;}}).await.unwrap();
+            request(&mut socket,"mcl.execute","inherited-config",json!({"address":address,"command":"CONFIG SET ? ?","arguments":["inheritance_marker","from-parent"]}),&mut seen).await;
+            request(&mut socket,"mcl.execute","spawn-user",json!({"address":address,"command":"INJECT ? TO entry.pending[-1]","arguments":[[{"type":"user","content":"spawn subagent"}]]}),&mut seen).await;
+            request(
+                &mut socket,
+                "mcl.execute",
+                "spawn-wake",
+                json!({"address":address,"command":"EFFECT wake","arguments":[]}),
+                &mut seen,
+            )
+            .await;
+            let entered = tokio::time::timeout(Duration::from_secs(15), async {
+                while !child_entered.load(Ordering::Acquire) {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await;
+            if entered.is_err() {
+                eprintln!(
+                    "AGENTS {:?}",
+                    request(
+                        &mut socket,
+                        "agent.req",
+                        "debug-agents",
+                        json!({}),
+                        &mut seen
+                    )
+                    .await
+                );
+                eprintln!(
+                    "TASKS {:?}",
+                    request(
+                        &mut socket,
+                        "agent.task.req",
+                        "debug-tasks",
+                        json!({"address":address}),
+                        &mut seen
+                    )
+                    .await
+                );
+                eprintln!(
+                    "LOGS {:?}",
+                    request(
+                        &mut socket,
+                        "agent.log.req",
+                        "debug-logs",
+                        json!({"address":address}),
+                        &mut seen
+                    )
+                    .await
+                );
+                panic!(
+                    "subagent inference not reached; attempts={}",
+                    attempts.load(Ordering::Acquire)
+                );
+            }
+            let agents = request(
+                &mut socket,
+                "agent.req",
+                "child-agent",
+                json!({}),
+                &mut seen,
+            )
+            .await;
+            let child_agent = agents["agents"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|agent| agent["address"] != address)
+                .expect("independent child Agent")["address"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            let child_state = agents["agents"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|agent| agent["address"] == child_agent)
+                .unwrap();
+            assert_eq!(child_state["creator"]["address"], address);
+            assert!(child_state["creator"]["task_id"]
+                .as_str()
+                .unwrap()
+                .starts_with("tool:"));
+            let parent_state = agents["agents"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|agent| agent["address"] == address)
+                .unwrap();
+            assert_eq!(
+                parent_state["creator"]["address"],
+                "workspace:local/probe:latest"
+            );
+            assert!(parent_state["creator"]["task_id"]
+                .as_str()
+                .unwrap()
+                .starts_with("driver-"));
+            let child_name = child_agent
+                .rsplit('/')
+                .next()
+                .unwrap()
+                .split(':')
+                .next()
+                .unwrap();
+            let child_settings =
+                data.join(format!("workspaces/probe/agents/{child_name}/setting.toml"));
+            let child_config: Value =
+                toml::from_str(&std::fs::read_to_string(child_settings).unwrap()).unwrap();
+            assert_eq!(child_config["inheritance_marker"], "from-parent");
+            assert_eq!(child_config["inference"]["model"], "offline");
+            let history = request(
+                &mut socket,
+                "agent.history.req",
+                "child-history",
+                json!({"address":child_agent}),
+                &mut seen,
+            )
+            .await;
+            let child_history = history["records"].as_array().unwrap();
+            assert_eq!(child_history.len(), 1);
+            assert_eq!(child_history[0]["payload"]["type"], "user");
+            assert_eq!(child_history[0]["payload"]["content"], "child objective");
+            assert!(child_history[0]["sequence"].as_u64().is_some());
+            child_release.store(true, Ordering::Release);
+            let retained = tokio::time::timeout(Duration::from_secs(15), async {
+                loop {
+                    let tasks = request(
+                        &mut socket,
+                        "agent.task.req",
+                        "subdriver-output",
+                        json!({"address":address}),
+                        &mut seen,
+                    )
+                    .await;
+                    if let Some(task) = tasks["tasks"].as_array().unwrap().iter().find(|task| {
+                        task["alias"] == "subagent"
+                            && task["returned"] == true
+                            && task["output"].to_string().contains("child completed")
+                    }) {
+                        break task.clone();
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .unwrap();
+            tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    let agents = request(
+                        &mut socket,
+                        "agent.req",
+                        "child-stopped",
+                        json!({}),
+                        &mut seen,
+                    )
+                    .await;
+                    if agents["agents"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .all(|agent| agent["address"] != child_agent)
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .unwrap();
+            request(&mut socket,"mcl.execute","finish-subdriver",json!({"address":address,"command":"EFFECT tool_call ?","arguments":[[{"id":"finish-child","tool_name":"task_finish","arguments":json!({"task_id":retained["task_id"]}).to_string()}]]}),&mut seen).await;
+            assert_eq!(retained["output"], json!(["child completed"]));
+            request(&mut socket,"mcl.execute","spawn-failure-user",json!({"address":address,"command":"INJECT ? TO entry.pending[-1]","arguments":[[{"type":"user","content":"spawn failing subagent"}]]}),&mut seen).await;
+            request(
+                &mut socket,
+                "mcl.execute",
+                "spawn-failure-wake",
+                json!({"address":address,"command":"EFFECT wake","arguments":[]}),
+                &mut seen,
+            )
+            .await;
+            let failed_child = tokio::time::timeout(Duration::from_secs(15), async {
+                loop {
+                    let tasks = request(
+                        &mut socket,
+                        "agent.task.req",
+                        "failed-subdriver-output",
+                        json!({"address":address}),
+                        &mut seen,
+                    )
+                    .await;
+                    if let Some(task) = tasks["tasks"].as_array().unwrap().iter().find(|task| {
+                        task["alias"] == "subagent"
+                            && task["returned"] == true
+                            && task["task_id"] != retained["task_id"]
+                    }) {
+                        break task.clone();
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .unwrap();
+            tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    let agents = request(
+                        &mut socket,
+                        "agent.req",
+                        "failed-child-stopped",
+                        json!({}),
+                        &mut seen,
+                    )
+                    .await;
+                    if agents["agents"].as_array().unwrap().len() == 1 {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .unwrap();
+            let failed_output = request(
+                &mut socket,
+                "agent.task.req",
+                "failed-output-empty",
+                json!({"address":address}),
+                &mut seen,
+            )
+            .await;
+            let failed_task = failed_output["tasks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|task| task["task_id"] == failed_child["task_id"])
+                .unwrap();
+            let diagnostics = failed_task["output"].as_array().unwrap();
+            assert_eq!(diagnostics.len(), 1);
+            assert!(diagnostics[0]
+                .as_str()
+                .unwrap()
+                .starts_with("[subagent error] "));
+            request(&mut socket,"mcl.execute","finish-failed-subdriver",json!({"address":address,"command":"EFFECT tool_call ?","arguments":[[{"id":"finish-failed-child","tool_name":"task_finish","arguments":json!({"task_id":failed_child["task_id"]}).to_string()}]]}),&mut seen).await;
             request(
                 &mut socket,
                 "workspace.stop",
@@ -584,5 +882,83 @@ mod mailbox_compaction {
         socket.close(None).await.unwrap();
         child.0.kill().unwrap();
         child.0.wait().unwrap();
+    }
+}
+
+#[test]
+fn subdriver_inherits_balanced_prefix_without_empty_delegating_assistants() {
+    use mlua::LuaSerdeExt;
+    use serde_json::json;
+    let tool = json!({"type":"assistant","tool_calls":[{"id":"delegate","tool_name":"subagent","arguments":"{}"}],"stop_reason":"tool_calls","sequence":15});
+    let result =
+        json!({"type":"tool_call","content":"result","tool_call_id":"delegate","sequence":16});
+    let earlier = json!([{"type":"user","content":"original","sequence":12},{"type":"assistant","content":"old response","tool_calls":[],"sequence":13},{"type":"user","content":"delegate","sequence":14}]);
+    let mut cases = Vec::new();
+    for count in [0, 1, 2] {
+        let mut context = earlier.as_array().unwrap().clone();
+        let mut request = tool.clone();
+        request["tool_calls"]=json!((0..count.max(1)).map(|index|json!({"id":format!("delegate-{index}"),"tool_name":"subagent","arguments":"{}"})).collect::<Vec<_>>());
+        context.push(request);
+        for index in 0..count {
+            let mut response = result.clone();
+            response["tool_call_id"] = json!(format!("delegate-{index}"));
+            context.push(response);
+        }
+        cases.push((json!(context), earlier.clone()));
+    }
+    let mut batch = tool.clone();
+    batch["tool_calls"] = json!([{"id":"delegate","tool_name":"subagent","arguments":"{}"},{"id":"other","tool_name":"read_file","arguments":"{}"}]);
+    cases.push((json!([batch, result.clone()]), json!([])));
+    cases.push((json!([tool.clone(), result.clone()]), json!([])));
+    cases.push((json!([tool.clone()]), json!([])));
+    cases.push((json!([]), json!([])));
+    cases.push((json!([{"type":"assistant","content":""}]), json!([])));
+    cases.push((
+        json!([{"type":"assistant","content":null,"tool_calls":null}]),
+        json!([]),
+    ));
+    cases.push((
+        json!([{"type":"assistant","content":"X","stop_reason":"max_tokens","sequence":4}]),
+        json!([{"type":"assistant","content":"X","stop_reason":"completed","sequence":4}]),
+    ));
+    cases.push((json!([{"type":"assistant","reasoning":"preserved","content":""}]),json!([{"type":"assistant","reasoning":"preserved","content":"","stop_reason":"completed"}])));
+    let mut nonempty = tool.clone();
+    nonempty["content"] = json!("parent delegation text");
+    nonempty["reasoning"] = json!("parent reasoning");
+    cases.push((json!([nonempty, result]), json!([])));
+    for source in [
+        include_str!("../../../resources/agent-drivers/local/coder/latest/base.lua"),
+        include_str!("../../../resources/agent-drivers/local/reviewer/latest/base.lua"),
+    ] {
+        for (context, expected) in &cases {
+            let lua = mlua::Lua::new();
+            lua.globals()
+                .set("conversation", lua.to_value(context).unwrap())
+                .unwrap();
+            lua.load(r#"
+ctx={kind="tool",binding={parent_agent="agent:parent:latest"},resource_dir="/driver",task_id="task",arguments={instructions="delegated objective"}}
+margatroid={task={},mcl={},agent={}}
+function margatroid.agent:data_dir(address) assert(address=="agent:parent:latest") return "/parent" end
+function margatroid.task:return_result(value) assert(value.task_id=="task") end
+function margatroid.mcl:execute(address,text,args)
+ assert(address=="agent:parent:latest" and text=="GET session.conversation")
+ return {Array={Message=conversation}}
+end
+"#).exec().unwrap();
+            let prefix = source
+                .split("    local agent = margatroid.agent:create(")
+                .next()
+                .unwrap();
+            let program = format!("{prefix}\nreturn inherited\nend\nreturn execute(nil,ctx)");
+            let inherited: mlua::Value = lua.load(program).eval().unwrap();
+            let mut inherited: serde_json::Value = lua.from_value(inherited).unwrap();
+            let boundary = inherited.as_array_mut().unwrap().pop().unwrap();
+            assert_eq!(boundary["type"], "user");
+            let content = boundary["content"].as_str().unwrap();
+            assert!(content.starts_with("[inherit-boundary]"));
+            assert!(content.contains("agent:parent:latest"));
+            assert!(content.contains("subagent-task"));
+            assert_eq!(&inherited, expected, "input: {context}");
+        }
     }
 }

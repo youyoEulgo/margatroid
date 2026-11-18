@@ -73,7 +73,7 @@ fn starting_and_running_mcl_reach_real_domains_which_reject_explicit_stale_turns
         r#"
 function configure()return {timeout_ms=0}end
 function execute(_,context)
- local agent=margatroid.agent:create({owner=context.workspace.address,name=context.name,config_path=context.resource_dir..'/setting.toml',ui_path=context.resource_dir..'/ui'})
+ local agent=margatroid.agent:create({name=context.name,config_path=context.resource_dir..'/setting.toml',ui_path=context.resource_dir..'/ui'})
  margatroid:wait(agent.address)
 end
 "#,

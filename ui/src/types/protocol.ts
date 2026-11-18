@@ -72,9 +72,14 @@ export type AgentMessage = { sequence?: number } & (
   | { type: 'error'; message: string; request_id?: string }
   | { type: 'inject'; messages: AgentMessage[] }
 );
+export interface AgentCreator {
+  address: string;
+  task_id: string;
+}
 export interface AgentState {
   workspace: WorkspaceRef;
   agent: string;
+  creator?: AgentCreator | null;
   status: 'starting' | 'running' | 'error' | 'stopping';
   turn: string | null;
   sandbox: string | null;
@@ -161,6 +166,7 @@ export interface AgentModel {
 export interface AgentInfo {
   address: string;
   workspace: string;
+  creator: AgentCreator;
   status: 'starting' | 'running' | 'error' | 'stopping';
   tools: AgentTool[];
   sandboxes: AgentSandbox[];
