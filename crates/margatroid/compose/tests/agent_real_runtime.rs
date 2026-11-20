@@ -36,7 +36,7 @@ margatroid.driver:mcl("EFFECT ready")
 margatroid.driver:wait()
 "#;
 fn seed(root: &Path) {
-    let driver = root.join("agent-drivers/local/test/latest");
+    let driver = root.join("agent-drivers/margatroid/test/dev");
     std::fs::create_dir_all(&driver).unwrap();
     std::fs::write(
         driver.join("driver.toml"),
@@ -46,7 +46,7 @@ fn seed(root: &Path) {
     std::fs::write(driver.join("base.lua"), PROGRAM).unwrap();
     std::fs::write(driver.join("setting.toml"), "").unwrap();
     for directory in [
-        root.join("workspaces/demo"),
+        root.join("workspaces/margatroid/demo/dev"),
         root.join("project"),
         root.join("home"),
     ] {
@@ -120,7 +120,7 @@ impl Fixture {
                     .unwrap(),
             )
             .add_plugin(MclPlugin::new())
-            .add_plugin(AgentPlugin::new(test_agent_context()).with_resource_roots(root))
+            .add_plugin(AgentPlugin::new(test_agent_context()))
             .add_system(RuntimePlugin::UPDATE, initialize_domains);
         app.world_mut()
             .insert_resource(inference_core::ModelRoutes::new(BTreeMap::from([(
@@ -139,9 +139,9 @@ impl Fixture {
         let workspace = app.world_mut().spawn();
         app.world_mut().insert_component(
             workspace,
-            address::Address::new("workspace:test/unit").unwrap(),
+            address::Address::new("workspace:test/unit:dev").unwrap(),
         );
-        let directory = root.join("workspaces/demo");
+        let directory = root.join("workspaces/margatroid/demo/dev");
         app.world_mut().insert_component(
             workspace,
             workspace_core::Workspace::new(
@@ -160,8 +160,8 @@ impl Fixture {
             app,
             workspace,
             parameters: AgentStartParameters {
-                initial_settings_path: root.join("agent-drivers/local/test/latest/setting.toml"),
-                ui_path: root.join("agent-drivers/local/test/latest/ui"),
+                initial_settings_path: root.join("agent-drivers/margatroid/test/dev/setting.toml"),
+                ui_path: root.join("agent-drivers/margatroid/test/dev/ui"),
                 project_root: root.join("project"),
                 home_root: root.join("home"),
                 database_path: directory.join("agents/coder/state.sqlite"),
@@ -173,7 +173,7 @@ impl Fixture {
         let (sender, mut receiver) = oneshot::channel();
         self.app.world().emit_event(StartAgent {
             creator: agent_core::AgentCreator {
-                address: "workspace:local/test:latest".into(),
+                address: "workspace:margatroid/test:dev".into(),
                 task_id: "fixture-driver-task".into(),
             },
             id: "start".into(),
@@ -377,7 +377,7 @@ fn real_agent_restart_recreates_entity_and_session_and_preserves_persistent_bloc
     let external = fixture.app.world_mut().spawn();
     fixture.app.world_mut().insert_component(
         external,
-        address::Address::new("client:local/test").unwrap(),
+        address::Address::new("client:margatroid/test:dev").unwrap(),
     );
     let mut query = mcl(&fixture.app, external, agent, None, "config-query");
     assert!(matches!(
@@ -457,7 +457,11 @@ fn test_binding() -> tool_core::TaskSyncBinding {
 fn test_tasks() -> tool_core::ToolTasks {
     let mut app = core_plugin::App::new();
     let owner = app.world_mut().spawn();
-    tool_core::ToolTasks::new(owner, "agent:test/unit:latest".into(), test_binding())
+    tool_core::ToolTasks::new(
+        owner,
+        "agent:margatroid-test-dev/unit:dev".into(),
+        test_binding(),
+    )
 }
 
 fn test_agent_context() -> agent_core::AgentUpdateContext {

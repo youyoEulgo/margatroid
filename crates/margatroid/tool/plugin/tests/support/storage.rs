@@ -17,7 +17,7 @@ pub fn mount(world: &mut core_plugin::World, agent: core_plugin::Entity, root: &
         world.insert_component(
             agent,
             address::Address::new(&format!(
-                "agent:fixture/task-{}-{}",
+                "agent:fixture/task-{}-{}:dev",
                 agent.index(),
                 agent.generation()
             ))

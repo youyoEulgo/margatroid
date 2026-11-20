@@ -61,7 +61,7 @@ Address：实体对外地址，公开组件
 ```text
 resolve_file(root: &Path, address: &str) -> Result<PathBuf, AddressError>
     行为：
-        解析type:scope/name[:tag]，缺省tag为latest。
+        解析type:scope/name:tag，必须显式提供非空tag，不补齐默认值。
         按资源类型的磁盘布局解析真实入口文件，类型对应根目录由调用方提供。
         规范化root与候选路径，要求候选仍位于root内且为真实普通文件。
         返回规范绝对路径；格式错误、越界、不存在或非文件时返回错误。
@@ -79,7 +79,7 @@ ParsedAddress：解析后的地址，公开值类型
     name: String--名称
     tag: String--标签
     parse(value: &str) -> Result<Self, AddressError>
-        行为：接受type:scope/name[:tag]；类型为小写ASCII字母、数字、下划线或短横线；其余段非空且不含路径分隔符、控制字符或冒号；拒绝点及双点；缺省tag为latest。
+        行为：接受type:scope/name:tag；类型为小写ASCII字母、数字、下划线或短横线；其余段非空且不含路径分隔符、控制字符或冒号；拒绝点及双点；必须显式提供非空tag，不补齐默认值。
     impl Display for ParsedAddress
         行为：输出type:scope/name:tag。
 ```

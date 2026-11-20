@@ -102,7 +102,7 @@ fn request() -> InferenceRequest {
 fn delivery() -> StreamDelivery {
     StreamDelivery {
         id: "request".into(),
-        agent: "agent:test/agent:latest".into(),
+        agent: "agent:test/agent:dev".into(),
         turn: Some("turn".into()),
         clients: client_core::Clients::default(),
         source_alive: Arc::new(std::sync::atomic::AtomicBool::new(true)),
@@ -1664,7 +1664,7 @@ async fn chunk_frames_share_one_generation_sequence_and_use_new_identity_fields(
         let frame = frame_json(frames.recv().await.unwrap());
         assert_eq!(
             frame,
-            json!({"type":"agent.message.chunk.sync","address":"agent:test/agent:latest","turn":"turn","generation":"request","sequence":sequence,"content":content,"reasoning":reasoning})
+            json!({"type":"agent.message.chunk.sync","address":"agent:test/agent:dev","turn":"turn","generation":"request","sequence":sequence,"content":content,"reasoning":reasoning})
         );
     }
     assert!(frames.try_recv().is_err());
@@ -1692,7 +1692,7 @@ async fn full_success_contains_complete_internal_assistant_without_persisted_seq
     push_full(&mut delivery, Ok(&response));
     let full = frame_json(frames.recv().await.unwrap());
     assert_eq!(full["type"], "agent.message.full.sync");
-    assert_eq!(full["address"], "agent:test/agent:latest");
+    assert_eq!(full["address"], "agent:test/agent:dev");
     assert!(full.get("instance").is_none());
     assert_eq!(full["turn"], "turn");
     assert_eq!(full["generation"], "request");

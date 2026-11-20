@@ -11,7 +11,7 @@ pub use sync::{
 pub use components::{Agent, AgentResources};
 pub use error::{AgentError, AgentErrorKind};
 pub use events::{AgentException, AgentOperationReply, RestartAgent, StartAgent, StopAgent};
-pub use types::{AgentResourceRoot, AgentStartParameters, AgentState};
+pub use types::{AgentStartParameters, AgentState};
 
 use core_plugin::{Entity, World};
 use std::sync::atomic::{AtomicU64, Ordering};

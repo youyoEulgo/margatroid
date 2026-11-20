@@ -21,7 +21,7 @@ impl ParsedAddress {
         }
         let (name, tag) = name_and_tag
             .split_once(':')
-            .unwrap_or((name_and_tag, "latest"));
+            .ok_or(AddressError::InvalidFormat)?;
         if kind.is_empty()
             || !kind.bytes().all(|byte| {
                 byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'_' | b'-')

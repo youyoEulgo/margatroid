@@ -215,7 +215,7 @@ async fn http_json_sse_headers_and_concurrent_out_of_order() {
     )
     .await;
     host.send(
-        json!({"id":"b","operation":"call","tool":"echo","arguments":{"reverse":true,"text":"b"}}),
+        json!({"id":"b","operation":"call","tool":"echo","arguments":{"reverse":true,"release_first":true,"text":"b"}}),
     )
     .await;
     let second = host.receive().await;

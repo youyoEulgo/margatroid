@@ -30,7 +30,7 @@ valid_request_id(id: &str) -> bool
     行为：检查非空白、无控制字符及512字节上限。
 
 validate_server_value(value: &serde_json::Value) -> Result<(), ProtocolError>
-    行为：检查45种严格wire type、回执成功/失败互斥、查询载荷、分页游标presence、nullable字段、记录顺序及完整消息序号关联。
+    行为：检查50种严格wire type、回执成功/失败互斥、查询载荷、分页游标presence、nullable字段、记录顺序及完整消息序号关联。
         诊断details/context按日志报告处理，不按内部AgentMessage递归解释原错误快照。
         agent.ui.res成功必须出现可空ui，失败省略ui并提供error；agent.ui.sync始终出现ui及error，error非空时ui为null。
 
@@ -61,15 +61,15 @@ ClientMessage：20种入站枚举，每个variant均为type、id和message信封
     ModelConfigReq { id: String, message: EmptyDto }
     ModelConfigUpdate { id: String, message: ModelConfigUpdateDto }
     WorkspaceReq { id: String, message: EmptyDto }
-    WorkspaceStart { id: String, message: WorkspacePathDto }
-    WorkspaceStop { id: String, message: WorkspacePathDto }
-    WorkspaceRestart { id: String, message: WorkspacePathDto }
-    WorkspaceReload { id: String, message: EmptyDto }
+    WorkspaceStart { id: String, message: WorkspaceTargetDto }
+    WorkspaceStop { id: String, message: WorkspaceTargetDto }
+    WorkspaceRestart { id: String, message: WorkspaceTargetDto }
+    WorkspaceCreate { id:String,message:WorkspaceWriteDto }
+    WorkspaceUpdate { id:String,message:WorkspaceWriteDto }
+    WorkspaceRename { id:String,message:WorkspaceRenameDto }
+    WorkspaceDelete { id:String,message:WorkspaceTargetDto }
     AgentReq { id: String, message: EmptyDto }
     AgentUiReq { id: String, message: AgentTargetDto }
-    AgentStart { id: String, message: AgentStartDto }
-    AgentStop { id: String, message: AgentTargetDto }
-    AgentRestart { id: String, message: AgentTargetDto }
     AgentTurnReq { id: String, message: AgentTargetDto }
     AgentTurnAbort { id: String, message: AgentTurnAbortDto }
     AgentTaskReq { id: String, message: AgentTargetDto }
@@ -88,14 +88,14 @@ ServerMessage：30种出站枚举，type之外的字段位于顶层，不包mess
     WorkspaceStartResult { id: String, success: bool, error: Option<ProtocolErrorDto> }
     WorkspaceStopResult { id: String, success: bool, error: Option<ProtocolErrorDto> }
     WorkspaceRestartResult { id: String, success: bool, error: Option<ProtocolErrorDto> }
-    WorkspaceReloadResult { id: String, success: bool, error: Option<ProtocolErrorDto> }
+    WorkspaceCreateResult { id:String,success:bool,error:Option<ProtocolErrorDto> }
+    WorkspaceUpdateResult { id:String,success:bool,error:Option<ProtocolErrorDto> }
+    WorkspaceRenameResult { id:String,success:bool,error:Option<ProtocolErrorDto> }
+    WorkspaceDeleteResult { id:String,success:bool,error:Option<ProtocolErrorDto> }
     AgentRes { id: String, success: bool, agents: Option<Vec<AgentStateDto>>, error: Option<ProtocolErrorDto> }
     AgentSync { agents: Vec<AgentStateDto> }
     AgentUiRes { id: String, success: bool, address: AddressDto, ui: Option<AgentUiBundleDto>, error: Option<ProtocolErrorDto> }
     AgentUiSync { address: AddressDto, ui: Option<AgentUiBundleDto>, error: Option<ProtocolErrorDto> }
-    AgentStartResult { id: String, success: bool, error: Option<ProtocolErrorDto> }
-    AgentStopResult { id: String, success: bool, error: Option<ProtocolErrorDto> }
-    AgentRestartResult { id: String, success: bool, error: Option<ProtocolErrorDto> }
     AgentTurnRes { id: String, success: bool, state: Option<AgentTurnStateDto>, error: Option<ProtocolErrorDto> }
     AgentTurnSync { address: AddressDto, turn: Option<String> }
     AgentTurnAbortResult { id: String, success: bool, error: Option<ProtocolErrorDto> }
@@ -135,11 +135,14 @@ RegisterConnectionDto
 ClientInfoDto
     address: AddressDto
     client_type: String
-WorkspacePathDto
-    path: String
-AgentStartDto
-    workspace: AddressDto
-    name: String
+WorkspaceTargetDto
+    address: AddressDto--kind=workspace；生命周期/删除都不接收path
+WorkspaceWriteDto
+    address: AddressDto
+    definition: WorkspaceDefinitionDto--完整替换；绝对project_root和成员home_root
+WorkspaceRenameDto
+    address: AddressDto
+    new_address: AddressDto--目标必须不存在，不接受覆盖/合并
 AgentTargetDto
     address: AddressDto
 AgentTurnAbortDto
@@ -168,7 +171,6 @@ WorkspaceInfoDto
     address: Option<AddressDto>
     error: Option<ProtocolErrorDto>
 WorkspaceDefinitionDto
-    name: String
     project_root: String
     agents: Vec<WorkspaceAgentDefinitionDto>
 WorkspaceAgentDefinitionDto

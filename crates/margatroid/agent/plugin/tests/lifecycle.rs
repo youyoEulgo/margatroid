@@ -199,9 +199,9 @@ fn wait(
     }
 }
 fn driver(root: &Path, name: &str, program: &str, settings: &str) {
-    let directory = root.join("agent-drivers/local").join(name).join("latest");
+    let directory = root.join("agent-drivers/margatroid").join(name).join("dev");
     std::fs::create_dir_all(&directory).unwrap();
-    std::fs::write(directory.join("driver.toml"),"schema_version=1\ndependencies=['tool:local/bash:latest','prompt:local/system:latest']\n[inference]\nmodel='test-model'\ntemperature=0.5\nmax_output_tokens=1024\n").unwrap();
+    std::fs::write(directory.join("driver.toml"),"schema_version=1\ndependencies=['tool:margatroid/bash:dev','prompt:margatroid/system:dev']\n[inference]\nmodel='test-model'\ntemperature=0.5\nmax_output_tokens=1024\n").unwrap();
     std::fs::write(directory.join("base.lua"), program).unwrap();
     std::fs::write(directory.join("setting.toml"), settings).unwrap();
 }
@@ -243,7 +243,7 @@ impl Fixture {
             .add_plugin(ClosurePlugin)
             .add_closure_system(RuntimePlugin::UPDATE)
             .add_plugin(AsyncRuntimePlugin)
-            .add_plugin(AgentPlugin::new(test_agent_context()).with_resource_roots(root.path()))
+            .add_plugin(AgentPlugin::new(test_agent_context()))
             .add_system(RuntimePlugin::UPDATE, fake_domains);
         app.world_mut().insert_resource(FakeDomains::default());
         app.world_mut()
@@ -260,7 +260,7 @@ impl Fixture {
                     reasoning_effort: Some("medium".into()),
                 },
             )])));
-        let directory = root.path().join("workspaces/demo");
+        let directory = root.path().join("workspaces/margatroid/demo/dev");
         std::fs::create_dir_all(&directory).unwrap();
         let workspace = app.world_mut().spawn();
         app.world_mut().insert_component(
@@ -275,14 +275,18 @@ impl Fixture {
                 crate::test_workspace_context(),
             ),
         );
+        app.world_mut().insert_component(
+            workspace,
+            address::Address::new("workspace:margatroid/demo:dev").unwrap(),
+        );
         app.world_mut()
             .insert_component(workspace, spawn_workspace_executor().unwrap());
         let home = directory.join("agents/coder");
         let parameters = AgentStartParameters {
             initial_settings_path: root
                 .path()
-                .join("agent-drivers/local/first/latest/setting.toml"),
-            ui_path: root.path().join("agent-drivers/local/first/latest/ui"),
+                .join("agent-drivers/margatroid/first/dev/setting.toml"),
+            ui_path: root.path().join("agent-drivers/margatroid/first/dev/ui"),
             project_root: root.path().join("project"),
             home_root: root.path().join("home"),
             database_path: home.join("state.sqlite"),
@@ -299,7 +303,7 @@ impl Fixture {
         let (sender, receiver) = oneshot::channel();
         self.app.world().emit_event(StartAgent {
             creator: agent_core::AgentCreator {
-                address: "workspace:local/test:latest".into(),
+                address: "workspace:margatroid/test:dev".into(),
                 task_id: "fixture-driver-task".into(),
             },
             id: id.into(),
@@ -637,11 +641,11 @@ fn restart_creates_new_entity_and_preserves_database_settings() {
     parameters.initial_settings_path = fixture
         .root
         .path()
-        .join("agent-drivers/local/second/latest/setting.toml");
+        .join("agent-drivers/margatroid/second/dev/setting.toml");
     parameters.ui_path = fixture
         .root
         .path()
-        .join("agent-drivers/local/second/latest/ui");
+        .join("agent-drivers/margatroid/second/dev/ui");
     let mut reply = fixture.request_restart("restart", parameters);
     let previous = agent;
     let agent = wait(&mut fixture.app, &mut reply).unwrap();
@@ -871,7 +875,7 @@ fn missing_initial_config_fails_without_creating_a_vm_and_confirmed_cleanup_remo
     let path = fixture
         .root
         .path()
-        .join("agent-drivers/local/first/latest/setting.toml");
+        .join("agent-drivers/margatroid/first/dev/setting.toml");
     std::fs::remove_file(path).unwrap();
     let mut reply = fixture.request_start("missing");
     assert_eq!(
@@ -964,7 +968,7 @@ fn test_binding() -> tool_core::TaskSyncBinding {
 fn test_tasks() -> tool_core::ToolTasks {
     let mut app = core_plugin::App::new();
     let owner = app.world_mut().spawn();
-    tool_core::ToolTasks::new(owner, "agent:test/unit:latest".into(), test_binding())
+    tool_core::ToolTasks::new(owner, "agent:test/unit:dev".into(), test_binding())
 }
 
 fn test_agent_context() -> agent_core::AgentUpdateContext {

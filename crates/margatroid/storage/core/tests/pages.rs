@@ -13,7 +13,7 @@ fn append_mcl(storage: &AgentStorage) {
         storage,
         StorageOperation::AppendHistory {
             records: vec![HistoryRecord {
-                source: Some("client:local/test:latest".into()),
+                source: Some("client:margatroid/test:dev".into()),
                 turn: None,
                 kind: "mcl".into(),
                 content: "GET x".into(),
@@ -203,7 +203,7 @@ fn record_change_watch_notifies_only_after_new_records_commit() {
         StorageOperation::AppendHistory {
             records: vec![
                 HistoryRecord {
-                    source: Some("client:local/test".into()),
+                    source: Some("client:margatroid/test:dev".into()),
                     turn: None,
                     kind: "mcl".into(),
                     content: "rolled-back".into(),

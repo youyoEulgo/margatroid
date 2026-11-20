@@ -54,7 +54,6 @@ pub fn update_workspace(
         }
         WorkspaceChange::Definition(value) => {
             let changed = workspace.data.definition.as_ref() != Some(&value);
-            workspace.data.name = value.name.clone();
             workspace.data.project_root = value.project_root.clone();
             workspace.data.definition = Some(value);
             changed

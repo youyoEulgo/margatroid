@@ -246,11 +246,11 @@ fn workspace_restarts_keep_block_files_persistent_context_and_history_without_te
     );
     let project = root.path().join("project");
     std::fs::create_dir(&project).unwrap();
-    let directory = root.path().join("workspaces/four-table");
+    let directory = root.path().join("workspaces/margatroid/four-table/dev");
     std::fs::create_dir_all(&directory).unwrap();
     let definition = directory.join("workspace.yaml");
     std::fs::write(&definition, format!(
-        "name: four-table\nproject_root: {}\nmembers:\n  - name: coder\n    driver: driver:local/coder:latest\n    home_root: {}\n",
+        "project_root: {}\nmembers:\n  - name: coder\n    driver: driver:margatroid/coder:dev\n    home_root: {}\n",
         project.display(), root.path().display())).unwrap();
     std::fs::write(
         root.path().join("config.toml"),
@@ -260,7 +260,7 @@ fn workspace_restarts_keep_block_files_persistent_context_and_history_without_te
     let driver_settings = agent_driver_core::read_initial_settings(
         &root
             .path()
-            .join("agent-drivers/local/coder/latest/setting.toml"),
+            .join("agent-drivers/margatroid/coder/dev/setting.toml"),
         agent_driver_core::AgentDriverReadLimits::default().settings_bytes,
     )
     .unwrap();

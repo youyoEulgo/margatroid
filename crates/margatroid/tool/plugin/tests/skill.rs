@@ -41,10 +41,10 @@ mod linux {
     impl Fixture {
         fn new() -> Self {
             let root = tempfile::tempdir().unwrap();
-            let resource = root.path().join("skill-register/latest");
+            let resource = root.path().join("skill-register/dev");
             std::fs::create_dir_all(&resource).unwrap();
             let bundled = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("../../../../resources/tools/local/skill-register/latest");
+                .join("../../../../resources/tools/margatroid/skill-register/dev");
             for entry in std::fs::read_dir(&bundled).unwrap() {
                 let entry = entry.unwrap();
                 let name = entry.file_name();
@@ -87,7 +87,7 @@ mod linux {
             let workspace = app.world_mut().spawn();
             app.world_mut().insert_component(
                 workspace,
-                address::Address::new("workspace:test/unit").unwrap(),
+                address::Address::new("workspace:test/unit:dev").unwrap(),
             );
             app.world_mut().insert_component(
                 workspace,

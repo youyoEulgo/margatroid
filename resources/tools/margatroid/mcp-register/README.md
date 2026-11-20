@@ -1,6 +1,6 @@
 # MCP 注册工具
 
-本资源的 [Lua 入口](./latest/main.lua) 使用当前命名空间 API： `margatroid.task` 下的任务方法、`margatroid.tools:register(definitions)`、`margatroid.process:start(program, args)`、`margatroid:wait_any` 与 `margatroid.data:encode` / `decode`（JSON 格式），空值使用 `margatroid.data.null`。参数取自 `margatroid.context.arguments`；MCP 连接、初始化、版本协商和传输仍由独立应用 `apps/mcp-client` 处理。
+本资源的 [Lua 入口](./dev/main.lua) 使用当前命名空间 API： `margatroid.task` 下的任务方法、`margatroid.tools:register(definitions)`、`margatroid.process:start(program, args)`、`margatroid:wait_any` 与 `margatroid.data:encode` / `decode`（JSON 格式），空值使用 `margatroid.data.null`。参数取自 `margatroid.context.arguments`；MCP 连接、初始化、版本协商和传输仍由独立应用 `apps/mcp-client` 处理。
 
 运行前须独立编译该应用，并将可执行文件放到 `latest/bin/mcp-client`。资源不会下载、编译或安装依赖；网络、进程及文件访问沿用宿主沙箱。`context.resource_dir` 必须指向 `latest`，Lua 用绝对资源路径和空 argv 调用 `margatroid.process:start(context.resource_dir .. "/bin/mcp-client", {})`，不使用 shell 或 PTY。
 

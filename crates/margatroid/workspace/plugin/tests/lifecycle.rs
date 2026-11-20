@@ -17,7 +17,7 @@ use workspace_plugin::WorkspacePlugin;
 fn legacy_agents_map_starts_with_original_state_paths_and_ignores_hidden_backups() {
     let root = tempfile::tempdir().unwrap();
     let path = file(root.path(), "demo");
-    let source = "name: demo\nproject_root: /projects/demo\nagents:\n  coder:\n    driver: local/coder:latest\n  reviewer:\n    driver: local/reviewer:latest\n";
+    let source = "project_root: /projects/demo\nagents:\n  coder:\n    driver: margatroid/coder:dev\n  reviewer:\n    driver: margatroid/reviewer:dev\n";
     std::fs::write(&path, source).unwrap();
     for hidden in [".operations", ".trash", ".backup"] {
         let directory = root.path().join(hidden);
@@ -38,7 +38,7 @@ fn legacy_agents_map_starts_with_original_state_paths_and_ignores_hidden_backups
     assert!(starts[0]
         .1
         .initial_settings_path
-        .ends_with("local/coder/latest/setting.toml"));
+        .ends_with("margatroid/coder/dev/setting.toml"));
     assert_eq!(starts[0].1.database_path, database);
     assert_eq!(
         starts[0].1.settings_path,
@@ -72,13 +72,14 @@ fn legacy_file_is_read_fresh_and_mutually_exclusive_forms_never_start_from_cache
     let path = file(root.path(), "demo");
     std::fs::write(
         &path,
-        "name: demo\nproject_root: /project\nagents: {coder: {driver: local/coder:latest}}\n",
+        "project_root: /project\nagents: {coder: {driver: margatroid/coder:dev}}\n",
     )
     .unwrap();
     let mut app = app(WorkspacePlugin::open(root.path())
         .unwrap()
         .with_program_root(root.path().join("agent-drivers")));
-    let invalid = "name: demo\nproject_root: /project\nagents: {coder: {driver: local/coder:latest}}\nmembers: []\n";
+    let invalid =
+        "project_root: /project\nagents: {coder: {driver: margatroid/coder:dev}}\nmembers: []\n";
     std::fs::write(&path, invalid).unwrap();
     app.world().emit_event(StartWorkspace {
         id: "changed".into(),
@@ -104,7 +105,7 @@ fn legacy_file_is_read_fresh_and_mutually_exclusive_forms_never_start_from_cache
             .unwrap()
             .members[0]
             .driver,
-        "driver:local/coder:latest"
+        "driver:margatroid/coder:dev"
     );
     assert_eq!(std::fs::read_to_string(path).unwrap(), invalid);
 }
@@ -261,19 +262,18 @@ fn wait(app: &mut App, id: &str) -> Result<WorkspaceOperationOutput, WorkspaceEr
     }
 }
 fn file(root: &Path, name: &str) -> PathBuf {
-    let directory = root.join(name);
+    let directory = root.join("margatroid").join(name).join("dev");
     std::fs::create_dir_all(&directory).unwrap();
     directory.join("workspace.yaml")
 }
-fn write(path: &Path, name: &str, members: &[&str], project: &str) {
+fn write(path: &Path, _name: &str, members: &[&str], project: &str) {
     let definition = WorkspaceDefinition {
-        name: name.into(),
         project_root: project.into(),
         members: members
             .iter()
             .map(|name| WorkspaceMemberDefinition {
                 name: (*name).into(),
-                driver: format!("drivers/{name}"),
+                driver: format!("drivers/{name}:dev"),
                 home_root: format!("home/{name}").into(),
             })
             .collect(),
@@ -286,9 +286,8 @@ fn write(path: &Path, name: &str, members: &[&str], project: &str) {
         };
         let parsed = address::ParsedAddress::parse(&locator).unwrap();
         let directory = path
-            .parent()
-            .unwrap()
-            .parent()
+            .ancestors()
+            .nth(4)
             .unwrap()
             .join("agent-drivers")
             .join(parsed.scope)
@@ -354,7 +353,7 @@ fn empty_workspace_creates_address_and_real_executor_then_stops() {
             .get_component::<Address>(output.workspace)
             .unwrap()
             .as_str(),
-        "workspace:local/empty:latest"
+        "workspace:margatroid/empty:dev"
     );
     let close = app
         .world()
@@ -396,9 +395,12 @@ fn start_uses_fresh_file_updates_shared_cache_and_preserves_existing_state_paths
             .state,
         WorkspaceState::Error
     );
-    assert_eq!(definitions.get(&path).unwrap().name, "fresh");
+    assert_eq!(
+        definitions.get(&path).unwrap().project_root,
+        path.parent().unwrap().join("new-project")
+    );
     let component = app.world().get_component::<Workspace>(workspace).unwrap();
-    assert_eq!(component.name, "fresh");
+    assert_eq!(component.name, "demo");
     assert_eq!(component.agents.len(), 1);
     let starts = &app.world().get_resource::<FakeAgents>().unwrap().starts;
     assert_eq!(starts.len(), 2);
@@ -448,8 +450,8 @@ fn unreadable_fresh_definition_never_starts_from_display_cache() {
             .unwrap()
             .get(&path)
             .unwrap()
-            .name,
-        "cached"
+            .project_root,
+        path.parent().unwrap().join("project")
     );
 }
 #[test]
@@ -533,8 +535,8 @@ fn restart_invalid_file_stops_old_runtime_and_reports_new_start_error() {
             .unwrap()
             .get(&path)
             .unwrap()
-            .name,
-        "old"
+            .project_root,
+        path.parent().unwrap().join("project")
     );
     assert_eq!(app.world().get_resource::<FakeAgents>().unwrap().stops, 1);
 }
@@ -756,7 +758,7 @@ fn workspace_start_reloads_all_sources_and_rejects_unrelated_invalid_definition(
         .unwrap()
         .with_program_root(root.path().join("agent-drivers")));
     write(&selected, "fresh-selected", &[], "project");
-    write(&other, "fresh-other", &[], "project");
+    write(&other, "fresh-other", &[], "fresh-project");
     let output = start(&mut app, &selected, "full-reload");
     assert_eq!(
         app.world()
@@ -764,8 +766,8 @@ fn workspace_start_reloads_all_sources_and_rejects_unrelated_invalid_definition(
             .unwrap()
             .get(&other)
             .unwrap()
-            .name,
-        "fresh-other"
+            .project_root,
+        other.parent().unwrap().join("fresh-project")
     );
     stop(&mut app, output.workspace, "stop");
     std::fs::write(&other, "broken: [").unwrap();
@@ -785,8 +787,8 @@ fn workspace_start_reloads_all_sources_and_rejects_unrelated_invalid_definition(
             .unwrap()
             .get(&other)
             .unwrap()
-            .name,
-        "fresh-other"
+            .project_root,
+        other.parent().unwrap().join("fresh-project")
     );
 }
 
@@ -822,8 +824,8 @@ fn removed_definition_remains_on_running_component_and_only_stop_succeeds() {
             .definition
             .as_ref()
             .unwrap()
-            .name,
-        "retained"
+            .project_root,
+        path.parent().unwrap().join("project")
     );
     assert_eq!(path.canonicalize().unwrap(), path);
     std::fs::remove_file(&path).unwrap();
@@ -852,7 +854,11 @@ fn test_binding() -> tool_core::TaskSyncBinding {
 fn test_tasks() -> tool_core::ToolTasks {
     let mut app = core_plugin::App::new();
     let owner = app.world_mut().spawn();
-    tool_core::ToolTasks::new(owner, "agent:test/unit:latest".into(), test_binding())
+    tool_core::ToolTasks::new(
+        owner,
+        "agent:margatroid-test-dev/unit:dev".into(),
+        test_binding(),
+    )
 }
 
 fn test_agent_context() -> agent_core::AgentUpdateContext {

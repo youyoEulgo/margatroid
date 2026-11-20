@@ -1,0 +1,35 @@
+sandbox = ["read_only"]
+
+[compaction]
+threshold = 0.8
+keep_messages = 16
+
+[inference]
+model = "openrouter/deepseek-v4.1-flash"
+temperature = 0.1
+top_p = 0.9
+
+[initialization]
+# Run defaults first, then user-defined commands.
+default = [
+    { command = "IMPORT TOOL tool:margatroid/skill-register:dev AS skill_register", arguments = [] },
+    { command = "IMPORT TOOL tool:margatroid/mcp-register:dev AS mcp_register", arguments = [] },
+    { command = "IMPORT MESSAGE prompt:margatroid/reviewer-soul:dev AS soul", arguments = [] },
+    { command = "IMPORT MESSAGE prompt:margatroid/compact:dev AS compact", arguments = [] },
+    { command = "IMPORT TOOL tool:margatroid/list-directory:dev AS list_dir", arguments = [] },
+    { command = "IMPORT TOOL tool:margatroid/read-file:dev AS read_file", arguments = [] },
+    { command = "IMPORT TOOL tool:margatroid/read-image:dev AS read_image", arguments = [] },
+    { command = "IMPORT TOOL tool:margatroid/grep:dev AS grep", arguments = [] },
+    { command = "IMPORT TOOL tool:margatroid/glob:dev AS glob", arguments = [] },
+    { command = "IMPORT TOOL tool:margatroid/task-read:dev AS task_read", arguments = [] },
+    { command = "IMPORT TOOL tool:margatroid/task-send:dev AS task_send", arguments = [] },
+    { command = "IMPORT TOOL tool:margatroid/task-finish:dev AS task_finish", arguments = [] },
+    { command = "IMPORT SANDBOX sandbox:margatroid/workspace-write:dev AS workspace_write", arguments = [] },
+    { command = "IMPORT SANDBOX sandbox:margatroid/read-only:dev AS read_only", arguments = [] },
+    { command = "CREATE TEMP BLOCK msg (instructions, compact_prompt, compact_context)", arguments = [] },
+    { command = "CREATE TEMP BLOCK entry (pending)", arguments = [] },
+    { command = "CREATE BLOCK session (conversation)", arguments = [] },
+    { command = "INJECT soul TO msg.instructions", arguments = [] },
+    { command = "INJECT compact TO msg.compact_prompt", arguments = [] },
+]
+custom = []

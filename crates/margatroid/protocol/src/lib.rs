@@ -56,20 +56,35 @@ pub fn parse_client_message(text: &str) -> Result<ClientMessage, ProtocolError> 
         }
         ClientMessage::ModelConfigReq { .. }
         | ClientMessage::WorkspaceReq { .. }
-        | ClientMessage::WorkspaceReload { .. }
         | ClientMessage::AgentReq { .. } => {}
-        ClientMessage::WorkspaceStart { message, .. }
-        | ClientMessage::WorkspaceStop { message, .. }
-        | ClientMessage::WorkspaceRestart { message, .. } => validate_path(&message.path)?,
-        ClientMessage::AgentStart { message, .. } => {
-            validate_address(&message.workspace, "workspace")?;
-            if !logical_name(&message.name, 256) {
-                return Err(invalid("invalid Agent member name"));
+        ClientMessage::WorkspaceCreate { message, .. }
+        | ClientMessage::WorkspaceUpdate { message, .. } => {
+            validate_address(&message.address, "workspace")?;
+            if message.definition.agents.len() > 1024 {
+                return Err(invalid("invalid Workspace definition"));
+            }
+            validate_path(&message.definition.project_root)?;
+            for member in &message.definition.agents {
+                if member.name.trim().is_empty() {
+                    return Err(invalid("invalid member name"));
+                }
+                validate_address(&member.driver, "driver")?;
+                validate_path(&member.home_root)?;
             }
         }
-        ClientMessage::AgentStop { message, .. }
-        | ClientMessage::AgentRestart { message, .. }
-        | ClientMessage::AgentTurnReq { message, .. }
+        ClientMessage::WorkspaceRename { message, .. } => {
+            validate_address(&message.address, "workspace")?;
+            validate_address(&message.new_address, "workspace")?;
+        }
+        ClientMessage::WorkspaceDelete { message, .. } => {
+            validate_address(&message.address, "workspace")?
+        }
+        ClientMessage::WorkspaceStart { message, .. }
+        | ClientMessage::WorkspaceStop { message, .. }
+        | ClientMessage::WorkspaceRestart { message, .. } => {
+            validate_address(&message.address, "workspace")?
+        }
+        ClientMessage::AgentTurnReq { message, .. }
         | ClientMessage::AgentTaskReq { message, .. }
         | ClientMessage::AgentUiReq { message, .. } => validate_target(&message.address)?,
         ClientMessage::AgentTurnAbort { message, .. } => {
@@ -166,7 +181,7 @@ fn validate_address(value: &str, expected: &str) -> Result<(), ProtocolError> {
         .ok_or_else(|| invalid("invalid address format"))?;
     let (name, tag) = remainder
         .split_once(':')
-        .map_or((remainder, None), |(name, tag)| (name, Some(tag)));
+        .ok_or_else(|| invalid("address requires an explicit tag"))?;
     let valid = |part: &str| {
         !part.is_empty()
             && !matches!(part, "." | "..")
@@ -174,7 +189,7 @@ fn validate_address(value: &str, expected: &str) -> Result<(), ProtocolError> {
                 .chars()
                 .any(|character| character.is_control() || matches!(character, '/' | '\\' | ':'))
     };
-    if !valid(scope) || !valid(name) || tag.is_some_and(|tag| !valid(tag)) {
+    if !valid(scope) || !valid(name) || !valid(tag) {
         return Err(invalid("invalid address segment"));
     }
     Ok(())
@@ -307,12 +322,12 @@ pub(crate) fn validate_server_value(value: &Value) -> Result<(), ProtocolError> 
                 | "workspace.start.result"
                 | "workspace.stop.result"
                 | "workspace.restart.result"
-                | "workspace.reload.result"
+                | "workspace.create.result"
+                | "workspace.update.result"
+                | "workspace.rename.result"
+                | "workspace.delete.result"
                 | "agent.res"
                 | "agent.ui.res"
-                | "agent.start.result"
-                | "agent.stop.result"
-                | "agent.restart.result"
                 | "agent.turn.res"
                 | "agent.turn.abort.result"
                 | "agent.task.res"

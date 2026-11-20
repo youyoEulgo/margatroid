@@ -18,7 +18,8 @@ export interface AgentDefinition {
   home_root: string;
 }
 export interface WorkspaceDefinition {
-  name: string;
+  /** Optional legacy display name; new definitions derive it from the address. */
+  name?: string;
   project_root: string;
   agents: AgentDefinition[];
 }
@@ -234,18 +235,27 @@ export type MclData =
 export type ClientMessage =
   | { type: 'connection.register'; id: string; message: { client_type: string; name?: string } }
   | {
-      type: 'workspace.req' | 'agent.req' | 'workspace.reload';
+      type: 'workspace.req' | 'agent.req';
       id: string;
       message: Record<string, never>;
     }
   | {
-      type: 'workspace.start' | 'workspace.restart' | 'workspace.stop';
+      type: 'workspace.start' | 'workspace.restart' | 'workspace.stop' | 'workspace.delete';
       id: string;
-      message: { path: string };
+      message: { address: string };
     }
-  | { type: 'agent.start'; id: string; message: { workspace: string; name: string } }
   | {
-      type: 'agent.stop' | 'agent.restart' | 'agent.turn.req' | 'agent.task.req';
+      type: 'workspace.create' | 'workspace.update';
+      id: string;
+      message: { address: string; definition: WorkspaceDefinition };
+    }
+  | {
+      type: 'workspace.rename';
+      id: string;
+      message: { address: string; new_address: string };
+    }
+  | {
+      type: 'agent.turn.req' | 'agent.task.req';
       id: string;
       message: AgentTarget;
     }
@@ -290,10 +300,10 @@ export type ServerMessage =
         | 'workspace.start.result'
         | 'workspace.stop.result'
         | 'workspace.restart.result'
-        | 'workspace.reload.result'
-        | 'agent.start.result'
-        | 'agent.stop.result'
-        | 'agent.restart.result'
+        | 'workspace.create.result'
+        | 'workspace.update.result'
+        | 'workspace.rename.result'
+        | 'workspace.delete.result'
         | 'agent.turn.abort.result';
     } & Receipt)
   | ({ type: 'agent.turn.res'; id: string } & ({ success: true; state: TurnState } | Failure))
@@ -356,7 +366,7 @@ const target = (v: Record<string, unknown>): boolean => string(v.address);
 const errorOrNull = (v: unknown): boolean => v === null || protocolError(v);
 const definition = (v: unknown): boolean =>
   isRecord(v) &&
-  string(v.name) &&
+  (v.name === undefined || string(v.name)) &&
   string(v.project_root) &&
   Array.isArray(v.agents) &&
   v.agents.every((a) => isRecord(a) && string(a.name) && string(a.driver) && string(a.home_root));
@@ -393,6 +403,9 @@ const agentInfo = (v: unknown): boolean =>
   isRecord(v) &&
   target(v) &&
   string(v.workspace) &&
+  isRecord(v.creator) &&
+  target(v.creator) &&
+  string(v.creator.task_id) &&
   ['starting', 'running', 'error', 'stopping'].includes(String(v.status)) &&
   errorOrNull(v.error) &&
   Array.isArray(v.tools) &&
@@ -592,10 +605,10 @@ export function parseServerMessage(raw: string): ServerMessage | null {
       case 'workspace.start.result':
       case 'workspace.stop.result':
       case 'workspace.restart.result':
-      case 'workspace.reload.result':
-      case 'agent.start.result':
-      case 'agent.stop.result':
-      case 'agent.restart.result':
+      case 'workspace.create.result':
+      case 'workspace.update.result':
+      case 'workspace.rename.result':
+      case 'workspace.delete.result':
       case 'agent.turn.abort.result':
         valid = reply;
         break;

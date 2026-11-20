@@ -52,21 +52,17 @@ asset_handler(uri: OriginalUri) -> Future<Output = Response>
     行为：从原请求URI取得完整静态资源路径，保留assets/前缀，供明确静态路由与fallback共用；仅查询嵌入资源，设置Content-Type，未命中返回404，不自行打开Workspace文件。
 ```
 
-前端，TypeScript伪代码（resolve_workspace_resource为待接入目标，其余按现有界面职责）：
+前端，TypeScript实际接口（ui/src/lib/workspaceUrl.ts及stores/workbench.ts）：
 ```text
-resolve_workspace_resource(source: string, workspace_address: string, backend_endpoint: string, document_path: Option<string>) -> Result<string, ResourcePathError>
-    行为：从当前消息所属Workspace取完整Address，不用异步回调执行时的新选择覆盖消息原归属；后端origin来自实际连接endpoint，ws/wss分别转换http/https。
-        普通消息中的./foo及foo以Workspace工作目录为基准；渲染已知工作目录内Markdown文件时，以明确document_path的父目录为基准；未知文件来源不猜主机绝对路径。
-        根URL为origin + "/" + encodeURIComponent(workspace_address) + "/"；相对路径按URL规则解析，保留查询和fragment，文件路径段各自编码，验证最终URL仍在同一Workspace根下。
-        合法的子目录../可在前端归一化，但归一化结果不能越过Workspace根；后端直接收到的.及..段一律拒绝；不得仅改全页base标签影响平台JS/CSS或Driver自身资源。
-        data:和明确http(s):保持原目标；//、file:、主机绝对路径等不作为Workspace相对路径推断；缺少Workspace归属时显示无法解析，不向daemon根请求裸文件名。
-        Markdown图片及工作目录文件链接使用该URL直接HTTP读取，不通过read_image、工具任务或临时turn；Driver ui_path自己的资源仍走agent.ui，不混用两类根目录。
+workspaceFileUrl(value:string,context:MarkdownResourceContext) -> string | undefined
+    行为：context持Workspace完整地址、实际WebSocket endpoint及可选baseDir；缺少归属、路径为绝对/协议URL/含反斜杠则undefined；相对路径归一化且禁止越过Workspace根，按段encodeURIComponent，ws/wss映射http/https，构造/{编码Workspace地址}/{相对文件}并保留query/fragment。
+    行为：Markdown图片/文件由实际renderMarkdown消费此URL，不生成工具调用或临时turn；独立http/data链接由渲染策略处理，Driver UI来源仍是agent.ui。
 
 handleServerMessage(message: ServerMessage): void
     行为：校验网络形状并更新权威配置、实例及历史；delta按address、generation、sequence及冻结标记处理。
 
 startWorkspace(path: string): Promise<void>
-    行为：发送workspace.start {path}，等待匹配回执，不上传展示缓存。
+    行为：从所选path定位权威Workspace快照的address，发送workspace.start {address}，等待匹配回执，不上传展示缓存。
 
 stopWorkspace(address: string): Promise<void>
     行为：发送workspace.stop，等待权威状态，不乐观删除实例。
@@ -74,7 +70,7 @@ stopWorkspace(address: string): Promise<void>
 abortTurn(): Promise<void>
     行为：立即冻结当前address/generation的流，发送agent.turn.abort；后端先清turn，再取消推理、强制return并清理未return工具，已return后台任务保留。受理ack不表示清理完成；Agent始终running，以权威turn sync确认当前turn已撤销及后续回合关联，不以长任务自然结束作为中止响应条件。
 
-sendUserMessage(): Promise<void>
+sendMessage(text: string, attachments: Attachment[]): Promise<void>
     行为：固定当前目标；按INJECT及EFFECT wake契约发送，回执失败保留草稿，切换目标隔离迟到结果。
 ```
 
@@ -99,7 +95,7 @@ AxumPlugin（Margatroid基础设施）
 
 浏览器Workbench
 ├── WebSocket连接
-├── Workspace路径及展示缓存
+├── Workspace完整Address、只读路径及展示缓存
 ├── 运行实例与权威历史
 ├── StreamState（临时显示）
 └── ComposerState

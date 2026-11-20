@@ -48,23 +48,23 @@ async fn shutdown_phase(phase: WorkspaceState) {
     };
     write(
         root.path(),
-        "agent-drivers/probe/shutdown/latest/base.lua",
+        "agent-drivers/probe/shutdown/dev/base.lua",
         &format!(
             "function configure()return {{timeout_ms=0}}end\nfunction execute(_,context)\nlocal agent=margatroid.agent:create({{name=context.name,config_path=context.resource_dir..'/setting.toml',ui_path=context.resource_dir..'/ui'}})\n{tail}\nend"
         ),
     );
     write(
         root.path(),
-        "workspaces/probe/workspace.yaml",
+        "workspaces/margatroid/probe/dev/workspace.yaml",
         &format!(
-            "name: probe\nproject_root: {}\nmembers:\n- name: target\n  driver: driver:probe/shutdown:latest\n  home_root: {}\n",
+            "project_root: {}\nmembers:\n- name: target\n  driver: driver:probe/shutdown:dev\n  home_root: {}\n",
             root.path().display(),
             root.path().display()
         ),
     );
     write(
         root.path(),
-        "agent-drivers/probe/shutdown/latest/setting.toml",
+        "agent-drivers/probe/shutdown/dev/setting.toml",
         "",
     );
     let mut app = build_app(ApplicationOptions {
@@ -75,7 +75,9 @@ async fn shutdown_phase(phase: WorkspaceState) {
     let (tx, mut start) = oneshot::channel();
     app.world().emit_event(StartWorkspace {
         id: "start".into(),
-        path: root.path().join("workspaces/probe/workspace.yaml"),
+        path: root
+            .path()
+            .join("workspaces/margatroid/probe/dev/workspace.yaml"),
         reply: Arc::new(Mutex::new(Some(tx))),
     });
     let workspace = if phase == WorkspaceState::Starting {

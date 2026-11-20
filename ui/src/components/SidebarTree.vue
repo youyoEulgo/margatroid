@@ -7,6 +7,7 @@ import {
   FolderKanban,
   LoaderCircle,
   Pause,
+  Pencil,
   Play,
   RotateCw,
 } from 'lucide-vue-next';
@@ -37,6 +38,7 @@ const emit = defineEmits<{
   startWorkspace: [path: string];
   restartWorkspace: [path: string];
   stopWorkspace: [address: string];
+  editWorkspace: [path: string];
 }>();
 
 function startWorkspace(workspace: SidebarWorkspace) {
@@ -118,16 +120,28 @@ function stopWorkspace(workspace: SidebarWorkspace) {
             >
               <Pause :size="14" />
             </button>
-            <button
+            <template
               v-else-if="workspace.lifecycle === 'stopped' || workspace.lifecycle === 'inactive'"
-              class="tree-action"
-              type="button"
-              title="Start workspace"
-              :disabled="pending || offline"
-              @click.stop="startWorkspace(workspace)"
             >
-              <Play :size="14" />
-            </button>
+              <button
+                class="tree-action"
+                type="button"
+                title="Edit workspace"
+                :disabled="pending || offline"
+                @click.stop="emit('editWorkspace', workspace.path)"
+              >
+                <Pencil :size="14" />
+              </button>
+              <button
+                class="tree-action"
+                type="button"
+                title="Start workspace"
+                :disabled="pending || offline"
+                @click.stop="startWorkspace(workspace)"
+              >
+                <Play :size="14" />
+              </button>
+            </template>
           </div>
         </div>
         <ul v-if="workspace.expanded" class="tree-children" role="group">

@@ -45,7 +45,6 @@ pub(crate) fn workspaces(world: &World) -> Vec<WorkspaceInfoDto> {
             WorkspaceInfoDto {
                 path: path.to_string_lossy().into_owned(),
                 definition: WorkspaceDefinitionDto {
-                    name: definition.name,
                     project_root: definition.project_root.to_string_lossy().into_owned(),
                     agents: definition
                         .members
@@ -61,7 +60,11 @@ pub(crate) fn workspaces(world: &World) -> Vec<WorkspaceInfoDto> {
                     .and_then(|entity| world.get_component::<Workspace>(entity))
                     .map(|item| format!("{:?}", item.state).to_lowercase())
                     .unwrap_or_else(|| "inactive".into()),
-                address: live.and_then(|entity| address(world, entity)),
+                address: live.and_then(|entity| address(world, entity)).or_else(|| {
+                    path.ancestors()
+                        .nth(4)
+                        .and_then(|root| workspace_core::workspace_address(root, &path).ok())
+                }),
                 error: live
                     .and_then(|entity| {
                         world.get_component::<workspace_core::WorkspaceFailure>(entity)

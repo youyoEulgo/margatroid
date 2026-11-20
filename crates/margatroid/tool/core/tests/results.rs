@@ -243,5 +243,5 @@ fn test_binding() -> tool_core::TaskSyncBinding {
 fn test_tasks() -> tool_core::ToolTasks {
     let mut app = core_plugin::App::new();
     let owner = app.world_mut().spawn();
-    tool_core::ToolTasks::new(owner, "agent:test/unit:latest".into(), test_binding())
+    tool_core::ToolTasks::new(owner, "agent:test/unit:dev".into(), test_binding())
 }

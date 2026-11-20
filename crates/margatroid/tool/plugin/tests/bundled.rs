@@ -65,7 +65,7 @@ impl Fixture {
         let workspace = app.world_mut().spawn();
         app.world_mut().insert_component(
             workspace,
-            address::Address::new("workspace:test/unit").unwrap(),
+            address::Address::new("workspace:test/unit:dev").unwrap(),
         );
         app.world_mut().insert_component(
             workspace,
@@ -230,9 +230,9 @@ impl Fixture {
             return;
         }
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../../../resources/tools/local")
+            .join("../../../../resources/tools/margatroid")
             .join(alias)
-            .join("latest/tool.toml")
+            .join("dev/tool.toml")
             .canonicalize()
             .unwrap();
         let directory = self.root.path().join("resources").join(alias);
@@ -285,9 +285,9 @@ impl Fixture {
     fn sandbox(&mut self, name: &str) {
         use sandbox_resource_core::Sandboxes;
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../../../resources/sandboxes/local")
+            .join("../../../../resources/sandboxes/margatroid")
             .join(name)
-            .join("latest/policy.json")
+            .join("dev/policy.json")
             .canonicalize()
             .unwrap();
         let mut entries = Sandboxes::new(crate::test_probe());
@@ -473,10 +473,11 @@ fn standard_guidance_skills_and_actual_resource_schemas_are_available() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../../resources");
     for name in ["code-review", "project-context"] {
         let content =
-            std::fs::read_to_string(root.join("skills/local").join(name).join("SKILL.md")).unwrap();
-        assert!(content.starts_with(&format!("---\nname: {name}\n")));
+            std::fs::read_to_string(root.join("skills/margatroid").join(name).join("SKILL.md"))
+                .unwrap();
+        assert!(content.starts_with(&format!("---\n")));
         assert!(content.contains("Guidance"));
-        assert!(!root.join("tools/local").join(name).exists());
+        assert!(!root.join("tools/margatroid").join(name).exists());
     }
     for alias in [
         "read-file",

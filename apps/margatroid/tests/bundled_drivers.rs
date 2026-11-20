@@ -4,9 +4,9 @@ fn all_bundled_drivers_and_declared_resource_files_are_readable_with_the_new_con
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../resources");
     for name in ["coder", "reviewer"] {
         let manifest = root
-            .join("agent-drivers/local")
+            .join("agent-drivers/margatroid")
             .join(name)
-            .join("latest/base.lua");
+            .join("dev/base.lua");
         let driver = agent_driver_core::read_driver(&manifest, &Default::default()).unwrap();
         mlua::Lua::new()
             .load(&driver.program)
@@ -84,6 +84,19 @@ mod mailbox_compaction {
         message: Value,
         seen: &mut Vec<Value>,
     ) -> Value {
+        let mut message = message;
+        if matches!(
+            kind,
+            "workspace.start" | "workspace.stop" | "workspace.restart"
+        ) {
+            if let Some(path) = message.get("path").and_then(Value::as_str) {
+                let path = std::path::Path::new(path);
+                let address =
+                    workspace_core::workspace_address(path.ancestors().nth(4).unwrap(), path)
+                        .unwrap();
+                message = json!({"address":address});
+            }
+        }
         socket
             .send(tokio_tungstenite::tungstenite::Message::Text(
                 json!({"type":kind,"id":id,"message":message})
@@ -225,27 +238,29 @@ mod mailbox_compaction {
                     write!(socket,"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",trace.len(),trace).unwrap();
                 }
             });
-            let driver = data.join(format!("agent-drivers/local/{name}/latest"));
+            let driver = data.join(format!("agent-drivers/margatroid/{name}/dev"));
             std::fs::create_dir_all(&driver).unwrap();
             std::fs::copy(
-                resources.join(format!("agent-drivers/local/{name}/latest/base.lua")),
+                resources.join(format!("agent-drivers/margatroid/{name}/dev/base.lua")),
                 driver.join("base.lua"),
             )
             .unwrap();
             for metadata in ["description.md", "input.schema.json"] {
                 std::fs::copy(
-                    resources.join(format!("agent-drivers/local/{name}/latest/{metadata}")),
+                    resources.join(format!("agent-drivers/margatroid/{name}/dev/{metadata}")),
                     driver.join(metadata),
                 )
                 .unwrap();
             }
-            std::fs::write(driver.join("setting.toml"),format!("sandbox=[]\n[inference]\nmodel='offline'\n[compaction]\nthreshold=0.8\nkeep_messages=2\n[initialization]{}",std::fs::read_to_string(resources.join(format!("agent-drivers/local/{name}/latest/setting.toml"))).unwrap().split_once("[initialization]").unwrap().1)).unwrap();
+            std::fs::write(driver.join("setting.toml"),format!("sandbox=[]\n[inference]\nmodel='offline'\n[compaction]\nthreshold=0.8\nkeep_messages=2\n[initialization]{}",std::fs::read_to_string(resources.join(format!("agent-drivers/margatroid/{name}/dev/setting.toml"))).unwrap().split_once("[initialization]").unwrap().1)).unwrap();
 
             let settings_file = driver.join("setting.toml");
-            let text=std::fs::read_to_string(&settings_file).unwrap().replace("custom = []","custom = [{command='IMPORT TOOL tool:local/bash-exec:latest AS init_exec',arguments=[]}, {command='CREATE TEMP BLOCK user_setup (messages)',arguments=[]}, {command='INJECT soul TO user_setup.messages',arguments=[]}, {command='EFFECT tool_call ?', arguments=[[{id='init-tool',tool_name='init_exec',arguments='{\"cmd\":\"printf initialized > initialization-result.txt\"}'}]]}]");
+            let text=std::fs::read_to_string(&settings_file).unwrap().replace("custom = []","custom = [{command='IMPORT TOOL tool:margatroid/bash-exec:dev AS init_exec',arguments=[]}, {command='CREATE TEMP BLOCK user_setup (messages)',arguments=[]}, {command='INJECT soul TO user_setup.messages',arguments=[]}, {command='EFFECT tool_call ?', arguments=[[{id='init-tool',tool_name='init_exec',arguments='{\"cmd\":\"printf initialized > initialization-result.txt\"}'}]]}]");
             std::fs::write(settings_file, text).unwrap();
             if legacy_config {
-                let file = data.join(format!("workspaces/probe/agents/{name}/setting.toml"));
+                let file = data.join(format!(
+                    "workspaces/margatroid/probe/dev/agents/{name}/setting.toml"
+                ));
                 std::fs::create_dir_all(file.parent().unwrap()).unwrap();
                 std::fs::write(file,"legacy_marker=true\nsandbox=[]\n[inference]\nmodel='offline'\n[compaction]\nthreshold=0.8\nkeep_messages=2\n").unwrap();
             }
@@ -259,10 +274,10 @@ mod mailbox_compaction {
                 format!("[server]\nbind='127.0.0.1:{port}'\n"),
             )
             .unwrap();
-            std::fs::write(data.join("models.toml"),format!("[[models]]\nid='offline'\nmodel='local'\nprovider='openai'\napi_type='chat_completions'\nbase_url='http://{endpoint}/v1'\napi_key='test'\ncontext_window='128k'\n")).unwrap();
-            let definition = data.join("workspaces/probe/workspace.yaml");
+            std::fs::write(data.join("models.toml"),format!("[[models]]\nid='offline'\nmodel='margatroid'\nprovider='openai'\napi_type='chat_completions'\nbase_url='http://{endpoint}/v1'\napi_key='test'\ncontext_window='128k'\n")).unwrap();
+            let definition = data.join("workspaces/margatroid/probe/dev/workspace.yaml");
             std::fs::create_dir_all(definition.parent().unwrap()).unwrap();
-            std::fs::write(&definition,format!("name: probe\nproject_root: {}\nmembers:\n- name: {name}\n  driver: driver:local/{name}:latest\n  home_root: {}\n",home.path().display(),home.path().display())).unwrap();
+            std::fs::write(&definition,format!("project_root: {}\nmembers:\n- name: {name}\n  driver: driver:margatroid/{name}:dev\n  home_root: {}\n",home.path().display(),home.path().display())).unwrap();
             let mut child = Child(
                 std::process::Command::new(
                     std::env::var_os("MARGATROID_DRIVER_TEST_BINARY")
@@ -304,8 +319,8 @@ mod mailbox_compaction {
                 &mut seen,
             )
             .await;
-            let address = format!("agent:probe/{name}:latest");
-            let persistent_setup=request(&mut socket,"mcl.execute","persistent-import",json!({"address":address,"command":"IMPORT TOOL tool:local/bash:latest AS restart_probe","arguments":[]}),&mut seen).await;
+            let address = format!("agent:margatroid-probe-dev/{name}:dev");
+            let persistent_setup=request(&mut socket,"mcl.execute","persistent-import",json!({"address":address,"command":"IMPORT TOOL tool:margatroid/bash:dev AS restart_probe","arguments":[]}),&mut seen).await;
             assert_eq!(persistent_setup["success"], true);
             let started=request(&mut socket,"mcl.execute","persistent-start",json!({"address":address,"command":"EFFECT tool_call ?","arguments":[[{"id":"persistent-before-restart","tool_name":"restart_probe","arguments":"{}"}]]}),&mut seen).await;
             assert_eq!(started["success"], true);
@@ -586,7 +601,7 @@ mod mailbox_compaction {
                 .unwrap();
             assert_eq!(
                 parent_state["creator"]["address"],
-                "workspace:local/probe:latest"
+                "workspace:margatroid/probe:dev"
             );
             assert!(parent_state["creator"]["task_id"]
                 .as_str()
@@ -599,8 +614,9 @@ mod mailbox_compaction {
                 .split(':')
                 .next()
                 .unwrap();
-            let child_settings =
-                data.join(format!("workspaces/probe/agents/{child_name}/setting.toml"));
+            let child_settings = data.join(format!(
+                "workspaces/margatroid/probe/dev/agents/{child_name}/setting.toml"
+            ));
             let child_config: Value =
                 toml::from_str(&std::fs::read_to_string(child_settings).unwrap()).unwrap();
             assert!(child_config.get("inheritance_marker").is_none());
@@ -738,7 +754,11 @@ mod mailbox_compaction {
             request(&mut socket,"mcl.execute","finish-failed-subdriver",json!({"address":address,"command":"EFFECT tool_call ?","arguments":[[{"id":"finish-failed-child","tool_name":"task_finish","arguments":json!({"task_id":failed_child["task_id"]}).to_string()}]]}),&mut seen).await;
             let skill_dir = home.path().join("persisted-skill");
             std::fs::create_dir(&skill_dir).unwrap();
-            std::fs::write(skill_dir.join("SKILL.md"),"---\nname: persisted-skill\ndescription: Startup registration fixture.\n---\nFixture instructions.\n").unwrap();
+            std::fs::write(
+                skill_dir.join("SKILL.md"),
+                "---\nname: persisted-skill\ndescription: Startup registration fixture.\n---\nFixture instructions.\n",
+            )
+            .unwrap();
             let register_arguments = json!({"path":skill_dir.join("SKILL.md")});
             for iteration in 0..2 {
                 let registered=request(&mut socket,"mcl.execute",&format!("persist-skill-{iteration}"),json!({"address":address,"command":"EFFECT tool_call ?","arguments":[[{"id":format!("register-{iteration}"),"tool_name":"skill_register","arguments":register_arguments.to_string()}]]}),&mut seen).await;
@@ -767,7 +787,9 @@ mod mailbox_compaction {
                 persisted[0]["arguments"][0][0]["tool_name"],
                 "skill_register"
             );
-            let settings = data.join(format!("workspaces/probe/agents/{name}/setting.toml"));
+            let settings = data.join(format!(
+                "workspaces/margatroid/probe/dev/agents/{name}/setting.toml"
+            ));
             let before_restart = std::fs::read_to_string(&settings).unwrap();
             request(
                 &mut socket,
@@ -965,8 +987,8 @@ mod mailbox_compaction {
 #[test]
 fn subdriver_creates_fresh_agent_from_default_config_before_returning_task_id() {
     for source in [
-        include_str!("../../../resources/agent-drivers/local/coder/latest/base.lua"),
-        include_str!("../../../resources/agent-drivers/local/reviewer/latest/base.lua"),
+        include_str!("../../../resources/agent-drivers/margatroid/coder/dev/base.lua"),
+        include_str!("../../../resources/agent-drivers/margatroid/reviewer/dev/base.lua"),
     ] {
         let lua = mlua::Lua::new();
         lua.load(r#"
@@ -974,7 +996,7 @@ ctx={kind="tool",resource_dir="/driver",task_id="task",arguments={instructions="
 margatroid={agent={}}
 function margatroid.agent:create(options)
  assert(options.name=="subagent-task" and options.config_path=="/driver/setting.toml" and options.ui_path=="/driver/subagent-ui")
- return {address="agent:test/subagent-task:latest"}
+ return {address="agent:margatroid-test-dev/subagent-task:dev"}
 end
 "#).exec().unwrap();
         let prefix = source.split("    local active_model").next().unwrap();

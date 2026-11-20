@@ -74,7 +74,7 @@ fn unregistered_and_removed_connections_are_never_selected() {
             id,
             Arc::new(ClientIdentity {
                 client: entity,
-                address: "client:webui/stale".into(),
+                address: "client:webui/stale:dev".into(),
                 client_type: "webui".into(),
                 name: "stale".into()
             })

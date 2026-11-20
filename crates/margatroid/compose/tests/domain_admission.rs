@@ -69,7 +69,7 @@ fn starting_and_running_mcl_reach_real_domains_which_reject_explicit_stale_turns
     }
     write(
         root.path(),
-        "agent-drivers/probe/admission/latest/base.lua",
+        "agent-drivers/probe/admission/dev/base.lua",
         r#"
 function configure()return {timeout_ms=0}end
 function execute(_,context)
@@ -80,16 +80,16 @@ end
     );
     write(
         root.path(),
-        "workspaces/probe/workspace.yaml",
+        "workspaces/margatroid/probe/dev/workspace.yaml",
         &format!(
-            "name: probe\nproject_root: {}\nmembers:\n- name: target\n  driver: driver:probe/admission:latest\n  home_root: {}\n",
+            "project_root: {}\nmembers:\n- name: target\n  driver: driver:probe/admission:dev\n  home_root: {}\n",
             root.path().display(),
             root.path().display()
         ),
     );
     write(
         root.path(),
-        "agent-drivers/probe/admission/latest/setting.toml",
+        "agent-drivers/probe/admission/dev/setting.toml",
         "",
     );
     let mut app = build_app(ApplicationOptions {
@@ -115,7 +115,9 @@ end
     let (tx, mut rx) = oneshot::channel();
     app.world().emit_event(StartWorkspace {
         id: "start".into(),
-        path: root.path().join("workspaces/probe/workspace.yaml"),
+        path: root
+            .path()
+            .join("workspaces/margatroid/probe/dev/workspace.yaml"),
         reply: Arc::new(Mutex::new(Some(tx))),
     });
     let workspace = drive(&mut app, &mut rx).unwrap();
@@ -123,7 +125,7 @@ end
     let client = app.world_mut().spawn();
     app.world_mut().insert_component(
         client,
-        address::Address::new("client:probe/admission").unwrap(),
+        address::Address::new("client:probe/admission:dev").unwrap(),
     );
     assert!(matches!(
         command(

@@ -5,7 +5,7 @@ fn parse(kind: &str, message: Value) -> Result<ClientMessage, ProtocolError> {
     parse_client_message(&json!({"type":kind,"id":"request-1","message":message}).to_string())
 }
 fn target() -> Value {
-    json!({"address":"agent:demo/coder:latest"})
+    json!({"address":"agent:demo/coder:dev"})
 }
 fn error() -> Value {
     json!({"code":"Rejected","message":"safe failure"})
@@ -19,33 +19,48 @@ fn all_eighteen_client_types_round_trip_and_keep_request_ids() {
             json!({"client_type":"webui","name":"browser"}),
         ),
         ("workspace.req", json!({})),
-        ("workspace.reload", json!({})),
-        ("workspace.start", json!({"path":"/project/workspace.yaml"})),
-        ("workspace.stop", json!({"path":"/project/workspace.yaml"})),
+        (
+            "workspace.delete",
+            json!({"address":"workspace:margatroid/demo:dev"}),
+        ),
+        (
+            "workspace.create",
+            json!({"address":"workspace:margatroid/demo:dev","definition":{"project_root":"/project","agents":[]}}),
+        ),
+        (
+            "workspace.update",
+            json!({"address":"workspace:margatroid/demo:dev","definition":{"project_root":"/project","agents":[]}}),
+        ),
+        (
+            "workspace.rename",
+            json!({"address":"workspace:margatroid/demo:dev","new_address":"workspace:margatroid/new:dev"}),
+        ),
+        (
+            "workspace.start",
+            json!({"address":"workspace:margatroid/demo:dev"}),
+        ),
+        (
+            "workspace.stop",
+            json!({"address":"workspace:margatroid/demo:dev"}),
+        ),
         (
             "workspace.restart",
-            json!({"path":"/project/workspace.yaml"}),
+            json!({"address":"workspace:margatroid/demo:dev"}),
         ),
         ("agent.req", json!({})),
         ("agent.ui.req", target()),
-        (
-            "agent.start",
-            json!({"workspace":"workspace:local/demo:latest","name":"coder"}),
-        ),
-        ("agent.stop", target()),
-        ("agent.restart", target()),
         ("agent.turn.req", target()),
         ("agent.task.req", target()),
         (
             "agent.turn.abort",
-            json!({"address":"agent:demo/coder:latest","turn":"turn-1"}),
+            json!({"address":"agent:demo/coder:dev","turn":"turn-1"}),
         ),
         ("agent.history.req", target()),
         ("agent.log.req", target()),
         ("agent.mcl.req", target()),
         (
             "mcl.execute",
-            json!({"address":"agent:demo/coder:latest","command":"CONFIG GET"}),
+            json!({"address":"agent:demo/coder:dev","command":"CONFIG GET"}),
         ),
     ];
     assert_eq!(cases.len(), 18);
@@ -84,25 +99,25 @@ fn retired_types_fields_and_invalid_envelopes_are_not_accepted() {
     assert!(
         parse(
             "workspace.stop",
-            json!({"workspace":"workspace:local/demo"})
+            json!({"workspace":"workspace:margatroid/demo:dev"})
         )
         .is_err()
     );
-    assert!(parse("agent.start",json!({"workspace":"workspace:local/demo","name":"coder","parameters":{"driver":"driver:local/coder","home_root":"/tmp"}})).is_err());
+    assert!(parse("agent.start",json!({"workspace":"workspace:margatroid/demo:dev","name":"coder","parameters":{"driver":"driver:margatroid/coder:dev","home_root":"/tmp"}})).is_err());
     for name in ["", ".", "..", "../x", "a\\b", "a:b"] {
         assert!(
             parse(
                 "agent.start",
-                json!({"workspace":"workspace:local/demo","name":name})
+                json!({"workspace":"workspace:margatroid/demo:dev","name":name})
             )
             .is_err()
         );
     }
-    assert!(parse("agent.stop", json!({"address":"tool:demo/coder"})).is_err());
+    assert!(parse("agent.stop", json!({"address":"tool:demo/coder:dev"})).is_err());
     assert!(
         parse(
             "agent.turn.abort",
-            json!({"address":"agent:demo/coder","turn":""})
+            json!({"address":"agent:demo/coder:dev","turn":""})
         )
         .is_err()
     );
@@ -140,10 +155,10 @@ fn all_twenty_seven_server_types_round_trip_and_distinguish_sync_ids() {
         "workspace.start.result",
         "workspace.stop.result",
         "workspace.restart.result",
-        "workspace.reload.result",
-        "agent.start.result",
-        "agent.stop.result",
-        "agent.restart.result",
+        "workspace.create.result",
+        "workspace.update.result",
+        "workspace.rename.result",
+        "workspace.delete.result",
         "agent.turn.abort.result",
         "mcl.execute.result",
     ] {
@@ -155,20 +170,20 @@ fn all_twenty_seven_server_types_round_trip_and_distinguish_sync_ids() {
         json!({"type":"workspace.sync","workspaces":[]}),
         json!({"type":"agent.res","id":"request-1","success":true,"agents":[]}),
         json!({"type":"agent.sync","agents":[]}),
-        json!({"type":"agent.ui.res","id":"request-1","address":"agent:demo/coder","success":true,"ui":null}),
-        json!({"type":"agent.ui.sync","address":"agent:demo/coder","ui":null,"error":null}),
-        json!({"type":"agent.turn.res","id":"request-1","success":true,"state":{"address":"agent:demo/coder","turn":null}}),
-        json!({"type":"agent.turn.sync","address":"agent:demo/coder","turn":null}),
-        json!({"type":"agent.task.res","id":"request-1","success":true,"address":"agent:demo/coder","tasks":[]}),
-        json!({"type":"agent.task.sync","address":"agent:demo/coder","tasks":[]}),
-        json!({"type":"agent.message.chunk.sync","address":"agent:demo/coder","turn":"turn-1","generation":"gen-1","sequence":1,"content":"","reasoning":"think"}),
-        json!({"type":"agent.message.full.sync","address":"agent:demo/coder","turn":null,"generation":null,"history_sequence":null,"message":{"type":"user","content":"hello","data":[]},"error":null}),
+        json!({"type":"agent.ui.res","id":"request-1","address":"agent:demo/coder:dev","success":true,"ui":null}),
+        json!({"type":"agent.ui.sync","address":"agent:demo/coder:dev","ui":null,"error":null}),
+        json!({"type":"agent.turn.res","id":"request-1","success":true,"state":{"address":"agent:demo/coder:dev","turn":null}}),
+        json!({"type":"agent.turn.sync","address":"agent:demo/coder:dev","turn":null}),
+        json!({"type":"agent.task.res","id":"request-1","success":true,"address":"agent:demo/coder:dev","tasks":[]}),
+        json!({"type":"agent.task.sync","address":"agent:demo/coder:dev","tasks":[]}),
+        json!({"type":"agent.message.chunk.sync","address":"agent:demo/coder:dev","turn":"turn-1","generation":"gen-1","sequence":1,"content":"","reasoning":"think"}),
+        json!({"type":"agent.message.full.sync","address":"agent:demo/coder:dev","turn":null,"generation":null,"history_sequence":null,"message":{"type":"user","content":"hello","data":[]},"error":null}),
     ]);
     for kind in ["agent.history.res", "agent.log.res", "agent.mcl.res"] {
-        cases.push(json!({"type":kind,"id":"request-1","success":true,"address":"agent:demo/coder","records":[],"next_before_sequence":null,"next_after_sequence":null}));
+        cases.push(json!({"type":kind,"id":"request-1","success":true,"address":"agent:demo/coder:dev","records":[],"next_before_sequence":null,"next_after_sequence":null}));
     }
-    cases.push(json!({"type":"agent.log.sync","address":"agent:demo/coder","records":[{"sequence":1,"created_at_ms":0,"level":"info","source":"driver","stage":"execute","message":"ready","details_json":null,"context_json":null,"origin":null,"raw_error":null,"traceback":null}]}));
-    cases.push(json!({"type":"agent.mcl.sync","address":"agent:demo/coder","records":[{"sequence":2,"created_at_ms":0,"source":"client:webui/browser:1","turn":null,"content":"CONFIG GET","payload":{"text":"CONFIG GET"}}]}));
+    cases.push(json!({"type":"agent.log.sync","address":"agent:demo/coder:dev","records":[{"sequence":1,"created_at_ms":0,"level":"info","source":"driver","stage":"execute","message":"ready","details_json":null,"context_json":null,"origin":null,"raw_error":null,"traceback":null}]}));
+    cases.push(json!({"type":"agent.mcl.sync","address":"agent:demo/coder:dev","records":[{"sequence":2,"created_at_ms":0,"source":"client:webui/browser:1","turn":null,"content":"CONFIG GET","payload":{"text":"CONFIG GET"}}]}));
     assert_eq!(cases.len(), 27);
     for raw in cases {
         let message: ServerMessage =
@@ -186,11 +201,7 @@ fn all_twenty_seven_server_types_round_trip_and_distinguish_sync_ids() {
 
 #[test]
 fn result_success_error_and_page_cursor_presence_are_strict() {
-    for kind in [
-        "workspace.start.result",
-        "agent.stop.result",
-        "agent.turn.abort.result",
-    ] {
+    for kind in ["workspace.start.result", "agent.turn.abort.result"] {
         for raw in [
             json!({"type":kind,"id":"r","success":false}),
             json!({"type":kind,"id":"r","success":true,"error":error()}),
@@ -206,7 +217,7 @@ fn result_success_error_and_page_cursor_presence_are_strict() {
     let result = ServerMessage::AgentHistoryRes {
         id: "r".into(),
         success: true,
-        address: "agent:demo/coder".into(),
+        address: "agent:demo/coder:dev".into(),
         records: Some(vec![]),
         next_before_sequence: None,
         next_after_sequence: None,
@@ -223,7 +234,7 @@ fn result_success_error_and_page_cursor_presence_are_strict() {
     let failed = ServerMessage::AgentHistoryRes {
         id: "r".into(),
         success: false,
-        address: "agent:demo/coder".into(),
+        address: "agent:demo/coder:dev".into(),
         records: None,
         next_before_sequence: None,
         next_after_sequence: None,
@@ -242,10 +253,10 @@ fn result_success_error_and_page_cursor_presence_are_strict() {
 
 #[test]
 fn complete_workspace_agent_tool_and_mcl_business_data_are_preserved() {
-    let workspace = json!({"type":"workspace.sync","workspaces":[{"path":"/project/workspace.yaml","definition":{"name":"demo","project_root":"/project","agents":[{"name":"coder","driver":"driver:local/coder","home_root":"/agent"}]},"status":"inactive","address":null,"error":null}]});
+    let workspace = json!({"type":"workspace.sync","workspaces":[{"path":"/project/workspace.yaml","definition":{"project_root":"/project","agents":[{"name":"coder","driver":"driver:margatroid/coder:dev","home_root":"/agent"}]},"status":"inactive","address":null,"error":null}]});
     let message: ServerMessage = serde_json::from_value(workspace.clone()).unwrap();
     assert_eq!(serde_json::to_value(message).unwrap(), workspace);
-    let agent = json!({"type":"agent.sync","agents":[{"address":"agent:demo/coder","workspace":"workspace:local/demo","creator":{"address":"workspace:local/demo:latest","task_id":"driver-fixture"},"status":"running","sandboxes":[],"sandbox":null,"model":null,"tools":[{"alias":"read","path":"/tools/read","description":"Read","input_schema":{"type":"object"},"owner_task_id":null,"binding":{"opaque":true}}],"error":null}]});
+    let agent = json!({"type":"agent.sync","agents":[{"address":"agent:demo/coder:dev","workspace":"workspace:margatroid/demo:dev","creator":{"address":"workspace:margatroid/demo:dev","task_id":"driver-fixture"},"status":"running","sandboxes":[],"sandbox":null,"model":null,"tools":[{"alias":"read","path":"/tools/read","description":"Read","input_schema":{"type":"object"},"owner_task_id":null,"binding":{"opaque":true}}],"error":null}]});
     let message: ServerMessage = serde_json::from_value(agent.clone()).unwrap();
     assert_eq!(serde_json::to_value(message).unwrap(), agent);
     let result = json!({"type":"mcl.execute.result","id":"r","success":true,"data":{"kind":"block_snapshots","value":{"timeline":{},"snapshots":[]}}});
@@ -258,7 +269,7 @@ fn complete_workspace_agent_tool_and_mcl_business_data_are_preserved() {
 
 #[test]
 fn message_sync_uses_one_reasoning_field_and_real_history_identity() {
-    let full = json!({"type":"agent.message.full.sync","address":"agent:demo/coder","turn":"t","generation":"g","history_sequence":42,"message":{"type":"assistant","sequence":42,"content":"answer","reasoning":"thought","tool_calls":[]},"error":null});
+    let full = json!({"type":"agent.message.full.sync","address":"agent:demo/coder:dev","turn":"t","generation":"g","history_sequence":42,"message":{"type":"assistant","sequence":42,"content":"answer","reasoning":"thought","tool_calls":[]},"error":null});
     let parsed: ServerMessage = serde_json::from_value(full.clone()).unwrap();
     assert!(parsed.id().is_none());
     for (key, value) in [
@@ -293,7 +304,7 @@ fn budgets_and_media_validation_do_not_echo_payloads() {
             .code,
         "MessageTooLarge"
     );
-    let message = |image| json!({"address":"agent:demo/coder","command":"INJECT ? TO entry.pending[-1]","arguments":[[{"type":"user","content":"image","data":[image]}]]});
+    let message = |image| json!({"address":"agent:demo/coder:dev","command":"INJECT ? TO entry.pending[-1]","arguments":[[{"type":"user","content":"image","data":[image]}]]});
     assert!(
         parse(
             "mcl.execute",
@@ -314,7 +325,7 @@ fn budgets_and_media_validation_do_not_echo_payloads() {
     let args = json!(["path",0.8,true,[1,2],{"$__toml_private_datetime":"1979-05-27T07:32:00Z"}]);
     let parsed = parse(
         "mcl.execute",
-        json!({"address":"agent:demo/coder","command":"CONFIG SET ? ?","arguments":args}),
+        json!({"address":"agent:demo/coder:dev","command":"CONFIG SET ? ?","arguments":args}),
     )
     .unwrap();
     let ClientMessage::MclExecute { message, .. } = parsed else {
@@ -331,7 +342,7 @@ fn budgets_and_media_validation_do_not_echo_payloads() {
 
 #[test]
 fn required_nullable_fields_and_type_constants_are_not_optional() {
-    let base = json!({"type":"agent.message.full.sync","address":"agent:demo/coder","turn":null,"generation":null,"history_sequence":null,"message":{"type":"error","message":"safe"},"error":null});
+    let base = json!({"type":"agent.message.full.sync","address":"agent:demo/coder:dev","turn":null,"generation":null,"history_sequence":null,"message":{"type":"error","message":"safe"},"error":null});
     for key in ["turn", "generation", "history_sequence", "error"] {
         let mut bad = base.clone();
         bad.as_object_mut().unwrap().remove(key);
@@ -340,7 +351,7 @@ fn required_nullable_fields_and_type_constants_are_not_optional() {
             "{key}"
         );
     }
-    let valid = json!({"type":"workspace.sync","workspaces":[{"path":"/work/workspace.yaml","definition":{"name":"w","project_root":"/work","agents":[]},"status":"inactive","address":null,"error":null}]});
+    let valid = json!({"type":"workspace.sync","workspaces":[{"path":"/work/workspace.yaml","definition":{"project_root":"/work","agents":[]},"status":"inactive","address":null,"error":null}]});
     for key in ["address", "error"] {
         let mut bad = valid.clone();
         bad["workspaces"][0].as_object_mut().unwrap().remove(key);
@@ -362,8 +373,9 @@ fn public_targets_reject_internal_vm_identity_fields() {
     for key in ["instance", "agent_instance", "start_id", "vm_id"] {
         let mut value = target();
         value[key] = json!("private-vm");
-        assert!(parse("agent.stop", value).is_err());
-        let mut value = json!({"type":"agent.turn.sync","address":"agent:demo/coder","turn":null});
+        assert!(parse("agent.turn.req", value).is_err());
+        let mut value =
+            json!({"type":"agent.turn.sync","address":"agent:demo/coder:dev","turn":null});
         value[key] = json!("private-vm");
         assert!(serde_json::from_value::<ServerMessage>(value).is_err());
     }
@@ -371,7 +383,7 @@ fn public_targets_reject_internal_vm_identity_fields() {
 
 #[test]
 fn agent_resources_and_public_model_fields_are_strict_and_nullable() {
-    let mut value = json!({"type":"agent.sync","agents":[{"address":"agent:demo/coder","workspace":"workspace:local/demo","creator":{"address":"workspace:local/demo:latest","task_id":"driver-fixture"},"status":"running","tools":[],"sandboxes":[{"alias":"read_only","path":"/sandbox/read-only.toml"}],"sandbox":"read_only","model":{"id":"model-route","model":"model-name","provider":"openai","api_type":"responses","context_window_tokens":131072,"thinking":null,"reasoning_effort":"high"},"error":null}]});
+    let mut value = json!({"type":"agent.sync","agents":[{"address":"agent:demo/coder:dev","workspace":"workspace:margatroid/demo:dev","creator":{"address":"workspace:margatroid/demo:dev","task_id":"driver-fixture"},"status":"running","tools":[],"sandboxes":[{"alias":"read_only","path":"/sandbox/read-only.toml"}],"sandbox":"read_only","model":{"id":"model-route","model":"model-name","provider":"openai","api_type":"responses","context_window_tokens":131072,"thinking":null,"reasoning_effort":"high"},"error":null}]});
     let message: ServerMessage = serde_json::from_value(value.clone()).unwrap();
     assert_eq!(serde_json::to_value(message).unwrap(), value);
     for field in ["creator", "sandboxes", "sandbox", "model"] {
@@ -393,13 +405,13 @@ fn agent_resources_and_public_model_fields_are_strict_and_nullable() {
 #[test]
 fn driver_ui_messages_enforce_complete_resource_and_nullable_contracts() {
     let bundle = json!({"revision":format!("sha256:{}","0".repeat(64)),"entry":"index.html","files":[{"path":"index.html","media_type":"text/html; charset=utf-8","data":"aGk="}]});
-    let value = json!({"type":"agent.ui.res","id":"ui","address":"agent:demo/coder","success":true,"ui":bundle});
+    let value = json!({"type":"agent.ui.res","id":"ui","address":"agent:demo/coder:dev","success":true,"ui":bundle});
     let message: ServerMessage = serde_json::from_value(value.clone()).unwrap();
     assert_eq!(serde_json::to_value(message).unwrap(), value);
     let absent = ServerMessage::AgentUiRes {
         id: "missing".into(),
         success: true,
-        address: "agent:demo/coder".into(),
+        address: "agent:demo/coder:dev".into(),
         ui: None,
         error: None,
     };
@@ -431,16 +443,16 @@ fn driver_ui_messages_enforce_complete_resource_and_nullable_contracts() {
         .push(bundle["files"][0].clone());
     assert!(serde_json::from_value::<ServerMessage>(duplicate).is_err());
     for value in [
-        json!({"type":"agent.ui.res","id":"ui","address":"agent:demo/coder","success":true}),
-        json!({"type":"agent.ui.res","id":"ui","address":"agent:demo/coder","success":false,"ui":null,"error":error()}),
-        json!({"type":"agent.ui.sync","address":"agent:demo/coder","ui":bundle,"error":error()}),
-        json!({"type":"agent.ui.sync","address":"agent:demo/coder","ui":null}),
+        json!({"type":"agent.ui.res","id":"ui","address":"agent:demo/coder:dev","success":true}),
+        json!({"type":"agent.ui.res","id":"ui","address":"agent:demo/coder:dev","success":false,"ui":null,"error":error()}),
+        json!({"type":"agent.ui.sync","address":"agent:demo/coder:dev","ui":bundle,"error":error()}),
+        json!({"type":"agent.ui.sync","address":"agent:demo/coder:dev","ui":null}),
     ] {
         assert!(serde_json::from_value::<ServerMessage>(value).is_err());
     }
     assert!(
         serde_json::from_value::<ServerMessage>(
-            json!({"type":"agent.ui.sync","address":"agent:demo/coder","ui":null,"error":error()})
+            json!({"type":"agent.ui.sync","address":"agent:demo/coder:dev","ui":null,"error":error()})
         )
         .is_ok()
     );
@@ -448,7 +460,7 @@ fn driver_ui_messages_enforce_complete_resource_and_nullable_contracts() {
 
 #[test]
 fn cumulative_chunk_requires_complete_text_pair_and_rejects_delta() {
-    let base = json!({"type":"agent.message.chunk.sync","address":"agent:demo/coder","turn":"turn-1","generation":"gen-1","sequence":1,"content":"你好","reasoning":"思考"});
+    let base = json!({"type":"agent.message.chunk.sync","address":"agent:demo/coder:dev","turn":"turn-1","generation":"gen-1","sequence":1,"content":"你好","reasoning":"思考"});
     let message: ServerMessage = serde_json::from_value(base.clone()).unwrap();
     assert!(encode_server_message(&message).is_ok());
     for field in ["content", "reasoning"] {
@@ -477,7 +489,7 @@ fn returned_turn_and_free_generation_chunk_preserve_explicit_optional_associatio
     };
     let value: Value = serde_json::from_str(&encode_server_message(&response).unwrap()).unwrap();
     assert_eq!(value["data"], json!({"kind":"turn","value":"turn:one"}));
-    let raw = json!({"type":"agent.message.chunk.sync","address":"agent:demo/coder:latest","turn":null,"generation":"free-request","sequence":1,"content":"summary","reasoning":""});
+    let raw = json!({"type":"agent.message.chunk.sync","address":"agent:demo/coder:dev","turn":null,"generation":"free-request","sequence":1,"content":"summary","reasoning":""});
     let parsed: ServerMessage = serde_json::from_value(raw.clone()).unwrap();
     assert_eq!(
         serde_json::from_str::<Value>(&encode_server_message(&parsed).unwrap()).unwrap(),
@@ -492,7 +504,7 @@ fn returned_turn_and_free_generation_chunk_preserve_explicit_optional_associatio
 
 #[test]
 fn compact_message_roundtrips_with_assistant_fields_and_keeps_compact_type() {
-    let raw = json!({"type":"agent.message.full.sync","address":"agent:demo/coder:latest","turn":null,"generation":null,"history_sequence":7,"message":{"type":"compact","sequence":7,"request_id":"summary-request","content":"summary","reasoning":"reason","tool_calls":[],"stop_reason":"completed"},"error":null});
+    let raw = json!({"type":"agent.message.full.sync","address":"agent:demo/coder:dev","turn":null,"generation":null,"history_sequence":7,"message":{"type":"compact","sequence":7,"request_id":"summary-request","content":"summary","reasoning":"reason","tool_calls":[],"stop_reason":"completed"},"error":null});
     let message: ServerMessage = serde_json::from_value(raw).unwrap();
     let wire: Value = serde_json::from_str(&encode_server_message(&message).unwrap()).unwrap();
     assert_eq!(wire["message"]["type"], "compact");
@@ -554,16 +566,16 @@ fn model_file_requests_and_replies_keep_content_and_do_not_accept_a_client_path(
 
 #[test]
 fn agent_creator_is_a_workspace_or_agent_address_and_a_real_task_reference() {
-    let mut raw = json!({"type":"agent.sync","agents":[{"address":"agent:demo/child:latest","workspace":"workspace:local/demo:latest","creator":{"address":"agent:demo/parent:latest","task_id":"tool:1:2:0"},"status":"running","tools":[],"sandboxes":[],"sandbox":null,"model":null,"error":null}]});
+    let mut raw = json!({"type":"agent.sync","agents":[{"address":"agent:demo/child:dev","workspace":"workspace:margatroid/demo:dev","creator":{"address":"agent:demo/parent:dev","task_id":"tool:1:2:0"},"status":"running","tools":[],"sandboxes":[],"sandbox":null,"model":null,"error":null}]});
     let message: ServerMessage = serde_json::from_value(raw.clone()).unwrap();
     assert_eq!(serde_json::to_value(message).unwrap(), raw);
     raw["agents"][0]["creator"] =
-        json!({"address":"workspace:local/demo:latest","task_id":"driver-task"});
+        json!({"address":"workspace:margatroid/demo:dev","task_id":"driver-task"});
     assert!(serde_json::from_value::<ServerMessage>(raw.clone()).is_ok());
     for creator in [
-        json!({"address":"execution:1/driver:latest","task_id":"x"}),
-        json!({"address":"agent:demo/parent:latest","task_id":""}),
-        json!({"address":"agent:demo/parent:latest","task_id":"task","instance":"internal"}),
+        json!({"address":"execution:1/driver:dev","task_id":"x"}),
+        json!({"address":"agent:demo/parent:dev","task_id":""}),
+        json!({"address":"agent:demo/parent:dev","task_id":"task","instance":"internal"}),
     ] {
         let mut invalid = raw.clone();
         invalid["agents"][0]["creator"] = creator;
@@ -573,7 +585,7 @@ fn agent_creator_is_a_workspace_or_agent_address_and_a_real_task_reference() {
 
 #[test]
 fn creator_cannot_be_null_or_missing() {
-    let valid = json!({"type":"agent.sync","agents":[{"address":"agent:demo/coder:latest","workspace":"workspace:local/demo:latest","creator":{"address":"workspace:local/demo:latest","task_id":"driver-task"},"status":"starting","tools":[],"sandboxes":[],"sandbox":null,"model":null,"error":null}]});
+    let valid = json!({"type":"agent.sync","agents":[{"address":"agent:demo/coder:dev","workspace":"workspace:margatroid/demo:dev","creator":{"address":"workspace:margatroid/demo:dev","task_id":"driver-task"},"status":"starting","tools":[],"sandboxes":[],"sandbox":null,"model":null,"error":null}]});
     assert!(serde_json::from_value::<ServerMessage>(valid.clone()).is_ok());
     let mut null = valid.clone();
     null["agents"][0]["creator"] = Value::Null;
@@ -584,4 +596,68 @@ fn creator_cannot_be_null_or_missing() {
         .unwrap()
         .remove("creator");
     assert!(serde_json::from_value::<ServerMessage>(missing).is_err());
+}
+
+#[test]
+fn every_address_target_requires_an_explicit_nonempty_tag() {
+    for (kind, field, prefix) in [
+        ("agent.turn.req", "address", "agent"),
+        ("workspace.start", "address", "workspace"),
+        ("workspace.delete", "address", "workspace"),
+    ] {
+        for suffix in ["", ":"] {
+            let request = json!({field:format!("{prefix}:margatroid/name{suffix}")});
+            assert!(parse(kind, request).is_err(), "{kind} {suffix}");
+        }
+    }
+    for prefix in ["workspace", "agent"] {
+        let mut raw = json!({"type":"agent.sync","agents":[{"address":"agent:margatroid-project-dev/coder:dev","workspace":"workspace:margatroid/project:dev","creator":{"address":format!("{prefix}:margatroid/name"),"task_id":"task"},"status":"running","tools":[],"sandboxes":[],"sandbox":null,"model":null,"error":null}]});
+        assert!(serde_json::from_value::<ServerMessage>(raw.clone()).is_err());
+        raw["agents"][0]["creator"]["address"] = json!(format!("{prefix}:margatroid/name:dev"));
+        assert!(serde_json::from_value::<ServerMessage>(raw).is_ok());
+    }
+}
+
+#[test]
+fn removed_agent_lifecycle_requests_and_results_are_rejected() {
+    for operation in ["start", "stop", "restart"] {
+        for message in [
+            json!({"address":"agent:margatroid-project-dev/coder:dev"}),
+            json!({"workspace":"workspace:margatroid/project:dev","name":"coder"}),
+        ] {
+            assert!(parse(&format!("agent.{operation}"), message).is_err());
+        }
+        assert!(
+            serde_json::from_value::<ServerMessage>(
+                json!({"type":format!("agent.{operation}.result"),"id":"removed","success":true})
+            )
+            .is_err()
+        );
+    }
+}
+
+#[test]
+fn workspace_definition_has_no_name_but_members_keep_names() {
+    let definition = json!({"project_root":"/project","agents":[{"name":"coder","driver":"driver:margatroid/coder:dev","home_root":"/project"}]});
+    for operation in ["create", "update"] {
+        assert!(
+            parse(
+                &format!("workspace.{operation}"),
+                json!({"address":"workspace:margatroid/project:dev","definition":definition})
+            )
+            .is_ok()
+        );
+        let mut invalid = definition.clone();
+        invalid["name"] = json!("forbidden-display-name");
+        assert!(
+            parse(
+                &format!("workspace.{operation}"),
+                json!({"address":"workspace:margatroid/project:dev","definition":invalid})
+            )
+            .is_err()
+        );
+    }
+    let value: WorkspaceDefinitionDto = serde_json::from_value(definition).unwrap();
+    assert_eq!(value.agents[0].name, "coder");
+    assert!(serde_json::to_value(value).unwrap().get("name").is_none());
 }

@@ -65,7 +65,11 @@ impl WorkspaceViews {
                     status: live
                         .map(|v| v.status.clone())
                         .unwrap_or_else(|| "inactive".into()),
-                    address: live.and_then(|v| v.address.clone()),
+                    address: live.and_then(|v| v.address.clone()).or_else(|| {
+                        path.ancestors()
+                            .nth(4)
+                            .and_then(|root| workspace_core::workspace_address(root, &path).ok())
+                    }),
                     error,
                 }
             })
@@ -76,7 +80,6 @@ impl WorkspaceViews {
 }
 fn definition_dto(value: workspace_core::WorkspaceDefinition) -> WorkspaceDefinitionDto {
     WorkspaceDefinitionDto {
-        name: value.name,
         project_root: value.project_root.to_string_lossy().into_owned(),
         agents: value
             .members
@@ -267,11 +270,11 @@ fn definition_event(source: &std::path::Path, event: &notify::Event) -> bool {
             return false;
         };
         let depth = relative.components().count();
-        (depth == 2
+        (depth == 4
             && path
                 .file_name()
                 .is_some_and(|name| name == "workspace.yaml"))
-            || (depth == 1
+            || ((1..=3).contains(&depth)
                 && matches!(
                     event.kind,
                     EventKind::Create(_)
@@ -287,9 +290,11 @@ mod tests {
     fn definition_monitor_ignores_agent_database_and_output_file_changes() {
         let root = PathBuf::from("/tmp/config/workspaces");
         for path in [
-            root.join("demo/agents/coder/state.sqlite"),
-            root.join("demo/agents/coder/.tmp"),
-            root.join("demo/state.sqlite.blocks/session/timeline.sqlite"),
+            root.join("margatroid/demo/dev/agents/coder/state.sqlite"),
+            root.join("margatroid/demo/dev/agents/coder/.tmp"),
+            root.join(
+                "margatroid/demo/dev/agents/coder/state.sqlite.blocks/session/timeline.sqlite",
+            ),
         ] {
             let event = notify::Event::new(EventKind::Modify(notify::event::ModifyKind::Name(
                 notify::event::RenameMode::To,
@@ -297,7 +302,12 @@ mod tests {
             .add_path(path);
             assert!(!definition_event(&root, &event));
         }
-        for path in [root.join("demo/workspace.yaml"), root.join("demo")] {
+        for path in [
+            root.join("margatroid/demo/dev/workspace.yaml"),
+            root.join("margatroid"),
+            root.join("margatroid/demo"),
+            root.join("margatroid/demo/dev"),
+        ] {
             let event = notify::Event::new(EventKind::Create(notify::event::CreateKind::Any))
                 .add_path(path);
             assert!(definition_event(&root, &event));

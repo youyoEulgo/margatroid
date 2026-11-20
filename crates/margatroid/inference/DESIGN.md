@@ -208,13 +208,13 @@ supervise_inference(context: InferenceContext) -> Future<Output = ()>
         确认监督任务已结束后才唤醒目标AgentWaitSlot，未结束则下一帧复查，过期事件丢弃，不自动finish_turn。
         不写历史、不执行工具、不重试推理。
 
-read_provider(context: ProviderContext, sender: mpsc::Sender<ProviderFragment>) -> Future<Output = Result<(), InferenceError>>
+read_provider(client:reqwest::Client,request:ProviderHttpRequest,cancel:CancellationToken,sender:mpsc::Sender<ProviderFragment>) -> Future<Output = Result<(), InferenceError>>
     行为：
         执行HTTP并有界解析SSE，按顺序发送ProviderFragment；
         不向前端发送，不维护另一份最终正文；
         发送失败或取消后退出并释放连接。
 
-receive_stream(context: StreamContext, receiver: mpsc::Receiver<ProviderFragment>) -> Future<Output = Result<AcceptedResponse, InferenceError>>
+receive_stream(gate:Arc<Mutex<StreamGate>>,cancel:CancellationToken,delivery:&mut StreamDelivery,receiver:mpsc::Receiver<ProviderFragment>) -> Future<Output=Result<(),InferenceError>>
     行为：
         每轮使用biased select!优先检查取消，再等待一个分片，不批量排空。
         取得分片后在接受门短锁内复检关闭状态；
@@ -263,8 +263,6 @@ build_request(input: DomainRequest, route: ModelRoute) -> Result<ProviderHttpReq
 ```text
 -- 私有
 InferenceContext：请求执行材料--原请求及reply、可选http_request、model_config: Option<ModelConfigFile>、tools: Vec<InferenceToolDefinition>、deadline、HTTP客户端、取消能力和推流投影；原样保留Option<String>回合，不将None改成当前turn
-ProviderContext：上游材料--HTTP请求、格式解码器、取消能力及读取预算
-StreamContext：接收材料--Arc<Mutex<StreamGate>>、取消能力及StreamDelivery
 ModelSyncBinding = ProbeFactory<Option<PublicModelInfo>>
 PublicModelInfo
     id: String
@@ -305,8 +303,8 @@ ProviderFragment：格式归一后的分片，私有枚举
     Usage(InferenceUsage)
     Finished(InferenceStopReason)
 
-AcceptedDelta：已接受的显示分片--sequence及Content或Reasoning
-AcceptedResponse：接收器结果--累积消息和已接受协议终态
+ResponseAccumulator::accept(fragment) -> Result<Option<(bool,String)>>--实际接受的正文/思考变化，序号由StreamGate维护
+ResponseAccumulator::response(&self) -> Result<InferenceResponse>--从唯一累积器取得响应与终态，不存在第二份AcceptedResponse
 ResponseAccumulator：唯一响应累积器--正文、思考、工具调用、usage及停止原因；不含replay、api_format或原生厂商内容块
 FormatDecoder：SSE解析状态--跨字节缓冲、协议索引及完整结束校验，不另存最终正文，不把签名或加密重放材料转为领域分片
 

@@ -1309,6 +1309,7 @@ dependencies = [
  "tool_plugin",
  "tool_resource_core",
  "tracing",
+ "workspace_core",
 ]
 
 [[package]]

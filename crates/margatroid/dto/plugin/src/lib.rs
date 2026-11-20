@@ -64,11 +64,6 @@ impl Plugin for DtoPlugin {
                 .expect("ClientPlugin required")
                 .clone(),
             lifetime,
-            definitions: app
-                .world()
-                .get_resource::<workspace_core::WorkspaceDefinitions>()
-                .cloned()
-                .unwrap_or_default(),
         };
         let events = state.events.clone();
         app.world()

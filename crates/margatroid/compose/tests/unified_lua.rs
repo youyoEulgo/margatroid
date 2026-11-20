@@ -23,7 +23,7 @@ function execute(_,context)
  assert(data_dir:sub(-#(child and '/agents/child' or '/agents/parent'))==(child and '/agents/child' or '/agents/parent'))
  assert(context.data_dir==nil and context.temp_dir==nil)
  assert(not pcall(function() return margatroid.agent:data_dir() end))
- assert(not pcall(function() return margatroid.agent:data_dir('agent:missing/none:latest') end))
+ assert(not pcall(function() return margatroid.agent:data_dir('agent:missing/none:dev') end))
  local function command(text,args)
   local result=margatroid.mcl:execute(agent.address,text,args)
   if type(result)=='table' and result.Error then error(result.Error.message) end
@@ -47,7 +47,7 @@ function execute(_,context)
   margatroid.tools:register({agent=agent.address,tools={{alias='automatic_registration',description='lifetime of automatic task',input_schema={type='object'},lifetime={task_id=context.task_id}}}})
  end
  if child then margatroid.task:return_result(agent.address);margatroid.task:receive();return end
- command('IMPORT TOOL tool:probe/shared:latest AS shared')
+ command('IMPORT TOOL tool:probe/shared:dev AS shared')
  command('EFFECT start_turn')
  local result=command('EFFECT tool_call ?',{{{id='child-create',tool_name='shared',arguments='{"child":true}'}}})
  command('CONFIG SET ? ?',{'child_address',result.Array.Message[1].content})
@@ -137,46 +137,48 @@ fn identical_lua_programs_create_independent_agents_and_stop_without_owning_the_
     }
     write(
         root.path(),
-        "agent-drivers/probe/shared/latest/base.lua",
+        "agent-drivers/probe/shared/dev/base.lua",
         PROGRAM,
     );
     write(
         root.path(),
-        "agent-drivers/probe/shared/latest/setting.toml",
+        "agent-drivers/probe/shared/dev/setting.toml",
         "label='parent-template'\n",
     );
     write(
         root.path(),
-        "agent-drivers/probe/shared/latest/ui/index.html",
+        "agent-drivers/probe/shared/dev/ui/index.html",
         "<main>parent-ui</main>",
     );
-    write(root.path(), "tools/probe/shared/latest/main.lua", PROGRAM);
+    write(root.path(), "tools/probe/shared/dev/main.lua", PROGRAM);
     write(
         root.path(),
-        "tools/probe/shared/latest/tool.toml",
+        "tools/probe/shared/dev/tool.toml",
         "schema_version=1\ndescription='shared Lua environment'\n",
     );
     write(
         root.path(),
-        "tools/probe/shared/latest/input.schema.json",
+        "tools/probe/shared/dev/input.schema.json",
         "{\"type\":\"object\"}",
     );
     write(
         root.path(),
-        "tools/probe/shared/latest/setting.toml",
+        "tools/probe/shared/dev/setting.toml",
         "label='child-template'\n",
     );
     write(
         root.path(),
-        "tools/probe/shared/latest/ui/index.html",
+        "tools/probe/shared/dev/ui/index.html",
         "<main>child-ui</main>",
     );
-    let definition = root.path().join("workspaces/test/workspace.yaml");
+    let definition = root
+        .path()
+        .join("workspaces/margatroid/test/dev/workspace.yaml");
     write(
         root.path(),
-        "workspaces/test/workspace.yaml",
+        "workspaces/margatroid/test/dev/workspace.yaml",
         &format!(
-            "name: test\nproject_root: {}\nmembers:\n- name: parent\n  driver: driver:probe/shared:latest\n  home_root: {}\n",
+            "project_root: {}\nmembers:\n- name: parent\n  driver: driver:probe/shared:dev\n  home_root: {}\n",
             root.path().display(),
             root.path().display()
         ),
@@ -229,20 +231,23 @@ fn identical_lua_programs_create_independent_agents_and_stop_without_owning_the_
             .get_component::<address::Address>(parent)
             .unwrap()
             .as_str(),
-        "agent:test/parent:latest"
+        "agent:margatroid-test-dev/parent:dev"
     );
     assert_eq!(
         app.world()
             .get_component::<address::Address>(child)
             .unwrap()
             .as_str(),
-        "agent:test/child:latest"
+        "agent:margatroid-test-dev/child:dev"
     );
     let binding = app
         .world()
         .get_component::<agent_core::AgentTaskBinding>(child)
         .unwrap();
-    assert_eq!(binding.creator().address, "agent:test/parent:latest");
+    assert_eq!(
+        binding.creator().address,
+        "agent:margatroid-test-dev/parent:dev"
+    );
     assert!(!binding.creator().task_id.starts_with("task-instance:"));
     let execution = app
         .world()
@@ -284,7 +289,7 @@ fn identical_lua_programs_create_independent_agents_and_stop_without_owning_the_
         .get_component::<agent_core::AgentTaskBinding>(parent)
         .unwrap()
         .creator();
-    assert_eq!(parent_creator.address, "workspace:local/test:latest");
+    assert_eq!(parent_creator.address, "workspace:margatroid/test:dev");
     assert_eq!(
         parent_creator.task_id,
         app.world()
@@ -306,8 +311,12 @@ fn identical_lua_programs_create_independent_agents_and_stop_without_owning_the_
             )
             .is_ok()
     );
-    let parent_home = root.path().join("workspaces/test/agents/parent");
-    let child_home = root.path().join("workspaces/test/agents/child");
+    let parent_home = root
+        .path()
+        .join("workspaces/margatroid/test/dev/agents/parent");
+    let child_home = root
+        .path()
+        .join("workspaces/margatroid/test/dev/agents/child");
     assert!(parent_home.join("state.sqlite").is_file());
     assert!(child_home.join("state.sqlite").is_file());
     assert!(!parent_home.join("ui").exists());
@@ -328,12 +337,12 @@ fn identical_lua_programs_create_independent_agents_and_stop_without_owning_the_
         .clone();
     assert_eq!(
         parent_ui,
-        root.path().join("agent-drivers/probe/shared/latest/ui")
+        root.path().join("agent-drivers/probe/shared/dev/ui")
     );
-    assert_eq!(child_ui, root.path().join("tools/probe/shared/latest/ui"));
+    assert_eq!(child_ui, root.path().join("tools/probe/shared/dev/ui"));
     write(
         root.path(),
-        "agent-drivers/probe/shared/latest/ui/index.html",
+        "agent-drivers/probe/shared/dev/ui/index.html",
         "changed-source",
     );
     assert_eq!(
@@ -347,7 +356,7 @@ fn identical_lua_programs_create_independent_agents_and_stop_without_owning_the_
     let client = app.world_mut().spawn();
     app.world_mut().insert_component(
         client,
-        address::Address::new("client:test/control").unwrap(),
+        address::Address::new("client:test/control:dev").unwrap(),
     );
     assert!(matches!(
         command(&mut app, client, parent, "EFFECT agent_stop"),
@@ -446,12 +455,12 @@ fn creator_tasks_own_agents_until_explicit_stop_or_actual_task_cleanup() {
         }
         write(
             root.path(),
-            "agent-drivers/probe/owner/latest/base.lua",
+            "agent-drivers/probe/owner/dev/base.lua",
             r#"
 function configure()return {timeout_ms=0}end
 function execute(_,ctx)
  local agent=margatroid.agent:create({name=ctx.name,config_path=ctx.resource_dir..'/setting.toml',ui_path=ctx.resource_dir..'/ui'})
- assert(not margatroid.mcl:execute(agent.address,'IMPORT TOOL tool:probe/child:latest AS spawn_child').Error)
+ assert(not margatroid.mcl:execute(agent.address,'IMPORT TOOL tool:probe/child:dev AS spawn_child').Error)
  assert(not margatroid.mcl:execute(agent.address,'EFFECT ready').Error)
  margatroid.task:return_result(agent.address)
  margatroid.task:receive()
@@ -460,23 +469,19 @@ end
         );
         write(
             root.path(),
-            "agent-drivers/probe/owner/latest/setting.toml",
+            "agent-drivers/probe/owner/dev/setting.toml",
             "",
         );
         write(
             root.path(),
-            "tools/probe/child/latest/tool.toml",
+            "tools/probe/child/dev/tool.toml",
             "schema_version=1\ndescription='create task-owned agents'\n",
         );
+        write(root.path(), "tools/probe/child/dev/input.schema.json", "{}");
+        write(root.path(), "tools/probe/child/dev/setting.toml", "");
         write(
             root.path(),
-            "tools/probe/child/latest/input.schema.json",
-            "{}",
-        );
-        write(root.path(), "tools/probe/child/latest/setting.toml", "");
-        write(
-            root.path(),
-            "tools/probe/child/latest/main.lua",
+            "tools/probe/child/dev/main.lua",
             r#"
 function configure()return {timeout_ms=0}end
 function execute(_,ctx)
@@ -494,12 +499,14 @@ function execute(_,ctx)
 end
 "#,
         );
-        let definition = root.path().join("workspaces/test/workspace.yaml");
+        let definition = root
+            .path()
+            .join("workspaces/margatroid/test/dev/workspace.yaml");
         write(
             root.path(),
-            "workspaces/test/workspace.yaml",
+            "workspaces/margatroid/test/dev/workspace.yaml",
             &format!(
-                "name: test\nproject_root: {}\nmembers:\n- name: parent\n  driver: driver:probe/owner:latest\n  home_root: {}\n",
+                "project_root: {}\nmembers:\n- name: parent\n  driver: driver:probe/owner:dev\n  home_root: {}\n",
                 root.path().display(),
                 root.path().display()
             ),
@@ -550,13 +557,13 @@ end
         let source = app.world_mut().spawn();
         app.world_mut().insert_component(
             source,
-            address::Address::new("client:test/lifetime").unwrap(),
+            address::Address::new("client:test/lifetime:dev").unwrap(),
         );
         let (tx, mut rx) = oneshot::channel();
         app.world().emit_event(MclCommand {
             id: "spawn-task".into(),
             source,
-            source_address: "client:test/lifetime:latest".into(),
+            source_address: "client:test/lifetime:dev".into(),
             source_instance: None,
             target: parent,
             instruction: MclInstruction {

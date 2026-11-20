@@ -142,12 +142,12 @@ fn fixture(home: &Path, address: std::net::SocketAddr) -> PathBuf {
     );
     write(
         &root,
-        "agent-drivers/local/shutdown/latest/setting.toml",
+        "agent-drivers/margatroid/shutdown/dev/setting.toml",
         "",
     );
     write(
         &root,
-        "agent-drivers/local/shutdown/latest/base.lua",
+        "agent-drivers/margatroid/shutdown/dev/base.lua",
         r#"
 function configure()return {timeout_ms=0}end
 function execute(_,context)
@@ -156,7 +156,7 @@ local function command(text)
     local result = margatroid.mcl:execute(agent.address, text)
     assert(type(result)~='table' or not result.Error, 'shutdown fixture MCL failed')
 end
-command('IMPORT TOOL tool:local/shutdown:latest AS shutdown')
+command('IMPORT TOOL tool:margatroid/shutdown:dev AS shutdown')
 command('EFFECT ready')
 while true do margatroid:wait(agent.address) end
 end
@@ -164,17 +164,17 @@ end
     );
     write(
         &root,
-        "tools/local/shutdown/latest/tool.toml",
+        "tools/margatroid/shutdown/dev/tool.toml",
         "schema_version=1\ndescription='test-owned persistent child process'\n",
     );
     write(
         &root,
-        "tools/local/shutdown/latest/input.schema.json",
+        "tools/margatroid/shutdown/dev/input.schema.json",
         r#"{"type":"object","properties":{"kind":{"type":"string"}},"required":["kind"]}"#,
     );
     write(
         &root,
-        "tools/local/shutdown/latest/main.lua",
+        "tools/margatroid/shutdown/dev/main.lua",
         r#"
 function configure() return {timeout_ms=0} end
 function execute(arguments, context)
@@ -204,7 +204,7 @@ function execute(arguments, context)
 end
 "#,
     );
-    shell_client::install_shell(&root.join("tools/local/shutdown/latest"));
+    shell_client::install_shell(&root.join("tools/margatroid/shutdown/dev"));
     let project = home.join("project");
     write(
         &project,
@@ -223,14 +223,14 @@ wait
     );
     write(
         &root,
-        "workspaces/shutdown/workspace.yaml",
+        "workspaces/margatroid/shutdown/dev/workspace.yaml",
         &format!(
-            "name: shutdown\nproject_root: {}\nmembers:\n  - name: fixture\n    driver: driver:local/shutdown:latest\n    home_root: {}\n",
+            "project_root: {}\nmembers:\n  - name: fixture\n    driver: driver:margatroid/shutdown:dev\n    home_root: {}\n",
             project.display(),
             home.display()
         ),
     );
-    root.join("workspaces/shutdown/workspace.yaml")
+    root.join("workspaces/margatroid/shutdown/dev/workspace.yaml")
 }
 
 async fn request(socket: &mut Socket, kind: &str, id: &str, message: Value) -> Value {
@@ -280,7 +280,7 @@ async fn shutdown_case(name: &str, repeat: bool) {
     let home = tempfile::tempdir().unwrap();
     let reservation = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let address = reservation.local_addr().unwrap();
-    let definition = fixture(home.path(), address);
+    fixture(home.path(), address);
     let log_path = home.path().join("daemon.log");
     let log = std::fs::File::create(&log_path).unwrap();
     drop(reservation);
@@ -341,7 +341,7 @@ async fn shutdown_case(name: &str, repeat: bool) {
         &mut socket,
         "workspace.start",
         "start",
-        json!({"path":definition}),
+        json!({"address":"workspace:margatroid/shutdown:dev"}),
     )
     .await;
     assert_eq!(started["type"], "workspace.start.result", "{started}");
@@ -531,7 +531,7 @@ async fn non_running_shutdown_case(starting: bool, name: &str) {
     let home = tempfile::tempdir().unwrap();
     let reservation = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let address = reservation.local_addr().unwrap();
-    let definition = fixture(home.path(), address);
+    fixture(home.path(), address);
     let program = if starting {
         r#"
 function configure()return {timeout_ms=0}end
@@ -543,11 +543,11 @@ function execute(_,context)
 end
 "#
     } else {
-        include_str!("../../../resources/agent-drivers/local/coder/latest/base.lua")
+        include_str!("../../../resources/agent-drivers/margatroid/coder/dev/base.lua")
     };
     write(
         &home.path().join(".margatroid"),
-        "agent-drivers/local/shutdown/latest/base.lua",
+        "agent-drivers/margatroid/shutdown/dev/base.lua",
         program,
     );
     let log_path = home.path().join("non-running-shutdown.log");
@@ -594,7 +594,7 @@ end
     if starting {
         socket
             .send(Message::Text(
-                json!({"type":"workspace.start","id":"start","message":{"path":definition}})
+                json!({"type":"workspace.start","id":"start","message":{"address":"workspace:margatroid/shutdown:dev"}})
                     .to_string()
                     .into(),
             ))
@@ -615,7 +615,7 @@ end
             &mut socket,
             "workspace.start",
             "start",
-            json!({"path":definition}),
+            json!({"address":"workspace:margatroid/shutdown:dev"}),
         )
         .await;
         assert_eq!(response["success"], false, "{response}");

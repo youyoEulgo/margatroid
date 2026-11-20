@@ -112,18 +112,6 @@ impl Plugin for WorkspacePlugin {
 pub(crate) fn invalid(error: impl std::fmt::Display) -> WorkspaceError {
     WorkspaceError::new(K::InvalidDefinition, error)
 }
-pub(crate) fn validate_name(name: &str) -> Result<(), WorkspaceError> {
-    if name.trim().is_empty()
-        || name.len() > 128
-        || matches!(name, "." | "..")
-        || name
-            .chars()
-            .any(|c| c.is_control() || matches!(c, '/' | '\\' | ':'))
-    {
-        return Err(invalid("invalid workspace or member name"));
-    }
-    Ok(())
-}
 pub(crate) fn checked_path(
     installed: &WorkspaceInstalled,
     path: &Path,
@@ -157,10 +145,10 @@ pub(crate) fn checked_path(
                 "workspace path is outside configured root",
             )
         })?;
-        if relative.components().count() != 2 {
+        if relative.components().count() != 4 {
             return Err(WorkspaceError::new(
                 K::InvalidRequest,
-                "expected root/<workspace>/workspace.yaml",
+                "expected root/<scope>/<name>/<tag>/workspace.yaml",
             ));
         }
     }

@@ -64,7 +64,7 @@ fn automatic_lua_failure_persists_and_pushes_logs_and_error_without_ready_or_ref
     }
     write(
         root.path(),
-        "agent-drivers/probe/failure/latest/base.lua",
+        "agent-drivers/probe/failure/dev/base.lua",
         r#"
 function configure()return {timeout_ms=0}end
 function execute(_,context)
@@ -81,9 +81,9 @@ end
     );
     write(
         root.path(),
-        "workspaces/probe/workspace.yaml",
+        "workspaces/margatroid/probe/dev/workspace.yaml",
         &format!(
-            "name: probe\nproject_root: {}\nmembers:\n- name: broken\n  driver: driver:probe/failure:latest\n  home_root: {}\n- name: control\n  driver: driver:probe/failure:latest\n  home_root: {}\n",
+            "project_root: {}\nmembers:\n- name: broken\n  driver: driver:probe/failure:dev\n  home_root: {}\n- name: control\n  driver: driver:probe/failure:dev\n  home_root: {}\n",
             root.path().display(),
             root.path().display(),
             root.path().display()
@@ -91,7 +91,7 @@ end
     );
     write(
         root.path(),
-        "agent-drivers/probe/failure/latest/setting.toml",
+        "agent-drivers/probe/failure/dev/setting.toml",
         "",
     );
     let mut app = build_app(ApplicationOptions {
@@ -106,14 +106,14 @@ end
     let client = app.world_mut().spawn();
     app.world_mut().insert_component(
         client,
-        address::Address::new("client:webui/state-probe").unwrap(),
+        address::Address::new("client:webui/state-probe:dev").unwrap(),
     );
     clients
         .commit_registration(
             connection,
             Arc::new(ClientIdentity {
                 client,
-                address: "client:webui/state-probe".into(),
+                address: "client:webui/state-probe:dev".into(),
                 client_type: "webui".into(),
                 name: "state-probe".into(),
             }),
@@ -122,7 +122,9 @@ end
     let (tx, mut rx) = oneshot::channel();
     app.world().emit_event(StartWorkspace {
         id: "start".into(),
-        path: root.path().join("workspaces/probe/workspace.yaml"),
+        path: root
+            .path()
+            .join("workspaces/margatroid/probe/dev/workspace.yaml"),
         reply: Arc::new(Mutex::new(Some(tx))),
     });
     let workspace = drive(&mut app, &mut rx).unwrap();

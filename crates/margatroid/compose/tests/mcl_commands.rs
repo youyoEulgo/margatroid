@@ -84,17 +84,17 @@ impl Fixture {
         let workspace = app.world_mut().spawn();
         app.world_mut().insert_component(
             workspace,
-            address::Address::new("workspace:test/unit").unwrap(),
+            address::Address::new("workspace:test/unit:dev").unwrap(),
         );
         let owner = app.world_mut().spawn();
         let client = app.world_mut().spawn();
         app.world_mut().insert_component(
             owner,
-            address::Address::new("agent:local/test:latest").unwrap(),
+            address::Address::new("agent:margatroid/test:dev").unwrap(),
         );
         app.world_mut().insert_component(
             client,
-            address::Address::new("client:local/frontend:latest").unwrap(),
+            address::Address::new("client:margatroid/frontend:dev").unwrap(),
         );
         let storage = open_storage(
             &root.path().join("agent.sqlite"),
@@ -791,11 +791,11 @@ async fn config_preserves_typed_values_and_failed_writes_leave_previous_file() {
 #[tokio::test]
 async fn imports_validate_dependencies_kind_and_cross_category_aliases_and_reread_prompts() {
     let mut fixture = Fixture::new();
-    let prompt = fixture.root.path().join("prompts/local/soul/latest");
+    let prompt = fixture.root.path().join("prompts/margatroid/soul/dev");
     fs::create_dir_all(&prompt).unwrap();
     fs::write(prompt.join("prompt.toml"), "role = 'system'\n").unwrap();
     fs::write(prompt.join("content.md"), "original prompt").unwrap();
-    let tool = fixture.root.path().join("tools/local/bash/latest");
+    let tool = fixture.root.path().join("tools/margatroid/bash/dev");
     fs::create_dir_all(&tool).unwrap();
     fs::write(
         tool.join("tool.toml"),
@@ -804,40 +804,46 @@ async fn imports_validate_dependencies_kind_and_cross_category_aliases_and_rerea
     .unwrap();
     fs::write(tool.join("input.schema.json"), "{}").unwrap();
     fs::write(tool.join("main.lua"), "function configure(arguments, context) return {timeout_ms=30000} end\nfunction execute() margatroid.task:return_result('test') end").unwrap();
-    let sandbox = fixture.root.path().join("sandboxes/local/policy/latest");
+    let sandbox = fixture.root.path().join("sandboxes/margatroid/policy/dev");
     fs::create_dir_all(&sandbox).unwrap();
     fs::write(sandbox.join("policy.json"), "{}").unwrap();
     fixture
-        .command("IMPORT MESSAGE prompt:local/soul:latest AS soul", vec![])
+        .command("IMPORT MESSAGE prompt:margatroid/soul:dev AS soul", vec![])
         .await
         .unwrap();
     assert_eq!(
         fixture
-            .command("IMPORT TOOL tool:local/bash AS soul", vec![])
+            .command("IMPORT TOOL tool:margatroid/bash:dev AS soul", vec![])
             .await
             .error_kind(),
         MclErrorKind::AliasConflict
     );
     assert_eq!(
         fixture
-            .command("IMPORT TOOL prompt:local/soul AS other", vec![])
+            .command("IMPORT TOOL prompt:margatroid/soul:dev AS other", vec![])
             .await
             .error_kind(),
         MclErrorKind::ImportDenied
     );
     assert_eq!(
         fixture
-            .command("IMPORT TOOL tool:local/undeclared AS other", vec![])
+            .command(
+                "IMPORT TOOL tool:margatroid/undeclared:dev AS other",
+                vec![]
+            )
             .await
             .error_kind(),
         MclErrorKind::ImportDenied
     );
     fixture
-        .command("IMPORT TOOL tool:local/bash AS bash", vec![])
+        .command("IMPORT TOOL tool:margatroid/bash:dev AS bash", vec![])
         .await
         .unwrap();
     fixture
-        .command("IMPORT SANDBOX sandbox:local/policy AS safe", vec![])
+        .command(
+            "IMPORT SANDBOX sandbox:margatroid/policy:dev AS safe",
+            vec![],
+        )
         .await
         .unwrap();
     fixture
@@ -1736,8 +1742,8 @@ async fn inference_error_does_not_finish_a_replacement_turn() {
 #[tokio::test]
 async fn bundled_drivers_record_inference_error_messages_and_keep_running_while_cleanup_finishes() {
     for source in [
-        include_str!("../../../../resources/agent-drivers/local/coder/latest/base.lua"),
-        include_str!("../../../../resources/agent-drivers/local/reviewer/latest/base.lua"),
+        include_str!("../../../../resources/agent-drivers/margatroid/coder/dev/base.lua"),
+        include_str!("../../../../resources/agent-drivers/margatroid/reviewer/dev/base.lua"),
     ] {
         for kind in [
             InferenceErrorKind::RequestFailed,
@@ -1816,7 +1822,7 @@ async fn bundled_drivers_record_inference_error_messages_and_keep_running_while_
                 .insert_component(workspace, executor);
             // Run the bundled initialization list; fake only resource imports and inference.
             let initial: Value = toml::from_str(include_str!(
-                "../../../../resources/agent-drivers/local/coder/latest/setting.toml"
+                "../../../../resources/agent-drivers/margatroid/coder/dev/setting.toml"
             ))
             .unwrap();
             fixture
@@ -1885,7 +1891,7 @@ async fn bundled_drivers_record_inference_error_messages_and_keep_running_while_
             owner: fixture.owner,
             workspace,
             program: LuaProgram {
-                source: source.replace("task = function() return margatroid.task:receive() end,", "").replace("if not subdriver then\n            margatroid.tools:register", "if false then\n            margatroid.tools:register").replace("local agent = margatroid.agent:create({\n        name = child_name,\n        config_path = config_path,\n        ui_path = context.resource_dir .. (subdriver and \"/subagent-ui\" or \"/ui\"),\n    })", "local agent = {address='agent:local/test:latest'}"),
+                source: source.replace("task = function() return margatroid.task:receive() end,", "").replace("if not subdriver then\n            margatroid.tools:register", "if false then\n            margatroid.tools:register").replace("local agent = margatroid.agent:create({\n        name = child_name,\n        config_path = config_path,\n        ui_path = context.resource_dir .. (subdriver and \"/subagent-ui\" or \"/ui\"),\n    })", "local agent = {address='agent:margatroid/test:dev'}"),
 
                 origin: "bundled-driver".into(),
 
@@ -2026,7 +2032,7 @@ async fn bundled_drivers_record_inference_error_messages_and_keep_running_while_
 #[tokio::test]
 async fn callers_must_supply_their_own_address_before_any_mcl_side_effect() {
     let mut fixture = Fixture::new();
-    for (index, source_address) in ["", "agent:local/test:latest", "entity:2:0"]
+    for (index, source_address) in ["", "agent:margatroid/test:dev", "entity:2:0"]
         .into_iter()
         .enumerate()
     {
@@ -2062,10 +2068,10 @@ async fn one_executor_records_mcl_caller_addresses_and_message_types_with_conten
     for (source, address, text) in [
         (
             fixture.client,
-            "client:local/frontend:latest",
+            "client:margatroid/frontend:dev",
             "from client",
         ),
-        (fixture.owner, "agent:local/test:latest", "from driver"),
+        (fixture.owner, "agent:margatroid/test:dev", "from driver"),
     ] {
         let payload = json!({"type":"user", "content":text});
         let mut reply = fixture.enqueue_as(
@@ -2948,7 +2954,11 @@ fn test_binding() -> tool_core::TaskSyncBinding {
 fn test_tasks() -> tool_core::ToolTasks {
     let mut app = core_plugin::App::new();
     let owner = app.world_mut().spawn();
-    tool_core::ToolTasks::new(owner, "agent:test/unit:latest".into(), test_binding())
+    tool_core::ToolTasks::new(
+        owner,
+        "agent:margatroid-test-dev/unit:dev".into(),
+        test_binding(),
+    )
 }
 
 fn test_agent_context() -> agent_core::AgentUpdateContext {

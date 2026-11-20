@@ -28,7 +28,7 @@ async fn unavailable_selected_backend_never_falls_back_to_unrestricted_worker() 
         "protocol_version":1,
         "program":"function configure(arguments, context) return {timeout_ms=30000} end\nfunction execute() margatroid.process:start('/bin/touch', {'unsafe'}):wait(); margatroid.task:return_result('unsafe') end",
         "arguments":{},
-        "context":{"agent_address":"agent:test/fixture","workspace":{"address":"workspace:test/unit","name":"test","project_root":"/tmp"},"owner_agent":null,"agent_name":"protocol-fixture","turn":"test-turn","source_origin":"protocol-fixture.lua","task_id":"sandbox-test","call_id":"call","alias":"tool","owner_task_id":null,"binding":null,"resource_dir":root.path(),"project_root":root.path(),"temp_dir":root.path()},
+        "context":{"agent_address":"agent:test/fixture:dev","workspace":{"address":"workspace:test/unit:dev","name":"test","project_root":"/tmp"},"owner_agent":null,"agent_name":"protocol-fixture","turn":"test-turn","source_origin":"protocol-fixture.lua","task_id":"sandbox-test","call_id":"call","alias":"tool","owner_task_id":null,"binding":null,"resource_dir":root.path(),"project_root":root.path(),"temp_dir":root.path()},
         "limits":ToolExecutionLimits::default()
     });
     let mut stdin = child.stdin.take().unwrap();

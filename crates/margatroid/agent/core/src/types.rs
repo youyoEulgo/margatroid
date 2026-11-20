@@ -17,7 +17,3 @@ pub struct AgentStartParameters {
     pub database_path: PathBuf,
     pub settings_path: PathBuf,
 }
-
-#[derive(Clone, Debug)]
-pub struct AgentResourceRoot(pub PathBuf);
-impl core_plugin::Resource for AgentResourceRoot {}

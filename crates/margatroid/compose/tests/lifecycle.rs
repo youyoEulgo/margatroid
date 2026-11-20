@@ -102,10 +102,10 @@ fn bundled_driver_runs_real_mcl_storage_and_http_then_stops_its_workspace() {
     copy_tree(&resources, root.path());
     let project = root.path().join("project");
     std::fs::create_dir_all(&project).unwrap();
-    let directory = root.path().join("workspaces/demo");
+    let directory = root.path().join("workspaces/margatroid/demo/dev");
     std::fs::create_dir_all(&directory).unwrap();
     let definition = directory.join("workspace.yaml");
-    std::fs::write(&definition, format!("name: demo\nproject_root: {}\nmembers:\n  - name: coder\n    driver: driver:local/coder:latest\n    home_root: {}\n", project.display(), root.path().display())).unwrap();
+    std::fs::write(&definition, format!("project_root: {}\nmembers:\n  - name: coder\n    driver: driver:margatroid/coder:dev\n    home_root: {}\n", project.display(), root.path().display())).unwrap();
     std::fs::write(
         root.path().join("config.toml"),
         "[server]\nbind='127.0.0.1:0'\n",
@@ -158,7 +158,7 @@ fn bundled_driver_runs_real_mcl_storage_and_http_then_stops_its_workspace() {
     let driver_settings = agent_driver_core::read_initial_settings(
         &root
             .path()
-            .join("agent-drivers/local/coder/latest/setting.toml"),
+            .join("agent-drivers/margatroid/coder/dev/setting.toml"),
         agent_driver_core::AgentDriverReadLimits::default().settings_bytes,
     )
     .unwrap();

@@ -13,6 +13,7 @@ import {
   type ServerMessage,
   type ToolCall,
   type WorkspaceConfig,
+  type WorkspaceDefinition,
   type WorkspaceInfo,
   type WorkspaceReference,
   type UserImage,
@@ -34,10 +35,10 @@ const COMMAND_RESULT: Partial<Record<ClientMessage['type'], ServerMessage['type'
   'workspace.start': 'workspace.start.result',
   'workspace.stop': 'workspace.stop.result',
   'workspace.restart': 'workspace.restart.result',
-  'workspace.reload': 'workspace.reload.result',
-  'agent.start': 'agent.start.result',
-  'agent.stop': 'agent.stop.result',
-  'agent.restart': 'agent.restart.result',
+  'workspace.create': 'workspace.create.result',
+  'workspace.update': 'workspace.update.result',
+  'workspace.rename': 'workspace.rename.result',
+  'workspace.delete': 'workspace.delete.result',
   'agent.turn.abort': 'agent.turn.abort.result',
   'mcl.execute': 'mcl.execute.result',
   'model.config.update': 'model.config.update.result',
@@ -137,6 +138,25 @@ export function workspaceKey(workspace: WorkspaceReference): string {
 }
 export function resourceName(resource: string): string {
   return resource.split('/').pop()?.split(':')[0] || resource;
+}
+export function workspaceAddressFromPath(path: string): string | null {
+  const match = /(?:^|\/)workspaces\/([^/]+)\/([^/]+)\/([^/]+)\/workspace\.yaml$/u.exec(
+    path.replace(/\\/gu, '/'),
+  );
+  return match ? `workspace:${match[1]}/${match[2]}:${match[3]}` : null;
+}
+export function workspaceDisplayName(
+  definition: { name?: string },
+  path: string,
+  address?: string | null,
+): string {
+  if (definition.name) return definition.name;
+  const source = address ?? workspaceAddressFromPath(path);
+  if (source?.startsWith('workspace:')) {
+    const body = source.slice('workspace:'.length);
+    return body.split('/').slice(1).join('/').split(':')[0] || body;
+  }
+  return resourceName(path);
 }
 export function contextInjection(
   content: string,
@@ -443,7 +463,7 @@ export function buildSidebarModel(
         key: definition.path,
         path: definition.path,
         address: instance?.id ?? null,
-        name: definition.cache.name,
+        name: workspaceDisplayName(definition.cache, definition.path, instance?.id),
         projectRoot: definition.cache.project_root,
         status,
         lifecycle: instance?.status ?? 'stopped',
@@ -553,7 +573,7 @@ export const useWorkbenchStore = defineStore('workbench', () => {
       return {
         path: definition.path,
         id: runtime?.id ?? '',
-        name: definition.cache.name,
+        name: workspaceDisplayName(definition.cache, definition.path, runtime?.id ?? null),
         project_root: runtime?.project_root ?? definition.cache.project_root,
         agents: runtime?.agents ?? [],
       };
@@ -1389,10 +1409,10 @@ export const useWorkbenchStore = defineStore('workbench', () => {
       cache: w.definition,
     }));
     runtimeWorkspaces.value = workspaceSnapshots.value
-      .filter((w) => w.address !== null)
+      .filter((w) => w.status !== 'inactive')
       .map((w) => ({
         id: w.address!,
-        name: w.definition.name,
+        name: workspaceDisplayName(w.definition, w.path, w.address),
         project_root: w.definition.project_root,
         definition_path: w.path,
         status: w.status as WorkspaceInfo['status'],
@@ -1622,10 +1642,10 @@ export const useWorkbenchStore = defineStore('workbench', () => {
       case 'workspace.start.result':
       case 'workspace.stop.result':
       case 'workspace.restart.result':
-      case 'workspace.reload.result':
-      case 'agent.start.result':
-      case 'agent.stop.result':
-      case 'agent.restart.result':
+      case 'workspace.create.result':
+      case 'workspace.update.result':
+      case 'workspace.rename.result':
+      case 'workspace.delete.result':
         settle(event.id, null, event.success ? undefined : event.error.message);
         break;
       case 'agent.turn.abort.result': {
@@ -1810,17 +1830,26 @@ export const useWorkbenchStore = defineStore('workbench', () => {
       workspaceOperationPending.value = false;
     }
   }
+  function workspaceAddress(path: string): string | null {
+    return (
+      workspaceSnapshots.value.find((workspace) => workspace.path === path)?.address ??
+      workspaceAddressFromPath(path)
+    );
+  }
   async function startWorkspace(path = selectedDefinition.value?.path): Promise<void> {
-    if (!path || !definitions.value.some((entry) => entry.path === path))
+    const address = path ? workspaceAddress(path) : null;
+    if (!path || !address || !definitions.value.some((entry) => entry.path === path))
       throw new Error('Choose a configured workspace definition');
     if (runtimeWorkspaces.value.some((workspace) => workspace.definition_path === path))
       throw new Error('Workspace is already active');
-    await workspaceRequest({ type: 'workspace.start', id: randomId(), message: { path } });
+    await workspaceRequest({ type: 'workspace.start', id: randomId(), message: { address } });
     workspaceNotice.value = 'Workspace started.';
   }
   async function restartWorkspace(path = selectedDefinition.value?.path): Promise<void> {
+    const address = path ? workspaceAddress(path) : null;
     if (
       !path ||
+      !address ||
       !runtimeWorkspaces.value.some(
         (workspace) =>
           workspace.definition_path === path && ['running', 'error'].includes(workspace.status),
@@ -1830,7 +1859,7 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     await workspaceRequest({
       type: 'workspace.restart',
       id: randomId(),
-      message: { path },
+      message: { address },
     });
     workspaceNotice.value = 'Workspace restarted.';
   }
@@ -1845,9 +1874,39 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     await workspaceRequest({
       type: 'workspace.stop',
       id: randomId(),
-      message: { path: runtimeWorkspaces.value.find((w) => w.id === address)!.definition_path },
+      message: { address },
     });
     workspaceNotice.value = 'Workspace stopped.';
+  }
+  async function updateWorkspace(
+    address: string,
+    definition: Omit<WorkspaceDefinition, 'name'>,
+  ): Promise<void> {
+    await workspaceRequest({
+      type: 'workspace.update',
+      id: randomId(),
+      message: { address, definition },
+    });
+    workspaceNotice.value = 'Workspace updated.';
+    sendQuery('workspace.req');
+  }
+  async function renameWorkspace(address: string, newAddress: string): Promise<void> {
+    await workspaceRequest({
+      type: 'workspace.rename',
+      id: randomId(),
+      message: { address, new_address: newAddress },
+    });
+    workspaceNotice.value = 'Workspace renamed.';
+    sendQuery('workspace.req');
+  }
+  async function deleteWorkspace(address: string): Promise<void> {
+    await workspaceRequest({
+      type: 'workspace.delete',
+      id: randomId(),
+      message: { address },
+    });
+    workspaceNotice.value = 'Workspace deleted.';
+    sendQuery('workspace.req');
   }
   function clearLogs() {
     logs.value = [];
@@ -1898,6 +1957,10 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     startWorkspace,
     restartWorkspace,
     stopWorkspace,
+    workspaceAddress,
+    updateWorkspace,
+    renameWorkspace,
+    deleteWorkspace,
     sidebarTree,
     toggleWorkspace,
     selectedWorkspaceKey,

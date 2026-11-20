@@ -24,30 +24,42 @@ pub enum ClientMessage {
     #[serde(rename = "workspace.start")]
     WorkspaceStart {
         id: String,
-        message: WorkspacePathDto,
+        message: WorkspaceTargetDto,
     },
     #[serde(rename = "workspace.stop")]
     WorkspaceStop {
         id: String,
-        message: WorkspacePathDto,
+        message: WorkspaceTargetDto,
     },
     #[serde(rename = "workspace.restart")]
     WorkspaceRestart {
         id: String,
-        message: WorkspacePathDto,
+        message: WorkspaceTargetDto,
     },
-    #[serde(rename = "workspace.reload")]
-    WorkspaceReload { id: String, message: EmptyDto },
+    #[serde(rename = "workspace.create")]
+    WorkspaceCreate {
+        id: String,
+        message: WorkspaceWriteDto,
+    },
+    #[serde(rename = "workspace.update")]
+    WorkspaceUpdate {
+        id: String,
+        message: WorkspaceWriteDto,
+    },
+    #[serde(rename = "workspace.rename")]
+    WorkspaceRename {
+        id: String,
+        message: WorkspaceRenameDto,
+    },
+    #[serde(rename = "workspace.delete")]
+    WorkspaceDelete {
+        id: String,
+        message: WorkspaceTargetDto,
+    },
     #[serde(rename = "agent.req")]
     AgentReq { id: String, message: EmptyDto },
     #[serde(rename = "agent.ui.req")]
     AgentUiReq { id: String, message: AgentTargetDto },
-    #[serde(rename = "agent.start")]
-    AgentStart { id: String, message: AgentStartDto },
-    #[serde(rename = "agent.stop")]
-    AgentStop { id: String, message: AgentTargetDto },
-    #[serde(rename = "agent.restart")]
-    AgentRestart { id: String, message: AgentTargetDto },
     #[serde(rename = "agent.turn.req")]
     AgentTurnReq { id: String, message: AgentTargetDto },
     #[serde(rename = "agent.turn.abort")]
@@ -84,12 +96,12 @@ impl ClientMessage {
             Self::WorkspaceStart { id, .. } => id,
             Self::WorkspaceStop { id, .. } => id,
             Self::WorkspaceRestart { id, .. } => id,
-            Self::WorkspaceReload { id, .. } => id,
+            Self::WorkspaceCreate { id, .. }
+            | Self::WorkspaceUpdate { id, .. }
+            | Self::WorkspaceRename { id, .. }
+            | Self::WorkspaceDelete { id, .. } => id,
             Self::AgentReq { id, .. } => id,
             Self::AgentUiReq { id, .. } => id,
-            Self::AgentStart { id, .. } => id,
-            Self::AgentStop { id, .. } => id,
-            Self::AgentRestart { id, .. } => id,
             Self::AgentTurnReq { id, .. } => id,
             Self::AgentTurnAbort { id, .. } => id,
             Self::AgentTaskReq { id, .. } => id,
@@ -147,22 +159,22 @@ pub enum ServerMessage {
         success: bool,
         error: Option<ProtocolErrorDto>,
     },
-    WorkspaceReloadResult {
+    WorkspaceCreateResult {
         id: String,
         success: bool,
         error: Option<ProtocolErrorDto>,
     },
-    AgentStartResult {
+    WorkspaceUpdateResult {
         id: String,
         success: bool,
         error: Option<ProtocolErrorDto>,
     },
-    AgentStopResult {
+    WorkspaceRenameResult {
         id: String,
         success: bool,
         error: Option<ProtocolErrorDto>,
     },
-    AgentRestartResult {
+    WorkspaceDeleteResult {
         id: String,
         success: bool,
         error: Option<ProtocolErrorDto>,
@@ -347,29 +359,29 @@ enum ServerWire {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<ProtocolErrorDto>,
     },
-    #[serde(rename = "workspace.reload.result")]
-    WorkspaceReloadResult {
+    #[serde(rename = "workspace.create.result")]
+    WorkspaceCreateResult {
         id: String,
         success: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<ProtocolErrorDto>,
     },
-    #[serde(rename = "agent.start.result")]
-    AgentStartResult {
+    #[serde(rename = "workspace.update.result")]
+    WorkspaceUpdateResult {
         id: String,
         success: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<ProtocolErrorDto>,
     },
-    #[serde(rename = "agent.stop.result")]
-    AgentStopResult {
+    #[serde(rename = "workspace.rename.result")]
+    WorkspaceRenameResult {
         id: String,
         success: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<ProtocolErrorDto>,
     },
-    #[serde(rename = "agent.restart.result")]
-    AgentRestartResult {
+    #[serde(rename = "workspace.delete.result")]
+    WorkspaceDeleteResult {
         id: String,
         success: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -580,17 +592,17 @@ impl From<ServerMessage> for ServerWire {
             ServerMessage::WorkspaceRestartResult { id, success, error } => {
                 Self::WorkspaceRestartResult { id, success, error }
             }
-            ServerMessage::WorkspaceReloadResult { id, success, error } => {
-                Self::WorkspaceReloadResult { id, success, error }
+            ServerMessage::WorkspaceCreateResult { id, success, error } => {
+                Self::WorkspaceCreateResult { id, success, error }
             }
-            ServerMessage::AgentStartResult { id, success, error } => {
-                Self::AgentStartResult { id, success, error }
+            ServerMessage::WorkspaceUpdateResult { id, success, error } => {
+                Self::WorkspaceUpdateResult { id, success, error }
             }
-            ServerMessage::AgentStopResult { id, success, error } => {
-                Self::AgentStopResult { id, success, error }
+            ServerMessage::WorkspaceRenameResult { id, success, error } => {
+                Self::WorkspaceRenameResult { id, success, error }
             }
-            ServerMessage::AgentRestartResult { id, success, error } => {
-                Self::AgentRestartResult { id, success, error }
+            ServerMessage::WorkspaceDeleteResult { id, success, error } => {
+                Self::WorkspaceDeleteResult { id, success, error }
             }
             ServerMessage::AgentRes {
                 id,
@@ -816,17 +828,17 @@ impl From<ServerWire> for ServerMessage {
             ServerWire::WorkspaceRestartResult { id, success, error } => {
                 Self::WorkspaceRestartResult { id, success, error }
             }
-            ServerWire::WorkspaceReloadResult { id, success, error } => {
-                Self::WorkspaceReloadResult { id, success, error }
+            ServerWire::WorkspaceCreateResult { id, success, error } => {
+                Self::WorkspaceCreateResult { id, success, error }
             }
-            ServerWire::AgentStartResult { id, success, error } => {
-                Self::AgentStartResult { id, success, error }
+            ServerWire::WorkspaceUpdateResult { id, success, error } => {
+                Self::WorkspaceUpdateResult { id, success, error }
             }
-            ServerWire::AgentStopResult { id, success, error } => {
-                Self::AgentStopResult { id, success, error }
+            ServerWire::WorkspaceRenameResult { id, success, error } => {
+                Self::WorkspaceRenameResult { id, success, error }
             }
-            ServerWire::AgentRestartResult { id, success, error } => {
-                Self::AgentRestartResult { id, success, error }
+            ServerWire::WorkspaceDeleteResult { id, success, error } => {
+                Self::WorkspaceDeleteResult { id, success, error }
             }
             ServerWire::AgentRes {
                 id,
@@ -1047,10 +1059,10 @@ impl ServerMessage {
             Self::WorkspaceStartResult { id, .. } => Some(id),
             Self::WorkspaceStopResult { id, .. } => Some(id),
             Self::WorkspaceRestartResult { id, .. } => Some(id),
-            Self::WorkspaceReloadResult { id, .. } => Some(id),
-            Self::AgentStartResult { id, .. } => Some(id),
-            Self::AgentStopResult { id, .. } => Some(id),
-            Self::AgentRestartResult { id, .. } => Some(id),
+            Self::WorkspaceCreateResult { id, .. }
+            | Self::WorkspaceUpdateResult { id, .. }
+            | Self::WorkspaceRenameResult { id, .. }
+            | Self::WorkspaceDeleteResult { id, .. } => Some(id),
             Self::AgentRes { id, .. } => Some(id),
             Self::AgentSync { .. } => None,
             Self::AgentUiRes { id, .. } => Some(id),
@@ -1089,14 +1101,8 @@ pub struct ClientInfoDto {
 }
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct WorkspacePathDto {
-    pub path: String,
-}
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct AgentStartDto {
-    pub workspace: AddressDto,
-    pub name: String,
+pub struct WorkspaceTargetDto {
+    pub address: AddressDto,
 }
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1143,7 +1149,6 @@ pub struct WorkspaceInfoDto {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkspaceDefinitionDto {
-    pub name: String,
     pub project_root: String,
     pub agents: Vec<WorkspaceAgentDefinitionDto>,
 }
@@ -1406,4 +1411,17 @@ pub struct ModelConfigUpdateDto {
 pub struct AgentCreatorDto {
     pub address: AddressDto,
     pub task_id: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceWriteDto {
+    pub address: AddressDto,
+    pub definition: WorkspaceDefinitionDto,
+}
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceRenameDto {
+    pub address: AddressDto,
+    pub new_address: AddressDto,
 }

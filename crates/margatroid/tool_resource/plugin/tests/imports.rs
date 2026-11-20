@@ -123,7 +123,8 @@ fn await_validation(app: &mut App) {
 }
 
 fn entry(path: PathBuf) -> ToolEntry {
-    ToolEntry { owner_agent:None,
+    ToolEntry {
+        owner_agent: None,
         path,
         description: "old".into(),
         input_schema: serde_json::json!({}),

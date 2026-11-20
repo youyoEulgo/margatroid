@@ -71,7 +71,7 @@ impl Fixture {
         let workspace = app.world_mut().spawn();
         app.world_mut().insert_component(
             workspace,
-            address::Address::new("workspace:test/unit").unwrap(),
+            address::Address::new("workspace:test/unit:dev").unwrap(),
         );
         app.world_mut().insert_component(
             workspace,
@@ -758,7 +758,7 @@ fn bundled_bash_exec_sleep_eleven_seconds_succeeds_with_author_configured_budget
     let mut fixture = Fixture::with_limits(limits);
     fixture.tool(
         "bash-exec",
-        include_str!("../../../../../resources/tools/local/bash-exec/latest/main.lua"),
+        include_str!("../../../../../resources/tools/margatroid/bash-exec/dev/main.lua"),
     );
     let reply = fixture.execute(
         "sleep-eleven",
@@ -918,7 +918,7 @@ fn bundled_bash_stays_alive_after_reply_and_preserves_shell_state() {
     let mut fixture = Fixture::new();
     fixture.tool(
         "bash",
-        include_str!("../../../../../resources/tools/local/bash/latest/main.lua"),
+        include_str!("../../../../../resources/tools/margatroid/bash/dev/main.lua"),
     );
     let reply = fixture.execute("terminal", "bash", json!({}));
     let response = fixture.response(reply).unwrap();
@@ -959,7 +959,7 @@ fn terminal_slow_reader_receives_all_eighty_scrolled_lines_once() {
         let mut fixture = Fixture::new();
         fixture.tool(
             "bash",
-            include_str!("../../../../../resources/tools/local/bash/latest/main.lua"),
+            include_str!("../../../../../resources/tools/margatroid/bash/dev/main.lua"),
         );
         let reply = fixture.execute("history", "bash", json!({}));
         fixture.response(reply).unwrap();
@@ -1017,7 +1017,7 @@ fn terminal_alternate_screen_updates_replace_cache_without_escape_sequences() {
     let mut fixture = Fixture::new();
     fixture.tool(
         "bash",
-        include_str!("../../../../../resources/tools/local/bash/latest/main.lua"),
+        include_str!("../../../../../resources/tools/margatroid/bash/dev/main.lua"),
     );
     let reply = fixture.execute("screen", "bash", json!({}));
     fixture.response(reply).unwrap();
@@ -1091,7 +1091,7 @@ fn bash_exit_finishes_task_even_if_a_background_process_keeps_the_pty_open() {
     let mut fixture = Fixture::new();
     fixture.tool(
         "bash",
-        include_str!("../../../../../resources/tools/local/bash/latest/main.lua"),
+        include_str!("../../../../../resources/tools/margatroid/bash/dev/main.lua"),
     );
     let reply = fixture.execute("background-child", "bash", json!({}));
     fixture.response(reply).unwrap();
@@ -1343,7 +1343,7 @@ fn interactive_bash_gets_its_own_controlling_terminal_under_tty_daemon() {
             let mut fixture = Fixture::new();
             fixture.tool(
                 "bash",
-                include_str!("../../../../../resources/tools/local/bash/latest/main.lua"),
+                include_str!("../../../../../resources/tools/margatroid/bash/dev/main.lua"),
             );
             let reply = fixture.execute("own-pty", "bash", json!({}));
             fixture.response(reply).unwrap();
@@ -1895,7 +1895,7 @@ fn cross_agent_registration_uses_third_agent_lifetime_and_preserves_accepted_cal
     f.tool("factory",r#"function configure() return {timeout_ms=0} end
  function execute()
   local ctx=margatroid.context
-  assert(ctx.workspace.address=='workspace:test/unit:latest' and ctx.workspace.name=='test',margatroid.data:encode('json',ctx.workspace))
+  assert(ctx.workspace.address=='workspace:test/unit:dev' and ctx.workspace.name=='test',margatroid.data:encode('json',ctx.workspace))
   if ctx.binding then
    local output=margatroid.task:read_output({agent=ctx.owner_agent,task_id=ctx.owner_task_id})
    assert(output.output[1]=='owner-ready')

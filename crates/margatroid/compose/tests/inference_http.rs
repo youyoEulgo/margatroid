@@ -210,10 +210,12 @@ impl Fixture {
         let workspace = app.world_mut().spawn();
         app.world_mut().insert_component(
             workspace,
-            address::Address::new("workspace:test/unit").unwrap(),
+            address::Address::new("workspace:test/unit:dev").unwrap(),
         );
-        app.world_mut()
-            .insert_component(workspace, Address::new("workspace:local/demo").unwrap());
+        app.world_mut().insert_component(
+            workspace,
+            Address::new("workspace:margatroid/demo:dev").unwrap(),
+        );
         app.world_mut().insert_component(
             workspace,
             workspace_core::Workspace::new(
@@ -231,7 +233,7 @@ impl Fixture {
             app.world_mut(),
             agent,
             agent_core::AgentCreator {
-                address: "workspace:local/test:latest".into(),
+                address: "workspace:margatroid/test:dev".into(),
                 task_id: "fixture-driver".into(),
             },
         );
@@ -250,8 +252,10 @@ impl Fixture {
                 agent_updates.clone(),
             ),
         );
-        app.world_mut()
-            .insert_component(agent, Address::new("agent:test/agent").unwrap());
+        app.world_mut().insert_component(
+            agent,
+            Address::new("agent:margatroid-test-dev/agent:dev").unwrap(),
+        );
         install_vm(app.world_mut(), agent, "driver-fixture");
         let (sender, mut reply) = oneshot::channel();
         app.world().emit_event(InitInference {
@@ -606,10 +610,10 @@ fn invalid_turn_and_stale_entity_never_find_a_replacement_by_address() {
     let replacement = fixture.app.world_mut().spawn();
     assert_eq!(original.index(), replacement.index());
     assert_ne!(original.generation(), replacement.generation());
-    fixture
-        .app
-        .world_mut()
-        .insert_component(replacement, Address::new("agent:test/agent").unwrap());
+    fixture.app.world_mut().insert_component(
+        replacement,
+        Address::new("agent:margatroid-test-dev/agent:dev").unwrap(),
+    );
     assert_eq!(
         fixture.run(request, reply).unwrap_err().kind,
         Kind::AgentMissing
@@ -788,7 +792,7 @@ fn address_only_state_and_streams_preserve_target_through_vm_restart() {
         });
         for frame in [&reasoning, &content, &finished] {
             assert!(frame.get("instance").is_none());
-            assert_eq!(frame["address"], "agent:test/agent:latest");
+            assert_eq!(frame["address"], "agent:margatroid-test-dev/agent:dev");
             serde_json::from_value::<margatroid_protocol::ServerMessage>(frame.clone()).unwrap();
         }
         assert_eq!(reasoning["reasoning"], "thinking");

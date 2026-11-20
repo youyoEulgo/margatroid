@@ -15,9 +15,10 @@ use std::{
 use tokio::sync::oneshot;
 use workspace_core::{WorkspaceExecutionClose, WorkspaceState, spawn_workspace_executor};
 
-const CODER: &str = include_str!("../../../../resources/agent-drivers/local/coder/latest/base.lua");
+const CODER: &str =
+    include_str!("../../../../resources/agent-drivers/margatroid/coder/dev/base.lua");
 const REVIEWER: &str =
-    include_str!("../../../../resources/agent-drivers/local/reviewer/latest/base.lua");
+    include_str!("../../../../resources/agent-drivers/margatroid/reviewer/dev/base.lua");
 
 #[derive(Default)]
 struct Commands {
@@ -59,7 +60,7 @@ impl Fixture {
         let owner = app.world_mut().spawn();
         app.world_mut().insert_component(
             owner,
-            address::Address::new("agent:local/driver-errors:latest").unwrap(),
+            address::Address::new("agent:margatroid/driver-errors:dev").unwrap(),
         );
         let storage = storage_core::open_storage(
             &root.path().join("agent.sqlite"),
@@ -71,7 +72,7 @@ impl Fixture {
         let workspace = app.world_mut().spawn();
         app.world_mut().insert_component(
             workspace,
-            address::Address::new("workspace:test/unit").unwrap(),
+            address::Address::new("workspace:test/unit:dev").unwrap(),
         );
         app.world_mut().insert_component(
             workspace,
@@ -93,7 +94,7 @@ impl Fixture {
         app.world_mut().insert_resource(LuaServices::new(move|identity,method,args|{let events=events.clone();let closures=closures.clone();Box::pin(async move{
             match method.as_str(){
                 "execution_finished"|"tools_register"=>Ok(json!({})),
-                "agent_create"=>Ok(json!({"address":"agent:local/driver-errors:latest"})),
+                "agent_create"=>Ok(json!({"address":"agent:margatroid/driver-errors:dev"})),
                 "wait"=>{let(tx,rx)=oneshot::channel();closures.send(move|world|{let _=tx.send(world.get_component::<DriverLuaVm>(owner).unwrap().wake.clone());});let slot=rx.await.unwrap();tokio::select!{_=identity.cancel.cancelled()=>Err(LuaRuntimeError::new(LuaRuntimeErrorKind::Cancelled,"cancelled")),result=DriverWakeSlot::wait(slot)=>{result?;Ok(serde_json::Value::Null)}}},
                 "task_receive"=>std::future::pending::<Result<Value,LuaRuntimeError>>().await,
                 "mcl_execute"=>{let(tx,rx)=oneshot::channel();events.send_event(MclCommand{id:"fixture-mcl".into(),source:identity.source,source_address:identity.address,source_instance:Some(identity.instance),target:owner,instruction:mcl_core::MclInstruction{text:args["instruction"].as_str().unwrap().into(),arguments:serde_json::from_value(args["arguments"].clone()).unwrap()},cancel:identity.cancel,reply:Arc::new(Mutex::new(Some(tx)))});Ok(match rx.await.unwrap().unwrap(){MclValue::Unit=>json!({}),value=>serde_json::to_value(value).unwrap()})},
@@ -122,7 +123,7 @@ impl Fixture {
                         MclValue::Unit
                     } else {
                         let mut config:toml::Table=toml::from_str("sandbox='read_only'\n[compaction]\nthreshold=0.8\nkeep_messages=2\n").unwrap();
-                        let initialization=state.initialization.clone().unwrap_or_else(||toml::from_str::<Value>(include_str!("../../../../resources/agent-drivers/local/coder/latest/setting.toml")).unwrap()["initialization"].clone());
+                        let initialization=state.initialization.clone().unwrap_or_else(||toml::from_str::<Value>(include_str!("../../../../resources/agent-drivers/margatroid/coder/dev/setting.toml")).unwrap()["initialization"].clone());
                         config.insert("initialization".into(),toml::Value::try_from(initialization).unwrap());
                         MclValue::Config(config)
                     }
@@ -209,8 +210,8 @@ impl Fixture {
         };
         self.app.world().send_event(StartDriverLuaVm {
             owner:self.owner, workspace:self.workspace,
-            program:LuaProgram {source, origin:PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../resources/agent-drivers/local/coder/latest/shipped-driver.lua"), },
-            environment:LuaEnvironment {globals:BTreeMap::from([("execution_context".into(), LuaBinding::Value(LuaValue::from_json(json!({"workspace":{"address":"workspace:test/unit:latest"},"name":"test","resource_dir":"/tmp"})).unwrap()))]), modules:BTreeMap::new()},
+            program:LuaProgram {source, origin:PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../resources/agent-drivers/margatroid/coder/dev/shipped-driver.lua"), },
+            environment:LuaEnvironment {globals:BTreeMap::from([("execution_context".into(), LuaBinding::Value(LuaValue::from_json(json!({"workspace":{"address":"workspace:test/unit:dev"},"name":"test","resource_dir":"/tmp"})).unwrap()))]), modules:BTreeMap::new()},
             reply:Arc::new(Mutex::new(Some(sender))),
         });
         self.drive(|| reply.try_recv().ok()).await

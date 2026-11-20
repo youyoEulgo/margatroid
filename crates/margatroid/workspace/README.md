@@ -9,7 +9,7 @@ Margatroid启动时传入配置根目录，调用WorkspacePlugin::open读取并�
 
 WorkspaceDefinitions是展示和启动共同使用的定义缓存，不再限定为展示目录。所有定义加载只有一条全量重载流程：读取配置根下全部定义、完整校验、原子更新缓存。不提供针对某个Workspace单独读取并启动的旁路。
 
-显式reload只执行上述流程。Workspace和单独Agent的启动执行同一全量reload，成功后再从缓存读取目标Workspace及成员参数启动；失败即结束操作，不能继续从旧缓存启动。
+全量reload仅为内部能力，公开workspace.reload已删除。Workspace和单独Agent的启动执行同一全量reload，成功后再从缓存读取目标Workspace及成员参数启动；失败即结束操作，不能继续从旧缓存启动。
 
 reload返回同一次发布的不可变缓存快照，后续启动以该快照为数据源，避免并发重载使“刚重载”和“启动使用”的内容分离。Workspace批量启动成员复用这一份快照，不对每个成员重复扫描。单独启动Agent则先完成一次全量reload，从新快照选择所属Workspace与成员，再调用既有Agent生命周期能力。
 
@@ -32,7 +32,7 @@ WorkspaceExecutor持有提交入口和关闭能力。Send工厂在专属线程�
 关闭提交入口不终止已有任务，Driver仍能完成退出。需要额外提交的清理工作使用明确的内部能力，不重新开放普通入口。生命周期闭包运行在mecs全局异步设施，不运行在待关闭的Workspace线程上；join不阻塞ECS线程。
 
 
-新API设计将统一缓存定义与自身运行状态由DTO合成Workspace对象，不再提供definitions wire子域。WorkspaceDefinitions::reload是全部重载入口，既供workspace.reload调用，也供普通Workspace/Agent启动调用。全量加载及Workspace生命周期已共用同一core入口，不改变System或公开事件字段。扫描移除但仍运行的实例保留展示，允许停止；重启先停止，后续普通启动要求本次全量重载后的缓存包含目标定义。停止完成后，该来源已移除的项退出列表。
+新API设计将统一缓存定义与自身运行状态由DTO合成Workspace对象，不再提供definitions wire子域。WorkspaceDefinitions::reload是全部重载入口，供内部启动和磁盘监控调用，不再有公开reload接口。全量加载及Workspace生命周期已共用同一core入口，不改变System或公开事件字段。扫描移除但仍运行的实例保留展示，允许停止；重启先停止，后续普通启动要求本次全量重载后的缓存包含目标定义。停止完成后，该来源已移除的项退出列表。
 
 全量reload使用共享串行锁覆盖读取、校验和发布；返回的WorkspaceDefinitionSnapshot持有不可变Arc，后续重载不会改变已取得的启动材料。未配置来源的默认资源reload明确报错，不把旧entries伪装成刚读到的新数据。配置来源保留目录或单文件两种既有装配形式；单文件形式的全量集合就是该配置文件，不新增按请求目标单独读取的旁路。
 
@@ -40,13 +40,23 @@ WorkspaceExecutor持有提交入口和关闭能力。Send工厂在专属线程�
 
 一个StartAgent只启动一个Agent。Workspace持有成员启动的并发编排，先发送全部单成员事件，再join_all收齐全部结果；Agent领域只处理自己的单次生命周期操作。
 
-定义监控和显式reload共用全量校验入口，变化后通过update_workspace提交新缓存及workspace.sync；运行状态、成员和故障也从同一入口更新。来源变化不自动改写运行实例定义或执行生命周期动作。监控覆盖父目录上的创建、删除及原子替换，100ms合并写入，失败保留最后有效集合，取消等待真实worker结束。
+定义监控和内部启动扫描共用全量校验入口，变化后通过update_workspace提交新缓存及workspace.sync；运行状态、成员和故障也从同一入口更新。来源变化不自动改写运行实例定义或执行生命周期动作。监控覆盖父目录上的创建、删除及原子替换，100ms合并写入，失败保留最后有效集合，取消等待真实worker结束。
 
 
-当前工作树已实现统一Lua：复用既有资源挂载、Storage、MCL队列、任务监督、进程回收及同步入口。Workspace先启动独立Lua任务；Agent创建由公共Lua注入能力提交StartAgent，Agent不再启动/持有/终止Lua VM。执行者与目标分开，Agent统一归属Workspace，创建来源由实际任务绑定记录，配置按明确初值文件初始化持久化，UI按创建时传入目录直接监控，模型通过EFFECT model_set配置。公共mcl.execute指定目标，wait(agent)登记本次唤醒句柄；关闭Agent使用margatroid.agent:stop(address)注入方法提交原StopAgent并外部监督，不经过MCL。EFFECT tool_call只接收调用数组。Driver专用manifest依赖裁剪取消；工具发现元数据保持。初始化/委托/子代理应用未实现；前端源码不在本轮修改范围内。
+当前工作树已实现统一Lua：复用既有资源挂载、Storage、MCL队列、任务监督、进程回收及同步入口。Workspace先启动独立Lua任务；Agent创建由公共Lua注入能力提交StartAgent，Agent不再启动/持有/终止Lua VM。执行者与目标分开，Agent统一归属Workspace，创建来源由实际任务绑定记录，配置按明确初值文件初始化持久化，UI按创建时传入目录直接监控，模型通过EFFECT model_set配置。公共mcl.execute指定目标，wait(agent)登记本次唤醒句柄；关闭Agent使用margatroid.agent:stop(address)注入方法提交原StopAgent并外部监督，不经过MCL。EFFECT tool_call只接收调用数组。Driver专用manifest依赖裁剪取消；工具发现元数据保持。初始化及全新子代理资源已实现；前端源码不在本轮修改范围内。
 
 四态契约：Agent/Workspace公开starting、running、error、stopping；Agent挂载完成不是ready，MCL允许starting/running，推理和工具显式携带turn时要求running且匹配，省略时为Starting/Running自由调用。Lua创建的Agent在返回信息前绑定创建者真实任务scope与AgentSession；return_result不结束生命周期，任务取消/退出会提交原StopAgent并等待全部绑定Agent实际移除后才确认任务清理。主动停止Agent会解绑；异常日志沿原Agent存储处理，正常结束和取消不误报故障。关闭使用Lua agent.stop注入，不提供MCL agent_stop。
 
 Agent创建注入接口为name/config_path/ui_path，拒绝旧resource_dir创建参数。配置仅首次从config_path初始化至Agent持久setting.toml，后续重启保留已修改配置；ui_path始终直接引用与监控，不创建Agent本地UI，不复制、覆盖、删除已有UI副本，也不把旧副本作为回退来源。Lua程序加载只读取程序文件，不推导或读取同目录配置。
 
 Workspace文件HTTP访问已实现：文件根取实际运行实例project_root，完整Workspace Address唯一定位；Starting/Running/Error可读，Stopping拒绝，实例不存在404。不使用Agent数据目录或ui_path，也不从变更后的定义缓存替换运行根。
+
+## 地址化资源管理
+
+Workspace身份为workspace:<scope>/<name>:<tag>，当前内置scope=margatroid、内置资源显式使用tag=dev，地址不提供默认tag，管理目录workspaces/<scope>/<name>/<tag>/workspace.yaml。定义不保存name，名称只取地址name，更名只能走rename。创建/修改提交结构化definition；create创建目录且不启动，update完整替换定义不改变地址；rename移动整个管理目录及其Agent配置/历史/快照，不合并已存在目标；delete只删除管理目录，绝不删除project_root项目目录。
+
+公开新增workspace.create/update/rename/delete，start/stop/restart改为address参数；旧path和workspace.reload不保留别名。update/rename/delete必须完全停止，starting/running/error/stopping均不允许。definitions.reload_lock与active路径登记共同裁决磁盘操作和启动，停止真实完成才release；修改成功重扫并由同一observer发布sync。磁盘监控覆盖三层资源目录新增/删除/改名及定义替换，不靠客户端reload发现。
+
+旧local/latest资源目录及原单层Workspace布局不自动迁移；本次仅修改源码、内置资源和隔离测试，用户持久配置、历史及项目目录保持原样。Agent地址作用域为Workspace scope-name-tag，例如agent:margatroid-project-dev/coder:dev，冲突明确拒绝，无父地址哈希。
+
+Workspace YAML顶层只保存project_root和成员配置，网络definition只保存project_root及agents；顶层name已删除且作为未知字段拒绝，不自动忽略或迁移。成员name保持原语义。运行实例名称从Workspace地址创建时取得，后续定义安装只更新project_root及成员定义，不覆盖运行名称。

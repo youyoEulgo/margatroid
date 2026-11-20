@@ -25,6 +25,7 @@ pub struct WorkspaceDefinitions {
     observer: Arc<OnceLock<DefinitionObserver>>,
     source: Option<PathBuf>,
     reload_lock: Arc<std::sync::Mutex<()>>,
+    active: Arc<std::sync::Mutex<BTreeSet<PathBuf>>>,
 }
 #[derive(Clone, Debug)]
 pub struct WorkspaceDefinitionSnapshot {
@@ -88,6 +89,9 @@ impl WorkspaceDefinitions {
             .reload_lock
             .lock()
             .map_err(|_| invalid_definition("definition reload lock poisoned"))?;
+        self.reload_locked()
+    }
+    fn reload_locked(&self) -> Result<WorkspaceDefinitionSnapshot, WorkspaceError> {
         let source = self
             .source
             .as_deref()
@@ -113,6 +117,137 @@ impl WorkspaceDefinitions {
             observer(Ok(snapshot.clone()));
         }
         Ok(snapshot)
+    }
+    pub fn path_for(&self, address: &str) -> Result<PathBuf, WorkspaceError> {
+        let root = self
+            .source
+            .as_ref()
+            .filter(|root| root.is_dir())
+            .ok_or_else(|| invalid_definition("Workspace resource directory is required"))?;
+        let (scope, name, tag) = parse_workspace_address(address)?;
+        let path = root.join(scope).join(name).join(tag).join("workspace.yaml");
+        reject_definition_symlinks(&path)?;
+        Ok(path)
+    }
+    pub fn reserve(&self, path: &Path) -> Result<(), WorkspaceError> {
+        let _guard = self
+            .reload_lock
+            .lock()
+            .map_err(|_| invalid_definition("Workspace operation lock poisoned"))?;
+        if !path.is_file() {
+            return Err(invalid_definition("Workspace definition missing"));
+        }
+        if !self.active.lock().unwrap().insert(path.to_path_buf()) {
+            return Err(WorkspaceError::new(
+                WorkspaceErrorKind::Duplicate,
+                "Workspace is already active",
+            ));
+        }
+        Ok(())
+    }
+    pub fn release(&self, path: &Path) {
+        let _guard = self.reload_lock.lock().unwrap();
+        self.active.lock().unwrap().remove(path);
+    }
+    pub fn modify(&self, operation: WorkspaceModification) -> Result<(), WorkspaceError> {
+        use std::io::Write;
+        let _guard = self
+            .reload_lock
+            .lock()
+            .map_err(|_| invalid_definition("Workspace operation lock poisoned"))?;
+        let address = match &operation {
+            WorkspaceModification::Create { address, .. }
+            | WorkspaceModification::Update { address, .. }
+            | WorkspaceModification::Delete { address }
+            | WorkspaceModification::Rename { address, .. } => address,
+        };
+        let path = self.path_for(address)?;
+        let directory = path.parent().unwrap();
+        if self.active.lock().unwrap().contains(&path) {
+            return Err(WorkspaceError::new(
+                WorkspaceErrorKind::StateRejected,
+                "Stop Workspace completely before modifying it",
+            ));
+        }
+        let create = matches!(&operation, WorkspaceModification::Create { .. });
+        match operation {
+            WorkspaceModification::Create { definition, .. }
+            | WorkspaceModification::Update { definition, .. } => {
+                validate_workspace_definition(&definition)?;
+                if !definition.project_root.is_absolute()
+                    || definition
+                        .members
+                        .iter()
+                        .any(|m| !m.home_root.is_absolute())
+                {
+                    return Err(invalid_definition("Workspace API paths must be absolute"));
+                }
+                let bytes = serde_yaml::to_string(&definition).map_err(invalid_definition)?;
+                if bytes.len() > MAX_WORKSPACE_DEFINITION_BYTES {
+                    return Err(invalid_definition("Workspace definition exceeds 1 MiB"));
+                }
+                if create {
+                    std::fs::create_dir_all(directory.parent().unwrap())
+                        .map_err(invalid_definition)?;
+                    reject_definition_symlinks(directory)?;
+                    std::fs::create_dir(directory).map_err(invalid_definition)?;
+                } else {
+                    if !path.is_file() {
+                        return Err(invalid_definition("Workspace definition missing"));
+                    }
+                }
+                let staged = directory.join(".workspace-write.yaml");
+                let mut file = std::fs::OpenOptions::new()
+                    .create_new(true)
+                    .write(true)
+                    .open(&staged)
+                    .map_err(invalid_definition)?;
+                let write = (|| {
+                    file.write_all(bytes.as_bytes())?;
+                    file.sync_all()?;
+                    std::fs::rename(&staged, &path)?;
+                    File::open(directory)?.sync_all()
+                })();
+                if write.is_err() {
+                    let _ = std::fs::remove_file(&staged);
+                }
+                write.map_err(invalid_definition)?;
+            }
+            WorkspaceModification::Rename { new_address, .. } => {
+                let destination = self.path_for(&new_address)?;
+                let new_dir = destination.parent().unwrap();
+                if new_dir.exists() {
+                    return Err(WorkspaceError::new(
+                        WorkspaceErrorKind::Duplicate,
+                        "Workspace destination already exists",
+                    ));
+                }
+                if !path.is_file() {
+                    return Err(invalid_definition("Workspace definition missing"));
+                }
+                std::fs::create_dir_all(new_dir.parent().unwrap()).map_err(invalid_definition)?;
+                reject_definition_symlinks(new_dir)?;
+                std::fs::rename(directory, new_dir).map_err(invalid_definition)?;
+                File::open(directory.parent().unwrap())
+                    .and_then(|file| file.sync_all())
+                    .map_err(invalid_definition)?;
+                File::open(new_dir.parent().unwrap())
+                    .and_then(|file| file.sync_all())
+                    .map_err(invalid_definition)?;
+            }
+            WorkspaceModification::Delete { .. } => {
+                if !path.is_file() {
+                    return Err(invalid_definition("Workspace definition missing"));
+                }
+                // The checked resource path owns this directory; project_root is never followed.
+                std::fs::remove_dir_all(directory).map_err(invalid_definition)?;
+                File::open(directory.parent().unwrap())
+                    .and_then(|file| file.sync_all())
+                    .map_err(invalid_definition)?;
+            }
+        }
+        self.reload_locked()?;
+        Ok(())
     }
     pub fn get(&self, path: &Path) -> Option<WorkspaceDefinition> {
         self.entries
@@ -161,21 +296,40 @@ pub fn load_workspace_definitions(
             .collect::<Result<Vec<_>, _>>()
             .map_err(invalid_definition)?;
         entries.sort_by_key(|entry| entry.file_name());
-        for entry in entries {
-            if entry.file_name().to_string_lossy().starts_with('.') {
+        for scope in entries {
+            if scope.file_name().to_string_lossy().starts_with('.') {
                 continue;
             }
-            let kind = entry.file_type().map_err(invalid_definition)?;
-            if kind.is_symlink() {
-                return Err(invalid_definition(
-                    "workspace root contains a symbolic link",
-                ));
+            if scope.file_type().map_err(invalid_definition)?.is_symlink() {
+                return Err(invalid_definition("workspace scope cannot be a symlink"));
             }
-            if kind.is_dir() {
-                let path = entry.path().join("workspace.yaml");
-                if path.exists() {
-                    reject_definition_symlinks(&path)?;
-                    paths.push(path);
+            if !scope.file_type().map_err(invalid_definition)?.is_dir() {
+                continue;
+            }
+            for name in std::fs::read_dir(scope.path()).map_err(invalid_definition)? {
+                let name = name.map_err(invalid_definition)?;
+                if name.file_name().to_string_lossy().starts_with('.') {
+                    continue;
+                }
+                reject_definition_symlinks(&name.path())?;
+                if !name.file_type().map_err(invalid_definition)?.is_dir() {
+                    continue;
+                }
+                for tag in std::fs::read_dir(name.path()).map_err(invalid_definition)? {
+                    let tag = tag.map_err(invalid_definition)?;
+                    if tag.file_name().to_string_lossy().starts_with('.') {
+                        continue;
+                    }
+                    reject_definition_symlinks(&tag.path())?;
+                    if !tag.file_type().map_err(invalid_definition)?.is_dir() {
+                        continue;
+                    }
+                    let path = tag.path().join("workspace.yaml");
+                    if path.exists() {
+                        workspace_address(source, &path)?;
+                        reject_definition_symlinks(&path)?;
+                        paths.push(path);
+                    }
                 }
             }
         }
@@ -201,7 +355,7 @@ pub fn load_workspace_definitions(
                     .chars()
                     .any(|c| c.is_control() || matches!(c, '/' | '\\' | ':'))
         };
-        if !valid(&definition.name) || definition.members.iter().any(|m| !valid(&m.name)) {
+        if definition.members.iter().any(|m| !valid(&m.name)) {
             return Err(invalid_definition("invalid workspace or member name"));
         }
         entries.insert(path, definition);
@@ -311,7 +465,6 @@ pub fn load_workspace_definition(path: &Path) -> Result<WorkspaceDefinition, Wor
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct WorkspaceDocument {
-    name: String,
     project_root: PathBuf,
     #[serde(default)]
     members: DocumentField<MemberList>,
@@ -432,13 +585,10 @@ fn normalize_driver(driver: String) -> Result<String, WorkspaceError> {
     } else {
         format!("driver:{driver}")
     };
-    let invalid = || invalid_definition("driver must be a driver:scope/name[:tag] file locator");
+    let invalid = || invalid_definition("driver must be a driver:scope/name:tag file locator");
     let body = normalized.strip_prefix("driver:").ok_or_else(invalid)?;
     let (scope, name_and_tag) = body.split_once('/').ok_or_else(invalid)?;
-    let (name, tag) = match name_and_tag.split_once(':') {
-        Some((name, tag)) => (name, Some(tag)),
-        None => (name_and_tag, None),
-    };
+    let (name, tag) = name_and_tag.split_once(':').ok_or_else(invalid)?;
     let valid_part = |part: &str| {
         !part.is_empty()
             && !matches!(part, "." | "..")
@@ -448,7 +598,7 @@ fn normalize_driver(driver: String) -> Result<String, WorkspaceError> {
                     || matches!(character, '/' | '\\' | ':')
             })
     };
-    if !valid_part(scope) || !valid_part(name) || tag.is_some_and(|tag| !valid_part(tag)) {
+    if !valid_part(scope) || !valid_part(name) || !valid_part(tag) {
         return Err(invalid());
     }
     Ok(normalized)
@@ -509,7 +659,6 @@ fn normalize_document(
         });
     }
     Ok(WorkspaceDefinition {
-        name: document.name,
         project_root,
         members: normalized,
     })
@@ -520,8 +669,8 @@ pub fn validate_workspace_definition(
     let invalid =
         |message: &str| WorkspaceError::new(WorkspaceErrorKind::InvalidDefinition, message);
     let valid_text = |value: &str| !value.trim().is_empty() && !value.chars().any(char::is_control);
-    if !valid_text(&definition.name) || definition.project_root.as_os_str().is_empty() {
-        return Err(invalid("workspace name and project_root must not be empty"));
+    if definition.project_root.as_os_str().is_empty() {
+        return Err(invalid("workspace project_root must not be empty"));
     }
     if definition.members.len() > MAX_WORKSPACE_MEMBERS {
         return Err(invalid("workspace has more than 1024 members"));
@@ -541,4 +690,64 @@ pub fn validate_workspace_definition(
         }
     }
     Ok(())
+}
+
+#[derive(Clone, Debug)]
+pub enum WorkspaceModification {
+    Create {
+        address: String,
+        definition: WorkspaceDefinition,
+    },
+    Update {
+        address: String,
+        definition: WorkspaceDefinition,
+    },
+    Rename {
+        address: String,
+        new_address: String,
+    },
+    Delete {
+        address: String,
+    },
+}
+pub fn workspace_address(root: &Path, path: &Path) -> Result<String, WorkspaceError> {
+    let relative = path.strip_prefix(root).map_err(invalid_definition)?;
+    let parts = relative
+        .components()
+        .map(|part| {
+            part.as_os_str()
+                .to_str()
+                .ok_or_else(|| invalid_definition("invalid Workspace path"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if parts.len() != 4 || parts[3] != "workspace.yaml" {
+        return Err(invalid_definition(
+            "expected Workspace root/scope/name/tag/workspace.yaml",
+        ));
+    }
+    let address = format!("workspace:{}/{}:{}", parts[0], parts[1], parts[2]);
+    parse_workspace_address(&address)?;
+    Ok(address)
+}
+fn parse_workspace_address(address: &str) -> Result<(&str, &str, &str), WorkspaceError> {
+    let rest = address
+        .strip_prefix("workspace:")
+        .ok_or_else(|| invalid_definition("expected Workspace address"))?;
+    let (scope, tail) = rest
+        .split_once('/')
+        .ok_or_else(|| invalid_definition("missing Workspace scope"))?;
+    let (name, tag) = tail
+        .split_once(':')
+        .ok_or_else(|| invalid_definition("Workspace address requires an explicit tag"))?;
+    for part in [scope, name, tag] {
+        if part.trim().is_empty()
+            || part.starts_with('.')
+            || part
+                .chars()
+                .any(|c| c.is_control() || matches!(c, '/' | '\\' | ':'))
+        {
+            return Err(invalid_definition("invalid Workspace address component"));
+        }
+    }
+    Ok((scope, name, tag))
 }

@@ -64,7 +64,6 @@ WorldAgentExt：Agent访问扩展，公开trait
 AgentPlugin：生命周期插件，公开类型
     schedule: String--启停System所属计划
     sync: AgentUpdateContext
-    driver_root: PathBuf--既有网络默认创建材料的解析根，安装为AgentResourceRoot
     new(sync: AgentUpdateContext) -> Self
         行为：必需发布上下文，默认schedule为UPDATE，不提供无上下文生产构造。
     impl Plugin for AgentPlugin
@@ -105,8 +104,6 @@ Agent：Agent领域组件，不可克隆
 
 AgentResources：Component
     parameters: AgentStartParameters--保留实际创建参数；UI目录是引用，配置目标为Agent持久文件
-AgentResourceRoot(PathBuf)：Resource
-    行为：既有网络agent.start按Workspace成员默认资源解析显式配置/UI路径；Lua创建直接传两条路径，不使用此默认解析根。
 AgentSession(String)：Component
     new() -> Self
     行为：每次实际Agent运行唯一，原TEMP Block命名空间沿用此id，结束时清理不落盘。
@@ -215,7 +212,7 @@ wait_observers(observers: Vec<AgentObservationWait>) -> Future<Output = Result<(
 
 handle_start_agent(world: &mut World, request: StartAgent)
     行为：
-        校验Workspace和成员创建请求；所有owner统一使用Workspace作用域，构造agent:<scope>/<request.name>:latest并检查Address唯一，不计算父Agent地址哈希；
+        校验Workspace和成员创建请求；Agent作用域从实际Workspace地址组成<workspace.scope>-<workspace.name>-<workspace.tag>，构造agent:<组合scope>/<request.name>:dev并检查Address唯一，不计算父Agent地址哈希；
         同步创建Agent Entity并经update_agent(Register)登记Starting公共视图，再提交start_flow；
         拒绝时发送启动错误。
 

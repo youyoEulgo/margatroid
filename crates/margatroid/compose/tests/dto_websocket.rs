@@ -85,7 +85,7 @@ impl Harness {
         let root = tempfile::tempdir().unwrap();
         let initial_root = root.path().join("agent-drivers");
         for name in ["new", "refreshed"] {
-            let source = initial_root.join("local").join(name).join("latest");
+            let source = initial_root.join("margatroid").join(name).join("dev");
             std::fs::create_dir_all(&source).unwrap();
             std::fs::write(source.join("base.lua"), "").unwrap();
         }
@@ -106,19 +106,17 @@ impl Harness {
                 .unwrap(),
         );
         let definitions_root = root.path().join("workspaces");
-        std::fs::create_dir_all(definitions_root.join("demo")).unwrap();
-        std::fs::write(definitions_root.join("demo/workspace.yaml"), format!(
-            "name: demo\nproject_root: {}\nmembers:\n  - name: coder\n    driver: driver:local/new:latest\n    home_root: {}\n",
+        std::fs::create_dir_all(definitions_root.join("margatroid/demo/dev")).unwrap();
+        std::fs::write(definitions_root.join("margatroid/demo/dev/workspace.yaml"), format!(
+            "project_root: {}\nmembers:\n  - name: coder\n    driver: driver:margatroid/new:dev\n    home_root: {}\n",
             root.path().display(), root.path().join("new-home").display()
         )).unwrap();
         app.world_mut()
             .insert_resource(WorkspaceDefinitions::open(&definitions_root).unwrap());
-        app.world_mut()
-            .insert_resource(agent_core::AgentResourceRoot(initial_root));
         let workspace = app.world_mut().spawn();
         app.world_mut().insert_component(
             workspace,
-            address::Address::new("workspace:test/unit").unwrap(),
+            address::Address::new("workspace:test/unit:dev").unwrap(),
         );
         let workspace_binding = dto_plugin::workspace_sync_binding(
             app.world()
@@ -133,7 +131,7 @@ impl Harness {
             workspace,
             workspace_core::Workspace::new(
                 "demo".into(),
-                definitions_root.join("demo/workspace.yaml"),
+                definitions_root.join("margatroid/demo/dev/workspace.yaml"),
                 root.path().into(),
                 WorkspaceState::Running,
                 BTreeSet::new(),
@@ -141,14 +139,16 @@ impl Harness {
                 workspace_binding.updates.clone(),
             ),
         );
-        app.world_mut()
-            .insert_component(workspace, Address::new("workspace:local/demo").unwrap());
+        app.world_mut().insert_component(
+            workspace,
+            Address::new("workspace:margatroid/demo:dev").unwrap(),
+        );
         let agent = app.world_mut().spawn();
         agent_core::AgentTaskBinding::reserve(
             app.world_mut(),
             agent,
             agent_core::AgentCreator {
-                address: "workspace:local/demo:latest".into(),
+                address: "workspace:margatroid/demo:dev".into(),
                 task_id: "driver-first".into(),
             },
         );
@@ -169,8 +169,10 @@ impl Harness {
                 agent_updates.clone(),
             ),
         );
-        app.world_mut()
-            .insert_component(agent, Address::new("agent:demo/coder").unwrap());
+        app.world_mut().insert_component(
+            agent,
+            Address::new("agent:margatroid-demo-dev/coder:dev").unwrap(),
+        );
         app.world_mut().insert_component(
             agent,
             open_storage(
@@ -401,6 +403,16 @@ impl Harness {
         })
     }
     fn request(&self, socket: &mut Socket, kind: &str, id: &str, message: Value) {
+        let message = if matches!(
+            kind,
+            "workspace.start" | "workspace.stop" | "workspace.restart"
+        ) && message.get("path").is_some()
+        {
+            let path = std::path::Path::new(message["path"].as_str().unwrap());
+            json!({"address":workspace_core::workspace_address(path.ancestors().nth(4).unwrap(),path).unwrap()})
+        } else {
+            message
+        };
         self.send(socket, json!({"type": kind, "id": id, "message": message}));
     }
     fn command(&self, socket: &mut Socket, id: &str, command: &str, arguments: Value) {
@@ -408,23 +420,30 @@ impl Harness {
             socket,
             "mcl.execute",
             id,
-            json!({"address": "agent:demo/coder", "command": command, "arguments": arguments}),
+            json!({"address": "agent:margatroid-demo-dev/coder:dev", "command": command, "arguments": arguments}),
         );
     }
     fn target(&self) -> Value {
-        json!({"address": "agent:demo/coder"})
+        json!({"address": "agent:margatroid-demo-dev/coder:dev"})
     }
     fn definition(&self) -> std::path::PathBuf {
-        self.root.path().join("workspaces/demo/workspace.yaml")
+        self.root
+            .path()
+            .join("workspaces/margatroid/demo/dev/workspace.yaml")
     }
-    fn add_definition(&self, directory: &str, name: &str) -> std::path::PathBuf {
-        let parent = self.root.path().join("workspaces").join(directory);
+    fn add_definition(&self, directory: &str, _name: &str) -> std::path::PathBuf {
+        let parent = self
+            .root
+            .path()
+            .join("workspaces/margatroid")
+            .join(directory)
+            .join("dev");
         std::fs::create_dir_all(&parent).unwrap();
         let path = parent.join("workspace.yaml");
         std::fs::write(
             &path,
             format!(
-                "name: {name}\nproject_root: {}\nmembers: []\n",
+                "project_root: {}\nmembers: []\n",
                 self.root.path().display()
             ),
         )
@@ -520,59 +539,44 @@ fn websocket_registration_mcl_reply_and_audit_use_original_network_identity() {
 }
 
 #[test]
-fn agent_start_without_creator_task_is_rejected_and_restart_preserves_parameters() {
+fn removed_agent_lifecycle_messages_never_dispatch_domain_events() {
     let mut harness = Harness::new();
-    let mut socket = harness.connect();
-    harness.register(&mut socket, "webui", "browser");
-    harness.request(
-        &mut socket,
-        "agent.start",
-        "start",
-        json!({"workspace":"workspace:local/demo","name":"coder"}),
-    );
-    let result = harness.next(&mut socket, |value| value["id"] == "start");
-    assert_eq!(result["success"], false);
-    assert_eq!(result["error"]["code"], "InvalidRequest");
-    assert!(
-        result["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("Workspace Driver or Agent tool task")
-    );
+    for operation in ["start", "stop", "restart"] {
+        let mut socket = harness.connect();
+        harness.register(&mut socket, "webui", operation);
+        harness.request(&mut socket,&format!("agent.{operation}"),"removed",json!({"address":"agent:margatroid-demo-dev/coder:dev","workspace":"workspace:margatroid/demo:dev","name":"coder"}));
+        harness.runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    match socket.next().await {
+                        Some(Ok(Message::Close(Some(frame)))) => {
+                            assert_eq!(u16::from(frame.code), 1007);
+                            break;
+                        }
+                        Some(Ok(Message::Text(text))) => {
+                            let value: Value = serde_json::from_str(&text).unwrap();
+                            assert_ne!(value["type"], format!("agent.{operation}.result"));
+                        }
+                        Some(Ok(_)) => {}
+                        other => panic!("expected invalid-protocol close: {other:?}"),
+                    }
+                }
+            })
+            .await
+            .unwrap();
+        });
+    }
     assert!(harness.starts.lock().unwrap().is_empty());
-    let creation = harness
-        .app
-        .world()
-        .get_component::<agent_core::AgentResources>(harness.agent)
-        .unwrap()
-        .parameters
-        .clone();
-    std::fs::write(harness.definition(), format!(
-        "name: demo\nproject_root: {}\nmembers:\n  - name: coder\n    driver: driver:local/refreshed:latest\n    home_root: {}\n",
-        harness.root.path().display(), harness.root.path().join("fresh-home").display()
-    )).unwrap();
-    harness.request(&mut socket, "agent.restart", "restart", harness.target());
-    harness.wait(|harness| !harness.restarts.lock().unwrap().is_empty());
-    let request = harness.restarts.lock().unwrap()[0].clone();
-    assert_eq!(request.parameters, creation);
-    vm(harness.app.world_mut(), harness.agent, "driver-restarted");
-    request
-        .reply
-        .lock()
-        .unwrap()
-        .take()
-        .unwrap()
-        .send(Ok(harness.agent))
-        .unwrap();
-    let reply = harness.next(&mut socket, |value| value["id"] == "restart");
+    assert!(harness.restarts.lock().unwrap().is_empty());
     assert_eq!(
-        reply,
-        json!({"type":"agent.restart.result","id":"restart","success":true})
+        harness
+            .app
+            .world()
+            .get_component::<Agent>(harness.agent)
+            .unwrap()
+            .state(),
+        AgentState::Running
     );
-    harness.request(&mut socket, "agent.req", "live", json!({}));
-    let states = harness.next(&mut socket, |value| value["id"] == "live");
-    assert!(states["agents"][0].get("instance").is_none());
-    assert!(states["agents"][0].get("name").is_none());
 }
 
 #[test]
@@ -581,12 +585,13 @@ fn workspace_queries_show_scanned_definitions_and_stop_uses_definition_path() {
     let cached = harness.add_definition("inactive", "inactive");
     let mut socket = harness.connect();
     harness.register(&mut socket, "webui", "browser");
-    harness.request(&mut socket, "workspace.reload", "reload", json!({}));
-    let reload = harness.next(&mut socket, |value| value["id"] == "reload");
-    assert_eq!(
-        reload,
-        json!({"type":"workspace.reload.result","id":"reload","success":true})
-    );
+    harness
+        .app
+        .world()
+        .get_resource::<workspace_core::WorkspaceDefinitions>()
+        .unwrap()
+        .reload()
+        .unwrap();
     harness.request(&mut socket, "workspace.req", "definitions", json!({}));
     let definitions = harness.next(&mut socket, |value| value["id"] == "definitions");
     assert_eq!(definitions["type"], "workspace.res");
@@ -596,9 +601,9 @@ fn workspace_queries_show_scanned_definitions_and_stop_uses_definition_path() {
         .iter()
         .find(|entry| entry["path"] == cached.to_string_lossy().as_ref())
         .unwrap();
-    assert_eq!(inactive["definition"]["name"], "inactive");
+    assert!(inactive["definition"].get("name").is_none());
     assert_eq!(inactive["status"], "inactive");
-    assert!(inactive["address"].is_null());
+    assert_eq!(inactive["address"], "workspace:margatroid/inactive:dev");
     assert!(inactive.get("member_failures").is_none());
     assert!(harness.workspace_starts.lock().unwrap().is_empty());
     harness.request(
@@ -746,7 +751,7 @@ fn classified_sync_deduplicates_targets_and_never_leaks_to_other_clients() {
     let turn = harness.next(&mut browser, |value| {
         value["type"] == "agent.turn.sync" && value["turn"] == "changed"
     });
-    assert_eq!(turn["address"], "agent:demo/coder:latest");
+    assert_eq!(turn["address"], "agent:margatroid-demo-dev/coder:dev");
     assert!(turn.get("instance").is_none());
     assert!(
         harness
@@ -863,7 +868,7 @@ fn abort_control_runs_next_frame_freezes_inference_and_only_cancels_unreturned_t
         &mut socket,
         "agent.turn.abort",
         "abort",
-        json!({"address": "agent:demo/coder", "turn": turn}),
+        json!({"address": "agent:margatroid-demo-dev/coder:dev", "turn": turn}),
     );
     harness.ingress_barrier(&mut socket);
     harness.app.tick();
@@ -912,7 +917,7 @@ fn abort_control_runs_next_frame_freezes_inference_and_only_cancels_unreturned_t
         &mut socket,
         "agent.turn.abort",
         "stale",
-        json!({"address": "agent:demo/coder", "turn": format!("{turn}-stale")}),
+        json!({"address": "agent:margatroid-demo-dev/coder:dev", "turn": format!("{turn}-stale")}),
     );
     harness.ingress_barrier(&mut socket);
     harness.app.tick();
@@ -1649,7 +1654,7 @@ fn driver_ui_query_and_sync_follow_actual_source_and_recover_from_resource_error
         v["type"] == "agent.ui.sync" && v["ui"]["entry"] == "index.html"
     });
     assert_eq!(initial["ui"]["files"][0]["data"], "Zmlyc3Q=");
-    assert_eq!(initial["address"], "agent:demo/coder:latest");
+    assert_eq!(initial["address"], "agent:margatroid-demo-dev/coder:dev");
     harness.request(&mut socket, "agent.ui.req", "ui-read", harness.target());
     let response = harness.next(&mut socket, |v| v["id"] == "ui-read");
     assert_eq!(response["ui"], initial["ui"]);
@@ -2007,7 +2012,7 @@ fn workspace_definition_disk_changes_reach_websocket_without_world_frames() {
     let mut socket = harness.connect();
     harness.register(&mut socket, "webui", "definition-monitor");
     harness.collect(&mut socket, 10);
-    let directory = harness.root.path().join("workspaces/added");
+    let directory = harness.root.path().join("workspaces/margatroid/added/dev");
     let definition = directory.join("workspace.yaml");
     let stop = Arc::new(AtomicBool::new(false));
     let stopping = stop.clone();
@@ -2047,42 +2052,67 @@ fn workspace_definition_disk_changes_reach_websocket_without_world_frames() {
             tokio::time::sleep(Duration::from_millis(200)).await;
             let before = counted.load(Ordering::Acquire);
             std::fs::create_dir_all(&directory).unwrap();
-            std::fs::write(&definition, "name: added\nproject_root: .\nmembers: []\n").unwrap();
-            wait(&mut socket, |v| {
-                v["type"] == "workspace.sync"
-                    && v["workspaces"]
-                        .as_array()
-                        .is_some_and(|rows| rows.iter().any(|r| r["definition"]["name"] == "added"))
-            })
-            .await;
-            std::fs::write(&definition, "name: [invalid\n").unwrap();
+            std::fs::write(&definition, "project_root: .\nmembers: []\n").unwrap();
             wait(&mut socket, |v| {
                 v["type"] == "workspace.sync"
                     && v["workspaces"].as_array().is_some_and(|rows| {
                         rows.iter()
-                            .any(|r| r["definition"]["name"] == "added" && r["error"].is_object())
+                            .any(|r| r["address"] == "workspace:margatroid/added:dev")
                     })
             })
             .await;
-            std::fs::write(
-                &definition,
-                "name: recovered\nproject_root: .\nmembers: []\n",
-            )
-            .unwrap();
+            std::fs::write(&definition, "").unwrap();
             wait(&mut socket, |v| {
                 v["type"] == "workspace.sync"
                     && v["workspaces"].as_array().is_some_and(|rows| {
-                        rows.iter()
-                            .any(|r| r["definition"]["name"] == "recovered" && r["error"].is_null())
+                        rows.iter().any(|r| {
+                            r["address"] == "workspace:margatroid/added:dev"
+                                && r["error"].is_object()
+                        })
                     })
             })
             .await;
-            assert!(definition.starts_with(directory.parent().unwrap()));
+            std::fs::write(&definition, "project_root: .\nmembers: []\n").unwrap();
+            wait(&mut socket, |v| {
+                v["type"] == "workspace.sync"
+                    && v["workspaces"].as_array().is_some_and(|rows| {
+                        rows.iter().any(|r| {
+                            r["address"] == "workspace:margatroid/added:dev" && r["error"].is_null()
+                        })
+                    })
+            })
+            .await;
+            let renamed = directory
+                .parent()
+                .unwrap()
+                .parent()
+                .unwrap()
+                .join("renamed/dev");
+            assert_eq!(
+                directory.parent().unwrap().parent().unwrap(),
+                renamed.parent().unwrap().parent().unwrap()
+            );
+            std::fs::create_dir_all(renamed.parent().unwrap()).unwrap();
+            std::fs::rename(&directory, &renamed).unwrap();
+            wait(&mut socket, |value| {
+                value["type"] == "workspace.sync"
+                    && value["workspaces"].as_array().is_some_and(|rows| {
+                        rows.iter()
+                            .any(|row| row["address"] == "workspace:margatroid/renamed:dev")
+                            && !rows
+                                .iter()
+                                .any(|row| row["address"] == "workspace:margatroid/added:dev")
+                    })
+            })
+            .await;
+            let definition = renamed.join("workspace.yaml");
+            assert!(definition.starts_with(&renamed));
             std::fs::remove_file(&definition).unwrap();
             wait(&mut socket, |v| {
                 v["type"] == "workspace.sync"
                     && v["workspaces"].as_array().is_some_and(|rows| {
-                        rows.iter().all(|r| r["definition"]["name"] != "recovered")
+                        rows.iter()
+                            .all(|r| r["address"] != "workspace:margatroid/renamed:dev")
                     })
             })
             .await;
@@ -2269,7 +2299,7 @@ fn aborting_user_turn_preserves_free_inference_and_free_pending_tool() {
         &mut socket,
         "agent.turn.abort",
         "abort-free",
-        json!({"address":"agent:demo/coder","turn":turn}),
+        json!({"address":"agent:margatroid-demo-dev/coder:dev","turn":turn}),
     );
     let reply = harness.next(&mut socket, |value| value["id"] == "abort-free");
     assert_eq!(reply["success"], true);
@@ -2357,7 +2387,7 @@ impl Harness {
         }
     }
 }
-const FILE_ROOT: &str = "/workspace%3Alocal%2Fdemo%3Alatest";
+const FILE_ROOT: &str = "/workspace%3Amargatroid%2Fdemo%3Adev";
 #[cfg(unix)]
 #[test]
 fn workspace_file_get_head_and_updates_use_actual_working_directory_without_agent_or_registration()
@@ -2398,10 +2428,7 @@ fn workspace_file_get_head_and_updates_use_actual_working_directory_without_agen
     std::fs::write(wrong.join("mikuji.png"), b"wrong-definition").unwrap();
     std::fs::write(
         h.definition(),
-        format!(
-            "name: demo\nproject_root: {}\nmembers: []\n",
-            wrong.display()
-        ),
+        format!("project_root: {}\nmembers: []\n", wrong.display()),
     )
     .unwrap();
     h.app
@@ -2499,18 +2526,22 @@ fn workspace_file_identity_lifecycle_and_ingress_are_checked_per_request() {
     std::fs::write(h.root.path().join("sample.txt"), b"sample").unwrap();
     assert_eq!(h.file_http("GET", "/demo/sample.txt", "").status, 400);
     assert_eq!(
-        h.file_http("GET", "/workspace%3Alocal%2Fdemo/sample.txt", "")
+        h.file_http("GET", "/workspace%3Amargatroid%2Fdemo/sample.txt", "")
             .status,
         400
     );
     assert_eq!(
-        h.file_http("GET", "/agent%3Ademo%2Fcoder%3Alatest/sample.txt", "")
+        h.file_http("GET", "/agent%3Ademo%2Fcoder%3Adev/sample.txt", "")
             .status,
         400
     );
     assert_eq!(
-        h.file_http("GET", "/workspace%3Alocal%2Fabsent%3Alatest/sample.txt", "")
-            .status,
+        h.file_http(
+            "GET",
+            "/workspace%3Amargatroid%2Fabsent%3Adev/sample.txt",
+            ""
+        )
+        .status,
         404
     );
     assert_eq!(
@@ -2605,7 +2636,7 @@ fn workspace_files_use_complete_addresses_when_display_names_are_equal() {
     let entity = h.app.world_mut().spawn();
     h.app
         .world_mut()
-        .insert_component(entity, Address::new("workspace:other/demo:latest").unwrap());
+        .insert_component(entity, Address::new("workspace:other/demo:dev").unwrap());
     let updates = h
         .app
         .world()
@@ -2630,7 +2661,7 @@ fn workspace_files_use_complete_addresses_when_display_names_are_equal() {
         b"first-workspace"
     );
     assert_eq!(
-        h.file_http("GET", "/workspace%3Aother%2Fdemo%3Alatest/same.png", "")
+        h.file_http("GET", "/workspace%3Aother%2Fdemo%3Adev/same.png", "")
             .body,
         b"second-workspace"
     );
@@ -2691,4 +2722,90 @@ fn generated_error_history_is_queryable_without_a_second_full_and_independent_er
             .any(|row| row["payload"]["request_id"] == "inference-failed"
                 && row["sequence"] == saved[0]["sequence"])
     );
+}
+
+#[test]
+fn workspace_resource_crud_uses_addresses_and_publishes_without_reload() {
+    let mut harness = Harness::new();
+    let mut socket = harness.connect();
+    harness.register(&mut socket, "webui", "crud");
+    let address = "workspace:margatroid/new-project:dev";
+    let new_address = "workspace:margatroid/renamed:dev";
+    let definition = json!({"project_root":harness.root.path(),"agents":[]});
+    harness.request(
+        &mut socket,
+        "workspace.create",
+        "create",
+        json!({"address":address,"definition":definition}),
+    );
+    let created = harness.next(&mut socket, |value| value["id"] == "create");
+    assert_eq!(created["success"], true, "{created}");
+    harness.request(&mut socket, "workspace.req", "created-list", json!({}));
+    let list = harness.next(&mut socket, |v| v["id"] == "created-list");
+    assert!(
+        list["workspaces"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["address"] == address && row["status"] == "inactive")
+    );
+    let mut updated = definition;
+    updated["project_root"] = json!(harness.root.path().join("updated-project"));
+    harness.request(
+        &mut socket,
+        "workspace.update",
+        "update",
+        json!({"address":address,"definition":updated}),
+    );
+    assert_eq!(
+        harness.next(&mut socket, |v| v["id"] == "update")["success"],
+        true
+    );
+    harness.request(
+        &mut socket,
+        "workspace.rename",
+        "rename",
+        json!({"address":address,"new_address":new_address}),
+    );
+    assert_eq!(
+        harness.next(&mut socket, |v| v["id"] == "rename")["success"],
+        true
+    );
+    harness.request(&mut socket, "workspace.req", "renamed-list", json!({}));
+    let list = harness.next(&mut socket, |v| v["id"] == "renamed-list");
+    assert!(list["workspaces"].as_array().unwrap().iter().any(|row| {
+        row["address"] == new_address
+            && row["definition"]["project_root"]
+                == harness
+                    .root
+                    .path()
+                    .join("updated-project")
+                    .to_string_lossy()
+                    .as_ref()
+    }));
+    assert!(
+        !list["workspaces"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["address"] == address)
+    );
+    harness.request(
+        &mut socket,
+        "workspace.delete",
+        "delete",
+        json!({"address":new_address}),
+    );
+    assert_eq!(
+        harness.next(&mut socket, |v| v["id"] == "delete")["success"],
+        true
+    );
+    assert!(
+        !harness
+            .root
+            .path()
+            .join("workspaces/margatroid/renamed/dev")
+            .exists()
+    );
+    assert!(harness.root.path().exists());
 }

@@ -37,10 +37,10 @@ mod linux {
     impl Fixture {
         fn new() -> Self {
             let root = tempfile::tempdir().unwrap();
-            let resource = root.path().join("mcp-register/latest");
+            let resource = root.path().join("mcp-register/dev");
             std::fs::create_dir_all(resource.join("bin")).unwrap();
             let bundled = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("../../resources/tools/local/mcp-register/latest");
+                .join("../../resources/tools/margatroid/mcp-register/dev");
             for entry in std::fs::read_dir(&bundled).unwrap() {
                 let entry = entry.unwrap();
                 let name = entry.file_name();
@@ -88,7 +88,7 @@ mod linux {
             let workspace = app.world_mut().spawn();
             app.world_mut().insert_component(
                 workspace,
-                address::Address::new("workspace:test/mcp").unwrap(),
+                address::Address::new("workspace:test/mcp:dev").unwrap(),
             );
             app.world_mut().insert_component(
                 workspace,

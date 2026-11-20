@@ -362,7 +362,7 @@ margatroid.agent:stop(target: String) -> Future<Value>
 margatroid:wait(target: String) -> Future<()>
     行为：在明确Agent上等待一次唤醒，与自动Lua相同，不把等待目标作为VM所有者。
 margatroid.agent:create({name: String, config_path: String, ui_path: String}) -> Future<Value>
-    行为：发送原StartAgent，owner指向Workspace或父Agent，资源挂载完成返回实际信息，创建者执行独立。
+    行为：根据真实执行身份取得Workspace和creator任务，发送原StartAgent，不接受owner；资源挂载完成并绑定创建者scope后返回实际信息。
         config_path是明确的初始化TOML文件地址，仅首次初始化持久配置；ui_path是明确目录引用，每个Agent直接监控，不复制。拒绝旧resource_dir创建参数和未知字段。
 margatroid.tools:register(registration: RegisterToolsRequest) -> Future<Output = ()>
     行为：仅工具execute可用。注册批次指定目标Agent，每项lifetime独立指定任务；缺省Agent为当前Agent，缺省lifetime不绑定发起任务。

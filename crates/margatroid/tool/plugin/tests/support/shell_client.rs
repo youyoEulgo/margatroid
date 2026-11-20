@@ -5,7 +5,7 @@ fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .ancestors()
         .find(|path| {
-            path.join("resources/tools/local/bash/latest/shell.lua")
+            path.join("resources/tools/margatroid/bash/dev/shell.lua")
                 .is_file()
         })
         .expect("workspace resources must be available to integration tests")
@@ -59,7 +59,7 @@ pub fn shell_client() -> &'static Path {
 pub fn install_shell(resource: &Path) {
     std::fs::create_dir_all(resource.join("bin")).unwrap();
     std::fs::copy(
-        workspace_root().join("resources/tools/local/bash/latest/shell.lua"),
+        workspace_root().join("resources/tools/margatroid/bash/dev/shell.lua"),
         resource.join("shell.lua"),
     )
     .unwrap();

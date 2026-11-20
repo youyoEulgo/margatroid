@@ -96,15 +96,13 @@ fn validate_parameters(
             "Workspace definition path has no home",
         )
     })?;
-    let scope = home
-        .file_name()
-        .and_then(|part| part.to_str())
-        .ok_or_else(|| {
-            error(
-                AgentErrorKind::InvalidRequest,
-                "Workspace home has no valid name",
-            )
-        })?;
+    let workspace_address = world
+        .get_component::<Address>(workspace)
+        .ok_or_else(|| error(AgentErrorKind::InvalidRequest, "Workspace address missing"))?;
+    let identity = address::ParsedAddress::parse(workspace_address.as_str()).map_err(|error| {
+        crate::handler::error(AgentErrorKind::InvalidRequest, error.to_string())
+    })?;
+    let scope = format!("{}-{}-{}", identity.scope, identity.name, identity.tag);
     let directory = home.join("agents").join(name);
     if parameters.database_path != directory.join("state.sqlite")
         || parameters.settings_path != directory.join("setting.toml")
@@ -224,7 +222,7 @@ pub(crate) fn handle_start_agent(world: &mut World, request: StartAgent) {
                 "Agent member name is already active",
             ));
         }
-        let address = Address::new(&format!("agent:{scope}/{}:latest", request.name))
+        let address = Address::new(&format!("agent:{scope}/{}:dev", request.name))
             .map_err(|e| error(AgentErrorKind::InvalidRequest, e))?;
         if world
             .query_with::<Address>()

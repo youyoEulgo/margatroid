@@ -53,7 +53,7 @@ crate公开：
 dto_route_system(world: &mut World)
     处理事件：DtoRequest
     接收闭包结果：None
-    产出事件：RegisterClient、StartWorkspace、StopWorkspace、RestartWorkspace、StartAgent、StopAgent、RestartAgent、MclCommand
+    产出事件：RegisterClient、StartWorkspace、StopWorkspace、RestartWorkspace、MclCommand
     回复：各请求原oneshot
     行为：逐条受理普通请求，业务更新由所属领域统一入口直接同步，不在此轮询投影。
 
@@ -96,7 +96,7 @@ ws_handler(State(state): State<DtoState>, ConnectInfo(peer): ConnectInfo<SocketA
     行为：评估入口策略和退出状态，通过state.clients.allocate取得真实连接、唯一ClientReceiver及取消能力；升级任务持有AxumWorkGuard。
 
 handle_dto_request(world: &mut World, request: DtoRequest)
-    行为：取出具体owned对象，按route转换领域请求或只读查询；原reply继续沿领域执行链回复。agent.restart只沿用目标Agent保存的创建参数，直接提交RestartAgent，不额外重载定义或检查成员文件，不用定义中的程序目录覆盖配置/UI引用。
+    行为：取出具体owned对象，按route转换领域请求或只读查询；原reply继续沿领域执行链回复；不分派Agent start/stop/restart网络请求。
 
 handle_abort_control(world: &mut World, event: AbortTurnControl)
     行为：认领原请求，校验真实Client、Agent及turn，调用WorldAgentExt的统一turn入口及相关领域取消能力；原oneshot回复。
@@ -146,7 +146,7 @@ model_config(world: &World, object: Box<dyn Any+Send>, write:bool)
 install_workspace_monitor(world: &mut World)
     行为：安装前已有定义和运行状态先发布，绑定同一WorkspaceDefinitions.observe回调；实际配置来源存在时建立一次watch_definitions，归属AxumLifetime。
 watch_definitions(source: PathBuf, definitions: WorkspaceDefinitions, lifetime: AxumLifetime) -> Future<Output = Result<(), String>>
-    行为：notify观察来源父目录及子树，过滤Access/无关路径；先挂观察再初读，100ms安静窗口合并；同一时间只一个blocking reload，完整校验后由定义入口observe直接发布。
+    行为：notify观察来源父目录及子树，定义仅接受scope/name/tag/workspace.yaml；scope/name/tag目录Create/Remove/Rename也触发，过滤Access/Agent数据库等无关路径；先挂观察再初读，100ms安静窗口合并；同一时间只一个blocking reload，完整校验后由定义入口observe直接发布。
         错误保留最后有效定义并记录现有错误状态，恢复清故障；取消等待实际reload返回，完整Future释放guard，不发同步事件或唤醒帧。
 
 ```
@@ -169,7 +169,7 @@ prepare_request(state: &DtoState, connection: ConnectionId, message: ClientMessa
         从唯一Clients.claim取得ticket，创建具体领域Result的原oneshot。
         普通请求包装DtoRequest，中止包装AbortTurnControl；注册只携带ConnectionId及自报标签，不复制sender或网络注册表。
         注册成功后Client领域已经原子发布身份；一次性回复不绕回DTO完成事件。
-        单独Agent启动仍在worker全量reload并传入本次快照；Agent重启直接使用AgentTargetDto及既存AgentResources，无RestartInput快照或提前reload。
+        Agent生命周期网络入口已删除；Workspace生命周期、MCL及只读Agent请求保留，不为Agent创建构造定义快照。
         UI查询沿原oneshot返回观察状态；base64和wire编码保持在网络边界。
 
 request<T, R, E>(ticket: Arc<RequestTicket>, route: &str, input: T, response: &str, project: impl FnOnce(R) -> Result<Value, ProtocolErrorDto> + Send + 'static) -> (DtoRequest, ReplyFuture)
@@ -180,8 +180,10 @@ query<T, R>(world: &World, object: Box<dyn Any + Send>, read: impl FnOnce(&World
     行为：校验真实Client及目标后只读并完成原reply。
 records(world: &World, route: &str, object: Box<dyn Any + Send>)
     行为：克隆实际AgentStorage，由worker调用对应分页core函数，通过原reply返回，不建立监控。
-reload(world: &World, object: Box<dyn Any + Send>)
-    行为：校验Client，克隆WorkspaceDefinitions，执行同一全量reload并回复；成功发布也经Workspace统一入口同步。
+workspace_modify(world:&World,object:Box<dyn Any+Send>)
+    行为：认领Prepared<WorkspaceModification,(),WorkspaceError>，校验Client并持AxumLifetime guard；原异步执行器运行blocking definitions.modify并等待真实完成，通过原oneshot回复，不发完成或同步中转事件。
+    行为：CRUD值形状在协议边界校验，具体路径/完整定义/活动状态/目录变更和发布由WorkspaceDefinitions承担；无公开reload路由。
+
 query_agent_ui(world: &World, object: Box<dyn Any + Send>)
     行为：核对当前Agent及实际AgentResources.parameters.ui_path来源，读取该来源已有观察状态；未就绪返回AgentUiNotReady，不创建监控。
 
@@ -191,11 +193,10 @@ check_ui_budget(address: &str, ui: &Option<AgentUiBundleDto>) -> Result<(), Prot
     行为：同时检查完整sync及最大合法id的res信封，超出映射DriverUiTooLarge。
 build_ui_delivery(address: &str, state: DriverUiState) -> UiDelivery
     行为：投影完整稳定UI集合或错误并编码一次，内容key去重；内部单调版本负责时序，摘要revision不作时间排序。
-parameters(world: &World, input: &AgentInput) -> Result<(Entity, String, AgentStartParameters), ProtocolErrorDto>
 client(world: &World, connection: ConnectionId) -> Result<Entity, ProtocolErrorDto>
 target(world: &World, address: &str) -> Result<Entity, ProtocolErrorDto>
 agent(world: &World, address: &str) -> Result<Entity, ProtocolErrorDto>
-    行为：使用实际连接身份与Address定位完整Entity；Agent启动参数仍取同次全量reload快照。
+    行为：使用实际连接身份与Address定位完整Entity；不解析网络Agent生命周期参数。
 deliver<R, E>(reply: &PreparedReply<R, E>, result: Result<R, E>)
 reject<T, R, E: BoundaryError>(request: Prepared<T, R, E>, failure: ProtocolErrorDto)
     行为：只认领原oneshot发送端一次。
@@ -243,7 +244,6 @@ DtoState
     events: Arc<OnceLock<AsyncContext>>--只用于业务请求和连接生命周期
     clients: Clients
     lifetime: AxumLifetime
-    definitions: WorkspaceDefinitions
     impl Resource + Clone
 ReplyOutput
     value: Value
@@ -267,20 +267,12 @@ IntoEvent
     type Event: core_plugin::Event
     into_event(self, world: &World) -> Result<Self::Event, ()>
 RegisterClientDto(Prepared<RegisterConnectionDto, RegisteredClient, ClientError>)
-StartWorkspaceDto(Prepared<WorkspacePathDto, WorkspaceOperationOutput, WorkspaceError>)
-StopWorkspaceDto(Prepared<WorkspacePathDto, WorkspaceOperationOutput, WorkspaceError>)
-RestartWorkspaceDto(Prepared<WorkspacePathDto, WorkspaceOperationOutput, WorkspaceError>)
-StartAgentDto(Prepared<AgentInput, Entity, AgentError>)
-StopAgentDto(Prepared<AgentTargetDto, Entity, AgentError>)
-RestartAgentDto(Prepared<RestartInput, Entity, AgentError>)
+    行为：start/restart通过definitions.path_for(address)取得受控定义路径；stop用同一地址定位路径和运行Entity，不接收客户机任意路径。
+StartWorkspaceDto(Prepared<WorkspaceTargetDto, WorkspaceOperationOutput, WorkspaceError>)
+StopWorkspaceDto(Prepared<WorkspaceTargetDto, WorkspaceOperationOutput, WorkspaceError>)
+RestartWorkspaceDto(Prepared<WorkspaceTargetDto, WorkspaceOperationOutput, WorkspaceError>)
 MclCommandDto(Prepared<MclExecuteDto, MclValue, MclError>)
     impl TryFrom<Box<dyn Any + Send>> + IntoEvent
-AgentInput
-    start: AgentStartDto
-    snapshot: WorkspaceDefinitionSnapshot
-RestartInput
-    target: AgentTargetDto
-    snapshot: WorkspaceDefinitionSnapshot
 BoundaryError
     boundary(value: ProtocolErrorDto) -> Self
     external(self) -> ProtocolErrorDto

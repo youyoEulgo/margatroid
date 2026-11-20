@@ -34,7 +34,7 @@ fn fixture(url: String, format: &str) -> (App, Entity) {
         ),
     );
     app.world_mut()
-        .insert_component(agent, Address::new("agent:test/agent").unwrap());
+        .insert_component(agent, Address::new("agent:test/agent:dev").unwrap());
     app.world_mut().insert_component(
         agent,
         DriverLuaVm {

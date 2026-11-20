@@ -623,7 +623,7 @@ test('command results for a removed Agent cannot complete as success', async () 
   }
 });
 test('workspace errors expose only a summary while local logs keep the detail', async () => {
-  const e = setup([{ ...ws, address: null, status: 'inactive' }], []);
+  const e = setup([{ ...ws, status: 'inactive' }], []);
   try {
     const pending = e.store.startWorkspace(path);
     const request = e.sent.at(-1)!;
@@ -644,7 +644,7 @@ test('workspace errors expose only a summary while local logs keep the detail', 
   }
 });
 test('Workspace result settles operation but cannot invent runtime state', async () => {
-  const e = setup([{ ...ws, address: null, status: 'inactive' }], []);
+  const e = setup([{ ...ws, status: 'inactive' }], []);
   try {
     const p = e.store.startWorkspace(path);
     const request = e.sent.at(-1)!;
@@ -663,7 +663,7 @@ test('Workspace stop uses definition path and result does not optimistically del
   try {
     const p = e.store.stopWorkspace();
     const request = e.sent.at(-1)!;
-    assert.deepEqual(request.message, { path });
+    assert.deepEqual(request.message, { address: workspace });
     e.receive({ type: 'workspace.stop.result', id: request.id, success: true });
     await p;
     assert.equal(e.store.runtimeWorkspaces.length, 1);

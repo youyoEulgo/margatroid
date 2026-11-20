@@ -2,7 +2,7 @@
 
 [Lua 入口](latest/main.lua) 通过 `margatroid.files`、`margatroid.data`、`margatroid.tools` 和 `margatroid.task` 完成注册与读取。Skill 元数据校验、清单收集和读取逻辑均在 Lua 中；独立 Skill 客户端 crate 与资源 bin 已删除，执行流程不启动子进程或交换 JSONL。
 
-`skill_register` 仍只接受一个参数 `path`：本机标准 `SKILL.md` 文件路径，相对路径基于 Agent 项目根目录。例如 `{"path":"resources/skills/local/example-skill/SKILL.md"}`。标准校验依据 [Agent Skills specification](https://agentskills.io/specification)，使用与集成指导见 [Integrate skills](https://agentskills.io/integrate-skills)。
+`skill_register` 仍只接受一个参数 `path`：本机标准 `SKILL.md` 文件路径，相对路径基于 Agent 项目根目录。例如 `{"path":"resources/skills/margatroid/example-skill/SKILL.md"}`。标准校验依据 [Agent Skills specification](https://agentskills.io/specification)，使用与集成指导见 [Integrate skills](https://agentskills.io/integrate-skills)。
 
 ## 通用能力与 Lua 分工
 

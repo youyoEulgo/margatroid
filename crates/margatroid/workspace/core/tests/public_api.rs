@@ -2,13 +2,12 @@ use core_plugin::World;
 use std::collections::BTreeSet;
 use workspace_core::*;
 
-fn definition(name: &str) -> WorkspaceDefinition {
+fn definition(_name: &str) -> WorkspaceDefinition {
     WorkspaceDefinition {
-        name: name.into(),
         project_root: "project".into(),
         members: vec![WorkspaceMemberDefinition {
             name: "coder".into(),
-            driver: "drivers/coder".into(),
+            driver: "drivers/coder:dev".into(),
             home_root: "home/coder".into(),
         }],
     }
@@ -17,66 +16,79 @@ fn definition(name: &str) -> WorkspaceDefinition {
 fn cloned_cache_shares_arc_and_exposes_cross_thread_updates_as_owned_snapshots() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("workspace.yaml");
-    std::fs::write(&path, "name: initial\nproject_root: project\nmembers: []\n").unwrap();
+    std::fs::write(&path, "project_root: initial\nmembers: []\n").unwrap();
     let definitions = WorkspaceDefinitions::open(&path).unwrap();
     let copy = definitions.clone();
     assert!(definitions.same_instance(&copy));
     let updated_path = path.clone();
     std::thread::spawn(move || {
-        std::fs::write(
-            updated_path,
-            "name: updated\nproject_root: project\nmembers: []\n",
-        )
-        .unwrap();
+        std::fs::write(updated_path, "project_root: updated\nmembers: []\n").unwrap();
         copy.reload().unwrap();
     })
     .join()
     .unwrap();
-    std::fs::write(&path, "name: initial\nproject_root: project\nmembers: []\n").unwrap();
+    std::fs::write(&path, "project_root: initial\nmembers: []\n").unwrap();
     definitions.reload().unwrap();
     let snapshot = definitions.get(&path).unwrap();
-    std::fs::write(&path, "name: updated\nproject_root: project\nmembers: []\n").unwrap();
+    std::fs::write(&path, "project_root: updated\nmembers: []\n").unwrap();
     definitions.reload().unwrap();
-    assert_eq!(snapshot.name, "initial");
-    assert_eq!(definitions.get(&path).unwrap().name, "updated");
+    assert_eq!(snapshot.project_root, dir.path().join("initial"));
+    assert_eq!(
+        definitions.get(&path).unwrap().project_root,
+        dir.path().join("updated")
+    );
     assert_eq!(definitions.list().len(), 1);
     let mut world = World::new();
     world.insert_resource(definitions);
     assert_eq!(
-        world.workspace_definitions().unwrap().list()[0].1.name,
-        "updated"
+        world.workspace_definitions().unwrap().list()[0]
+            .1
+            .project_root,
+        dir.path().join("updated")
     );
 }
 #[test]
 fn fresh_load_reads_current_file_and_never_uses_or_mutates_display_cache() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("workspace.yaml");
-    std::fs::write(&path, "name: cached\nproject_root: project\nmembers: []\n").unwrap();
+    std::fs::write(&path, "project_root: project\nmembers: []\n").unwrap();
     let cache = WorkspaceDefinitions::open(&path).unwrap();
-    std::fs::write(&path,"name: first\nproject_root: project\nmembers:\n  - name: coder\n    driver: drivers/coder\n    home_root: home/coder\n").unwrap();
+    std::fs::write(&path,"project_root: project\nmembers:\n  - name: coder\n    driver: drivers/coder:dev\n    home_root: home/coder\n").unwrap();
     let loaded = load_workspace_definition(&path).unwrap();
-    assert_eq!(loaded.name, "first");
+    assert_eq!(loaded.members[0].name, "coder");
     assert_eq!(loaded.project_root, dir.path().join("project"));
     assert_eq!(loaded.members[0].home_root, dir.path().join("home/coder"));
-    assert_eq!(loaded.members[0].driver, "driver:drivers/coder");
-    std::fs::write(&path, "name: second\nproject_root: next\nmembers: []\n").unwrap();
-    assert_eq!(load_workspace_definition(&path).unwrap().name, "second");
-    assert_eq!(cache.get(&path).unwrap().name, "cached");
+    assert_eq!(loaded.members[0].driver, "driver:drivers/coder:dev");
+    std::fs::write(&path, "project_root: next\nmembers: []\n").unwrap();
+    assert_eq!(
+        load_workspace_definition(&path).unwrap().project_root,
+        dir.path().join("next")
+    );
+    assert_eq!(
+        cache.get(&path).unwrap().project_root,
+        dir.path().join("project")
+    );
     std::fs::write(&path, "broken: [").unwrap();
     assert_eq!(
         load_workspace_definition(&path).unwrap_err().kind,
         WorkspaceErrorKind::InvalidDefinition
     );
-    assert_eq!(cache.get(&path).unwrap().name, "cached");
+    assert_eq!(
+        cache.get(&path).unwrap().project_root,
+        dir.path().join("project")
+    );
     std::fs::remove_file(&path).unwrap();
     assert!(load_workspace_definition(&path).is_err());
-    assert_eq!(cache.get(&path).unwrap().name, "cached");
+    assert_eq!(
+        cache.get(&path).unwrap().project_root,
+        dir.path().join("project")
+    );
 }
 #[test]
 fn definitions_reject_oversize_unknown_duplicate_and_invalid_member_inputs() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("workspace.yaml");
-    for text in ["name: x\nproject_root: p\nunknown: 1\n", "name: x\nproject_root: p\nmembers:\n- {name: one, driver: d, home_root: h}\n- {name: one, driver: e, home_root: j}\n", "name: ''\nproject_root: p\n", "name: x\nproject_root: p\nmembers:\n- {name: one, driver: '', home_root: h}\n"] {
+    for text in ["project_root: p\nunknown: 1\n", "project_root: p\nmembers:\n- {name: one, driver: d, home_root: h}\n- {name: one, driver: e, home_root: j}\n", "name: forbidden\nproject_root: p\n", "project_root: p\nmembers:\n- {name: one, driver: '', home_root: h}\n"] {
         std::fs::write(&path,text).unwrap();assert_eq!(load_workspace_definition(&path).unwrap_err().kind,WorkspaceErrorKind::InvalidDefinition);
     }
     std::fs::write(&path, vec![b' '; MAX_WORKSPACE_DEFINITION_BYTES + 1]).unwrap();
@@ -180,13 +192,13 @@ fn lifecycle_request_owns_original_oneshot() {
 fn full_reload_publishes_all_definitions_atomically_and_snapshots_remain_immutable() {
     let dir = tempfile::tempdir().unwrap();
     let write = |name: &str, value: &str| {
-        let path = dir.path().join(name).join("workspace.yaml");
+        let path = dir
+            .path()
+            .join("margatroid")
+            .join(name)
+            .join("dev/workspace.yaml");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(
-            &path,
-            format!("name: {value}\nproject_root: project\nmembers: []\n"),
-        )
-        .unwrap();
+        std::fs::write(&path, format!("project_root: {value}\nmembers: []\n")).unwrap();
         path
     };
     let first = write("first", "old-first");
@@ -196,20 +208,44 @@ fn full_reload_publishes_all_definitions_atomically_and_snapshots_remain_immutab
     write("first", "new-first");
     write("second", "new-second");
     let current = definitions.reload().unwrap();
-    assert_eq!(current.get(&first).unwrap().name, "new-first");
-    assert_eq!(current.get(&second).unwrap().name, "new-second");
-    assert_eq!(old.get(&first).unwrap().name, "old-first");
-    assert_eq!(old.get(&second).unwrap().name, "old-second");
+    assert_eq!(
+        current.get(&first).unwrap().project_root,
+        first.parent().unwrap().join("new-first")
+    );
+    assert_eq!(
+        current.get(&second).unwrap().project_root,
+        second.parent().unwrap().join("new-second")
+    );
+    assert_eq!(
+        old.get(&first).unwrap().project_root,
+        first.parent().unwrap().join("old-first")
+    );
+    assert_eq!(
+        old.get(&second).unwrap().project_root,
+        second.parent().unwrap().join("old-second")
+    );
     std::fs::write(&second, "broken: [").unwrap();
     write("first", "unpublished");
     assert!(definitions.reload().is_err());
-    assert_eq!(definitions.get(&first).unwrap().name, "new-first");
-    assert_eq!(definitions.get(&second).unwrap().name, "new-second");
-    assert_eq!(current.get(&first).unwrap().name, "new-first");
+    assert_eq!(
+        definitions.get(&first).unwrap().project_root,
+        first.parent().unwrap().join("new-first")
+    );
+    assert_eq!(
+        definitions.get(&second).unwrap().project_root,
+        second.parent().unwrap().join("new-second")
+    );
+    assert_eq!(
+        current.get(&first).unwrap().project_root,
+        first.parent().unwrap().join("new-first")
+    );
     std::fs::remove_file(&second).unwrap();
     let after = definitions.reload().unwrap();
     assert!(after.get(&second).is_none());
-    assert_eq!(after.get(&first).unwrap().name, "unpublished");
+    assert_eq!(
+        after.get(&first).unwrap().project_root,
+        first.parent().unwrap().join("unpublished")
+    );
 }
 
 fn test_workspace_context() -> workspace_core::WorkspaceUpdateContext {

@@ -16,6 +16,7 @@ tool_plugin = { path = "../../crates/margatroid/tool/plugin" }
 tokio = { workspace = true }
 
 [dev-dependencies]
+workspace_core = { path = "../../crates/margatroid/workspace/core" }
 toml = { workspace = true }
 futures-util = { workspace = true }
 tokio-tungstenite = { workspace = true }

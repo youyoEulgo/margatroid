@@ -6,7 +6,7 @@ It never downloads or installs a server or another executable.
 
 Build from the workspace root with `cargo build --offline --release -p mcp-client`.
 The artifact is `target/release/mcp-client`; the resource author delivers that binary
-as `mcp-register/latest/bin/mcp-client`. The host does not build it automatically.
+as `mcp-register/dev/bin/mcp-client`. The host does not build it automatically.
 Run `cargo test --offline -p mcp-client` for integration tests. These require `python3`
 and use only Python's standard library, real child pipes, and loopback HTTP.
 On Linux, `cargo test --offline -p mcp-client --test host_integration` also runs the

@@ -57,7 +57,7 @@ async fn lua_creation_persists_only_configuration_and_each_agent_monitors_its_ex
     }
     write(
         root.path(),
-        "agent-drivers/probe/create/latest/base.lua",
+        "agent-drivers/probe/create/dev/base.lua",
         r#"
 function configure()return {timeout_ms=0}end
 function execute(_,context)
@@ -70,7 +70,7 @@ end
     );
     write(
         root.path(),
-        "agent-drivers/probe/create/latest/setting.toml",
+        "agent-drivers/probe/create/dev/setting.toml",
         "[invalid unrelated config must not be read by the Lua loader",
     );
     for name in ["alpha", "beta"] {
@@ -83,9 +83,9 @@ end
     }
     write(
         root.path(),
-        "workspaces/probe/workspace.yaml",
+        "workspaces/margatroid/probe/dev/workspace.yaml",
         &format!(
-            "name: probe\nproject_root: {}\nmembers:\n- name: alpha\n  driver: driver:probe/create:latest\n  home_root: {}\n- name: beta\n  driver: driver:probe/create:latest\n  home_root: {}\n",
+            "project_root: {}\nmembers:\n- name: alpha\n  driver: driver:probe/create:dev\n  home_root: {}\n- name: beta\n  driver: driver:probe/create:dev\n  home_root: {}\n",
             root.path().display(),
             root.path().display(),
             root.path().display()
@@ -129,7 +129,7 @@ end
         &mut socket,
         "workspace.start",
         "start",
-        json!({"path":root.path().join("workspaces/probe/workspace.yaml")}),
+        json!({"address":"workspace:margatroid/probe:dev"}),
     )
     .await;
     let started = next(&mut app, &mut socket, &mut seen, |value| {
@@ -137,8 +137,8 @@ end
     })
     .await;
     assert_eq!(started["success"], true, "{started}");
-    let alpha = "agent:probe/alpha:latest";
-    let beta = "agent:probe/beta:latest";
+    let alpha = "agent:margatroid-probe-dev/alpha:dev";
+    let beta = "agent:margatroid-probe-dev/beta:dev";
     next(&mut app, &mut socket, &mut seen, |value| {
         value["type"] == "agent.ui.sync"
             && value["address"] == alpha
@@ -152,7 +152,10 @@ end
     })
     .await;
     for name in ["alpha", "beta"] {
-        let home = root.path().join("workspaces/probe/agents").join(name);
+        let home = root
+            .path()
+            .join("workspaces/margatroid/probe/dev/agents")
+            .join(name);
         assert!(
             !home.join("ui").exists(),
             "UI must not be copied into Agent data"
@@ -164,7 +167,7 @@ end
     }
     write(
         root.path(),
-        "workspaces/probe/agents/alpha/ui/index.html",
+        "workspaces/margatroid/probe/dev/agents/alpha/ui/index.html",
         "legacy-copy-must-be-ignored",
     );
     let beta_updates = seen
@@ -188,7 +191,7 @@ end
     assert_eq!(
         std::fs::read_to_string(
             root.path()
-                .join("workspaces/probe/agents/alpha/ui/index.html")
+                .join("workspaces/margatroid/probe/dev/agents/alpha/ui/index.html")
         )
         .unwrap(),
         "legacy-copy-must-be-ignored"
@@ -211,21 +214,55 @@ end
         "initial/alpha.toml",
         "[invalid initial config after first initialization",
     );
-    send(
-        &mut socket,
-        "agent.restart",
-        "restart",
-        json!({"address":alpha}),
-    )
-    .await;
-    let restarted = next(&mut app, &mut socket, &mut seen, |value| {
-        value["id"] == "restart"
-    })
-    .await;
-    assert_eq!(restarted["success"], true, "{restarted}");
+    // Domain lifecycle remains available internally; no network restart entry.
+    let entity = app
+        .world()
+        .query_with::<agent_core::Agent>()
+        .result()
+        .into_iter()
+        .find(|entity| {
+            app.world()
+                .get_component::<address::Address>(*entity)
+                .is_some_and(|address| address.as_str() == alpha)
+        })
+        .unwrap();
+    let agent = app
+        .world()
+        .get_component::<agent_core::Agent>(entity)
+        .unwrap();
+    let workspace = agent.workspace();
+    let name = agent.name().clone();
+    let parameters = app
+        .world()
+        .get_component::<agent_core::AgentResources>(entity)
+        .unwrap()
+        .parameters
+        .clone();
+    let (tx, mut rx) = tokio::sync::oneshot::channel();
+    app.world().emit_event(agent_core::RestartAgent {
+        id: "internal-restart".into(),
+        workspace,
+        name,
+        parameters,
+        reply: std::sync::Arc::new(std::sync::Mutex::new(Some(tx))),
+    });
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        app.tick();
+        match rx.try_recv() {
+            Ok(result) => {
+                result.unwrap();
+                break;
+            }
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {}
+            Err(error) => panic!("restart reply lost: {error}"),
+        };
+        assert!(Instant::now() < deadline);
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
     let settings = std::fs::read_to_string(
         root.path()
-            .join("workspaces/probe/agents/alpha/setting.toml"),
+            .join("workspaces/margatroid/probe/dev/agents/alpha/setting.toml"),
     )
     .unwrap();
     assert!(settings.contains("alpha") && settings.contains("persisted = true"));

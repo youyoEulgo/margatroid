@@ -7,7 +7,7 @@ fn reply(
         let _ = sender.send(result);
     }
 }
-use crate::{checked_path, invalid, reject_symlinks, types::*, validate_name, WorkspaceInstalled};
+use crate::{checked_path, invalid, reject_symlinks, types::*, WorkspaceInstalled};
 use address::Address;
 use agent_core::{Agent, AgentState, StopAgent};
 use app_runtime_plugin::WorldEventExt;
@@ -111,13 +111,16 @@ pub(crate) fn handle_start_workspace(world: &mut World, request: StartWorkspace)
                 "workspace path is already active",
             ));
         }
-        let key = path
-            .parent()
-            .and_then(Path::file_name)
-            .and_then(|name| name.to_str())
-            .ok_or_else(|| invalid("workspace path has no valid directory name"))?;
-        validate_name(key)?;
-        let address = Address::new(&format!("workspace:local/{key}:latest")).map_err(invalid)?;
+        let root = installed
+            .definitions
+            .source()
+            .filter(|root| root.is_dir())
+            .ok_or_else(|| invalid("Workspace resource root is required"))?;
+        let locator = workspace_core::workspace_address(root, &path)?;
+        let address = Address::new(&locator).map_err(invalid)?;
+        let key = address::ParsedAddress::parse(&locator)
+            .map_err(invalid)?
+            .name;
         if world
             .query_with::<Address>()
             .result()
@@ -129,6 +132,7 @@ pub(crate) fn handle_start_workspace(world: &mut World, request: StartWorkspace)
                 "workspace address is already active",
             ));
         }
+        installed.definitions.reserve(&path)?;
         let workspace = world.spawn();
         world.insert_component(
             workspace,
@@ -331,6 +335,16 @@ fn failure_result(world: &mut World, failure: &FlowError, state: WorkspaceState)
                 WorkspaceChange::Failure(Some(failure.error.clone())),
             );
             if failure.cleanup_completed {
+                let path = world
+                    .get_component::<Workspace>(workspace)
+                    .unwrap()
+                    .definition_path
+                    .clone();
+                world
+                    .get_resource::<WorkspaceInstalled>()
+                    .unwrap()
+                    .definitions
+                    .release(&path);
                 remove_workspace(world, workspace);
             } else {
                 let _ = update_workspace(
@@ -408,6 +422,16 @@ pub(crate) fn handle_stop_result(world: &mut World, result: Result<StopOutput, S
                 .get_component::<Workspace>(output.workspace)
                 .is_some_and(|w| w.state == WorkspaceState::Stopping)
             {
+                let path = world
+                    .get_component::<Workspace>(output.workspace)
+                    .unwrap()
+                    .definition_path
+                    .clone();
+                world
+                    .get_resource::<WorkspaceInstalled>()
+                    .unwrap()
+                    .definitions
+                    .release(&path);
                 remove_workspace(world, output.workspace);
                 Ok(WorkspaceOperationOutput {
                     workspace: output.workspace,
@@ -567,7 +591,7 @@ async fn start_members(
             let component=world.get_component::<Workspace>(workspace).ok_or_else(||error(WorkspaceErrorKind::Missing,"Workspace missing"))?;
             let path=source.origin;let program=source.program;
             let workspace_address=world.get_component::<Address>(workspace).unwrap().as_str().to_owned();
-            let execution_address=Address::new(&format!("execution:{}/{}:latest",workspace.index(),name)).map_err(invalid)?;
+            let execution_address=Address::new(&format!("execution:{}/{}:dev",workspace.index(),name)).map_err(invalid)?;
             let environment=lua_runtime_core::LuaEnvironment{globals:std::collections::BTreeMap::from([("execution_context".into(),lua_runtime_core::LuaBinding::Value(lua_runtime_core::LuaValue::from_json(serde_json::json!({"workspace":{"address":workspace_address,"name":component.name,"project_root":component.project_root},"name":name,"resource_dir":path.parent().unwrap()})).map_err(invalid)?))]),modules:Default::default()};
             let owner=world.spawn();world.insert_component(owner,execution_address);world.insert_component(owner,lua_runtime_core::WorkspaceLuaTask{workspace,name});
             world.send_event(lua_runtime_core::StartDriverLuaVm{owner,workspace,program:lua_runtime_core::LuaProgram{source:program,origin:path,},environment,reply:Arc::new(Mutex::new(Some(sender)))});Ok(owner)

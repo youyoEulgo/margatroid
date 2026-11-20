@@ -3617,3 +3617,107 @@ textarea:focus-visible {
   flex: 0 0 auto;
   color: var(--mg-text-quaternary);
 }
+
+/* Workspace editor: definition, rename and destructive delete. */
+.workspace-editor-dialog {
+  width: min(780px, 100%);
+  max-height: min(88vh, 860px);
+  overflow-y: auto;
+}
+
+.workspace-edit-address {
+  display: block;
+  margin-top: 4px;
+  color: var(--mg-text-quaternary);
+  font-family: var(--mg-font-mono);
+  font-size: 10px;
+  overflow-wrap: anywhere;
+}
+
+.workspace-agent-editor-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin: 18px 0 8px;
+  color: var(--mg-text-secondary);
+  font-size: 12px;
+  font-weight: 550;
+}
+
+.workspace-agent-editor {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.workspace-agent-edit-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1.4fr) minmax(0, 1fr) 32px;
+  align-items: end;
+  gap: 8px;
+  padding: 10px;
+  border: 1px solid var(--mg-border-l1);
+  border-radius: 10px;
+  background: var(--mg-bg-subtle);
+}
+
+.workspace-agent-edit-row label {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.workspace-agent-edit-row label > span {
+  color: var(--mg-text-tertiary);
+  font-size: 10px;
+}
+
+.workspace-agent-edit-row .field-input {
+  min-height: 34px;
+  padding: 5px 9px;
+  border-radius: 8px;
+  font-family: var(--mg-font-mono);
+  font-size: 11px;
+}
+
+.workspace-agent-remove {
+  width: 32px;
+  height: 34px;
+  color: var(--mg-text-tertiary);
+}
+
+.workspace-agent-remove:hover:not(:disabled) {
+  color: var(--mg-error);
+}
+
+.workspace-edit-warning {
+  margin: 16px 0;
+  padding: 10px 12px;
+  border: 1px solid var(--mg-error-soft);
+  border-radius: 8px;
+  color: var(--mg-error);
+  background: var(--mg-error-soft);
+  font-size: 12px;
+  line-height: 18px;
+}
+
+.workspace-delete-button {
+  background: var(--mg-error);
+}
+
+.workspace-delete-button:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--mg-error) 82%, black);
+}
+
+@media (max-width: 760px) {
+  .workspace-agent-edit-row {
+    grid-template-columns: minmax(0, 1fr) 32px;
+  }
+
+  .workspace-agent-edit-row label:nth-child(2),
+  .workspace-agent-edit-row label:nth-child(3) {
+    grid-column: 1 / -1;
+  }
+}

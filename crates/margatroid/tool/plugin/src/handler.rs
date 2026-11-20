@@ -2147,7 +2147,7 @@ fn test_binding() -> tool_core::TaskSyncBinding {
 fn test_tasks() -> tool_core::ToolTasks {
     let mut app = core_plugin::App::new();
     let owner = app.world_mut().spawn();
-    tool_core::ToolTasks::new(owner, "agent:test/unit:latest".into(), test_binding())
+    tool_core::ToolTasks::new(owner, "agent:test/unit:dev".into(), test_binding())
 }
 
 #[cfg(test)]
@@ -2224,7 +2224,7 @@ mod world_sender_tests {
         let workspace = app.world_mut().spawn();
         app.world_mut().insert_component(
             workspace,
-            address::Address::new("workspace:test/unit").unwrap(),
+            address::Address::new("workspace:test/unit:dev").unwrap(),
         );
         let agent = app.world_mut().spawn();
         app.world_mut().insert_component(
@@ -2239,7 +2239,7 @@ mod world_sender_tests {
         );
         app.world_mut().insert_component(
             agent,
-            address::Address::new("agent:test/source:latest").unwrap(),
+            address::Address::new("agent:test/source:dev").unwrap(),
         );
         let tasks = test_tasks();
         let (reply, _) = oneshot::channel();
@@ -2270,8 +2270,8 @@ mod world_sender_tests {
         let context = ToolExecutionContext {
             storage,
             agent_name: "test".into(),
-            agent_address: "agent:test/source:latest".into(),
-            workspace: json!({"address":"workspace:test/unit","name":"test","project_root":"/project"}),
+            agent_address: "agent:test/source:dev".into(),
+            workspace: json!({"address":"workspace:test/unit:dev","name":"test","project_root":"/project"}),
             diagnostic_received: false,
             request: ToolExecuteRequest {
                 id: "caller".into(),
@@ -2501,11 +2501,13 @@ mod world_sender_tests {
         let root = tempfile::tempdir().unwrap();
         let workspace = app.world_mut().spawn();
         let agent = app.world_mut().spawn();
-        app.world_mut()
-            .insert_component(agent, address::Address::new("agent:test/source").unwrap());
+        app.world_mut().insert_component(
+            agent,
+            address::Address::new("agent:test/source:dev").unwrap(),
+        );
         app.world_mut().insert_component(
             workspace,
-            address::Address::new("workspace:test/unit").unwrap(),
+            address::Address::new("workspace:test/unit:dev").unwrap(),
         );
         let storage = storage_core::open_storage(
             &root.path().join("agent.sqlite"),
@@ -2581,8 +2583,8 @@ mod world_sender_tests {
     fn optional_context_markers_are_lua_nil_and_present_markers_survive_the_wire() {
         let lua = Lua::new();
         let mut context = ToolContext {
-            agent_address: "agent:test/source:latest".into(),
-            workspace: serde_json::json!({"address":"workspace:test/unit","name":"test","project_root":"/project"}),
+            agent_address: "agent:test/source:dev".into(),
+            workspace: serde_json::json!({"address":"workspace:test/unit:dev","name":"test","project_root":"/project"}),
             owner_agent: None,
             agent_name: "test".into(),
             turn: Some("turn".into()),
@@ -2617,7 +2619,7 @@ mod world_sender_tests {
             table.get::<LuaValue>("owner_agent").unwrap(),
             LuaValue::Nil
         ));
-        context.owner_agent = Some("agent:test/lifetime:latest".into());
+        context.owner_agent = Some("agent:test/lifetime:dev".into());
         context.owner_task_id = Some("owner".into());
         context.binding = Some(serde_json::json!({"method": "echo"}));
         let wire = serde_json::to_vec(&context).unwrap();
@@ -2638,7 +2640,7 @@ mod world_sender_tests {
         assert_eq!(table.get::<String>("project_root").unwrap(), "/project");
         assert_eq!(
             table.get::<String>("owner_agent").unwrap(),
-            "agent:test/lifetime:latest"
+            "agent:test/lifetime:dev"
         );
         host::Margatroid::install(
             &lua,

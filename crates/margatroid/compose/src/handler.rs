@@ -103,9 +103,7 @@ pub(crate) fn install(app: &mut App, parts: ApplicationParts) -> Result<(), Comp
         .add_plugin(storage_plugin::StoragePlugin::new())
         .add_plugin(lua_runtime_plugin::LuaRuntimePlugin::new())
         .add_plugin(mcl_plugin::MclPlugin::new().with_import_config(imports))
-        .add_plugin(
-            agent_plugin::AgentPlugin::new(agent_sync).with_resource_roots(options.data_root),
-        )
+        .add_plugin(agent_plugin::AgentPlugin::new(agent_sync))
         .add_plugin(workspace)
         .add_plugin(dto_plugin::DtoPlugin::new())
         .add_plugin(ui_plugin::UiPlugin::default());

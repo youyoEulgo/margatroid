@@ -100,11 +100,11 @@ fn original_websocket_can_query_inactive_workspaces_and_no_agents_after_last_sto
     );
     let project = root.path().join("project");
     std::fs::create_dir(&project).unwrap();
-    let directory = root.path().join("workspaces/post-stop");
+    let directory = root.path().join("workspaces/margatroid/post-stop/dev");
     std::fs::create_dir_all(&directory).unwrap();
     let definition = directory.join("workspace.yaml");
     std::fs::write(&definition, format!(
-        "name: post-stop\nproject_root: {}\nmembers:\n  - name: coder\n    driver: driver:local/coder:latest\n    home_root: {}\n",
+        "project_root: {}\nmembers:\n  - name: coder\n    driver: driver:margatroid/coder:dev\n    home_root: {}\n",
         project.display(), root.path().display())).unwrap();
     std::fs::write(
         root.path().join("config.toml"),
@@ -116,7 +116,7 @@ fn original_websocket_can_query_inactive_workspaces_and_no_agents_after_last_sto
     let driver_settings = agent_driver_core::read_initial_settings(
         &root
             .path()
-            .join("agent-drivers/local/coder/latest/setting.toml"),
+            .join("agent-drivers/margatroid/coder/dev/setting.toml"),
         agent_driver_core::AgentDriverReadLimits::default().settings_bytes,
     )
     .unwrap();
@@ -172,7 +172,7 @@ fn original_websocket_can_query_inactive_workspaces_and_no_agents_after_last_sto
                 &mut socket,
                 "workspace.start",
                 &start_id,
-                json!({"path":definition}),
+                json!({"address":"workspace:margatroid/post-stop:dev"}),
             )
             .await;
             let started = next(&mut socket, |v| v["id"] == start_id).await;
@@ -189,7 +189,7 @@ fn original_websocket_can_query_inactive_workspaces_and_no_agents_after_last_sto
                 &mut socket,
                 "workspace.stop",
                 &stop_id,
-                json!({"path":definition}),
+                json!({"address":"workspace:margatroid/post-stop:dev"}),
             )
             .await;
             let stopped = next(&mut socket, |v| v["id"] == stop_id).await;
@@ -207,7 +207,7 @@ fn original_websocket_can_query_inactive_workspaces_and_no_agents_after_last_sto
                 assert_eq!(entries.len(), 1);
                 assert_eq!(entries[0]["path"], definition.to_string_lossy().as_ref());
                 assert_eq!(entries[0]["status"], "inactive");
-                assert!(entries[0]["address"].is_null());
+                assert_eq!(entries[0]["address"], "workspace:margatroid/post-stop:dev");
                 assert!(state.get("histories").is_none());
                 let id = format!("agents-{cycle}-{query}");
                 send(&mut socket, "agent.req", &id, json!({})).await;

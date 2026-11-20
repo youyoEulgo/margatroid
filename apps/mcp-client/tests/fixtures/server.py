@@ -119,9 +119,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if args.get("reverse"):
             event = threading.Event()
             with lock:
-                held.append(event)
+                held.append((args.get("release_first", False), event))
                 if len(held) == 2:
-                    held[1].set()
+                    selected = next((entry for entry in held if entry[0]), held[1])
+                    selected[1].set()
             assert event.wait(5), "client serialized HTTP requests"
         if args.get("json") or request.get("method") == "initialize":
             body = json.dumps(response).encode()
@@ -141,7 +142,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if args.get("reverse"):
             with lock:
                 if len(held) == 2:
-                    held[0].set()
+                    for _, waiting in held:
+                        waiting.set()
 
 if len(sys.argv) > 1 and sys.argv[1] == "http":
     server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)

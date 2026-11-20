@@ -25,7 +25,6 @@ pub enum WorkspaceState {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkspaceDefinition {
-    pub name: String,
     pub project_root: PathBuf,
     #[serde(default)]
     pub members: Vec<WorkspaceMemberDefinition>,

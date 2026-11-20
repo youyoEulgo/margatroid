@@ -14,7 +14,6 @@ pub(crate) struct DtoState {
     pub events: Arc<std::sync::OnceLock<async_runtime_plugin::AsyncContext>>,
     pub clients: Clients,
     pub lifetime: axum_plugin::AxumLifetime,
-    pub definitions: workspace_core::WorkspaceDefinitions,
 }
 impl Resource for DtoState {}
 

@@ -1,6 +1,6 @@
 use crate::{projection, types::*};
 use address::WorldAddressExt;
-use agent_core::{Agent, AgentStartParameters, WorldAgentExt};
+use agent_core::{Agent, WorldAgentExt};
 use app_runtime_plugin::WorldEventExt;
 use async_runtime_plugin::WorldAsyncExt;
 use client_core::{ClientDisconnected, ClientFrame, ConnectionId, WorldClientExt};
@@ -22,7 +22,7 @@ use std::{
 use storage_core::{AgentStorage, RecordRange};
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
-use workspace_core::{Workspace, WorkspaceDefinitionSnapshot, WorkspaceDefinitions};
+use workspace_core::{Workspace, WorkspaceDefinitions};
 
 struct ReplyOutput {
     value: Value,
@@ -287,9 +287,6 @@ pub(crate) fn handle_dto_request(world: &mut World, request: DtoRequest) {
         "workspace.start" => dispatch::<StartWorkspaceDto>(world, object),
         "workspace.stop" => dispatch::<StopWorkspaceDto>(world, object),
         "workspace.restart" => dispatch::<RestartWorkspaceDto>(world, object),
-        "agent.start" => dispatch::<StartAgentDto>(world, object),
-        "agent.stop" => dispatch::<StopAgentDto>(world, object),
-        "agent.restart" => dispatch::<RestartAgentDto>(world, object),
         "mcl.execute" => dispatch::<MclCommandDto>(world, object),
         "agent.ui.req" => crate::ui::query_agent_ui(world, object),
         "workspace.req" => query::<(), Vec<WorkspaceInfoDto>>(world, object, |w, _, _| {
@@ -306,7 +303,9 @@ pub(crate) fn handle_dto_request(world: &mut World, request: DtoRequest) {
             projection::tasks(w, agent(w, &v.address)?)
                 .ok_or_else(|| error("AgentMissing", "Agent tasks are missing"))
         }),
-        "workspace.reload" => reload(world, object),
+        "workspace.create" | "workspace.update" | "workspace.rename" | "workspace.delete" => {
+            workspace_modify(world, object)
+        }
         "model.config.req" => model_config(world, object, false),
         "model.config.update" => model_config(world, object, true),
         "agent.history.req" | "agent.log.req" | "agent.mcl.req" => {
@@ -380,58 +379,70 @@ converter!(
 );
 converter!(
     StartWorkspaceDto,
-    WorkspacePathDto,
+    WorkspaceTargetDto,
     workspace_core::WorkspaceOperationOutput,
     workspace_core::WorkspaceError,
     workspace_core::StartWorkspace,
     |world: &World,
      r: &Prepared<
-        WorkspacePathDto,
+        WorkspaceTargetDto,
         workspace_core::WorkspaceOperationOutput,
         workspace_core::WorkspaceError,
     >| {
         client(world, r.ticket.connection)?;
         Ok(workspace_core::StartWorkspace {
             id: request_id(&r.ticket),
-            path: r.input.path.clone().into(),
+            path: world
+                .get_resource::<WorkspaceDefinitions>()
+                .ok_or_else(|| error("WorkspaceMissing", "Workspace catalog missing"))?
+                .path_for(&r.input.address)
+                .map_err(|e| e.external())?,
             reply: r.reply.clone(),
         })
     }
 );
 converter!(
     RestartWorkspaceDto,
-    WorkspacePathDto,
+    WorkspaceTargetDto,
     workspace_core::WorkspaceOperationOutput,
     workspace_core::WorkspaceError,
     workspace_core::RestartWorkspace,
     |world: &World,
      r: &Prepared<
-        WorkspacePathDto,
+        WorkspaceTargetDto,
         workspace_core::WorkspaceOperationOutput,
         workspace_core::WorkspaceError,
     >| {
         client(world, r.ticket.connection)?;
         Ok(workspace_core::RestartWorkspace {
             id: request_id(&r.ticket),
-            path: r.input.path.clone().into(),
+            path: world
+                .get_resource::<WorkspaceDefinitions>()
+                .ok_or_else(|| error("WorkspaceMissing", "Workspace catalog missing"))?
+                .path_for(&r.input.address)
+                .map_err(|e| e.external())?,
             reply: r.reply.clone(),
         })
     }
 );
 converter!(
     StopWorkspaceDto,
-    WorkspacePathDto,
+    WorkspaceTargetDto,
     workspace_core::WorkspaceOperationOutput,
     workspace_core::WorkspaceError,
     workspace_core::StopWorkspace,
     |world: &World,
      r: &Prepared<
-        WorkspacePathDto,
+        WorkspaceTargetDto,
         workspace_core::WorkspaceOperationOutput,
         workspace_core::WorkspaceError,
     >| {
         client(world, r.ticket.connection)?;
-        let path = PathBuf::from(&r.input.path);
+        let path = world
+            .get_resource::<WorkspaceDefinitions>()
+            .ok_or_else(|| error("WorkspaceMissing", "Workspace catalog missing"))?
+            .path_for(&r.input.address)
+            .map_err(|e| e.external())?;
         let entity = world
             .query_with::<Workspace>()
             .result()
@@ -445,116 +456,6 @@ converter!(
         Ok(workspace_core::StopWorkspace {
             id: request_id(&r.ticket),
             workspace: entity,
-            reply: r.reply.clone(),
-        })
-    }
-);
-#[derive(Clone)]
-struct AgentInput {
-    start: AgentStartDto,
-    snapshot: WorkspaceDefinitionSnapshot,
-}
-fn parameters(
-    world: &World,
-    input: &AgentInput,
-) -> Result<(Entity, String, AgentStartParameters), ProtocolErrorDto> {
-    let entity = target(world, &input.start.workspace)?;
-    let ws = world
-        .get_component::<Workspace>(entity)
-        .ok_or_else(|| error("WorkspaceMissing", "Workspace is not active"))?;
-    let definition = input
-        .snapshot
-        .get(&ws.definition_path)
-        .ok_or_else(|| error("DefinitionMissing", "Workspace definition is absent"))?;
-    let member = definition
-        .members
-        .iter()
-        .find(|m| m.name == input.start.name)
-        .ok_or_else(|| error("MemberMissing", "Agent member is absent"))?;
-    let base = ws
-        .definition_path
-        .parent()
-        .ok_or_else(|| error("InvalidPath", "Workspace directory is missing"))?;
-    let home = if member.home_root.is_absolute() {
-        member.home_root.clone()
-    } else {
-        base.join(&member.home_root)
-    };
-    let directory = base.join("agents").join(&member.name);
-    let resource_root = world
-        .get_resource::<agent_core::AgentResourceRoot>()
-        .ok_or_else(|| error("ResourceRootMissing", "Agent initial resource root missing"))?;
-    let program = address::resolve_file(&resource_root.0, &member.driver)
-        .map_err(|failure| error("ResourceMissing", &failure.to_string()))?;
-    let source = program
-        .parent()
-        .ok_or_else(|| error("InvalidPath", "initial resource directory missing"))?;
-    Ok((
-        entity,
-        member.name.clone(),
-        AgentStartParameters {
-            initial_settings_path: source.join("setting.toml"),
-            ui_path: source.join("ui"),
-            project_root: definition.project_root.clone(),
-            home_root: home,
-            database_path: directory.join("state.sqlite"),
-            settings_path: directory.join("setting.toml"),
-        },
-    ))
-}
-converter!(
-    StartAgentDto,
-    AgentInput,
-    Entity,
-    agent_core::AgentError,
-    agent_core::StartAgent,
-    |world: &World, r: &Prepared<AgentInput, Entity, agent_core::AgentError>| {
-        client(world, r.ticket.connection)?;
-        let _ = parameters(world, &r.input)?;
-        Err(error(
-            "CreatorTaskRequired",
-            "Agent creation must run in a Workspace Driver or Agent tool task",
-        ))
-    }
-);
-converter!(
-    RestartAgentDto,
-    AgentTargetDto,
-    Entity,
-    agent_core::AgentError,
-    agent_core::RestartAgent,
-    |world: &World, r: &Prepared<AgentTargetDto, Entity, agent_core::AgentError>| {
-        client(world, r.ticket.connection)?;
-        let entity = agent(world, &r.input.address)?;
-        let a = world.get_component::<Agent>(entity).unwrap();
-        let workspace = a.workspace();
-        let name = a.name().clone();
-        let parameters = world
-            .get_component::<agent_core::AgentResources>(entity)
-            .ok_or_else(|| error("ResourcesMissing", "Agent creation parameters are missing"))?
-            .parameters
-            .clone();
-        Ok(agent_core::RestartAgent {
-            id: request_id(&r.ticket),
-            workspace,
-            name,
-            parameters,
-            reply: r.reply.clone(),
-        })
-    }
-);
-converter!(
-    StopAgentDto,
-    AgentTargetDto,
-    Entity,
-    agent_core::AgentError,
-    agent_core::StopAgent,
-    |world: &World, r: &Prepared<AgentTargetDto, Entity, agent_core::AgentError>| {
-        client(world, r.ticket.connection)?;
-        let entity = agent(world, &r.input.address)?;
-        Ok(agent_core::StopAgent {
-            id: request_id(&r.ticket),
-            agent: entity,
             reply: r.reply.clone(),
         })
     }
@@ -595,33 +496,39 @@ fn query<T: Send + 'static, R: Send + 'static>(
         deliver(&r.reply, result);
     }
 }
-fn reload(world: &World, object: Box<dyn Any + Send>) {
-    let Ok(r) = object.downcast::<Prepared<(), (), workspace_core::WorkspaceError>>() else {
+fn workspace_modify(world: &World, object: Box<dyn Any + Send>) {
+    let Ok(request) = object.downcast::<Prepared<
+        workspace_core::WorkspaceModification,
+        (),
+        workspace_core::WorkspaceError,
+    >>() else {
         return;
     };
-    if let Err(e) = client(world, r.ticket.connection) {
-        reject(*r, e);
+    if let Err(error) = client(world, request.ticket.connection) {
+        reject(*request, error);
         return;
     }
     let definitions = world
         .get_resource::<WorkspaceDefinitions>()
-        .cloned()
-        .unwrap_or_default();
-    world.send_async_closure(
-        app_runtime_plugin::RuntimePlugin::UPDATE,
-        move || async move {
-            let result =
-                tokio::task::spawn_blocking(move || definitions.reload().map(|_| ())).await;
-            let result = result.unwrap_or_else(|e| {
-                Err(workspace_core::WorkspaceError::new(
-                    workspace_core::WorkspaceErrorKind::CleanupFailed,
-                    e.to_string(),
-                ))
-            });
-            deliver(&r.reply, result);
-            Ok::<_, DtoAsyncError>(())
-        },
-    );
+        .unwrap()
+        .clone();
+    let guard = world.get_resource::<DtoState>().unwrap().lifetime.track();
+    world
+        .get_resource::<async_runtime_plugin::AsyncRuntimeHandle>()
+        .unwrap()
+        .spawn(async move {
+            let _guard = guard;
+            let request = *request;
+            let result = tokio::task::spawn_blocking(move || definitions.modify(request.input))
+                .await
+                .unwrap_or_else(|e| {
+                    Err(workspace_core::WorkspaceError::new(
+                        workspace_core::WorkspaceErrorKind::CleanupFailed,
+                        e.to_string(),
+                    ))
+                });
+            deliver(&request.reply, result);
+        });
 }
 fn model_config(world: &World, object: Box<dyn Any + Send>, write: bool) {
     macro_rules! operation {
@@ -848,37 +755,51 @@ async fn prepare_request(
             workspace_core::WorkspaceError,
             minimal
         ),
-        ClientMessage::WorkspaceReload { .. } => {
-            build!((), (), workspace_core::WorkspaceError, minimal)
+        ClientMessage::WorkspaceCreate { message, .. }
+        | ClientMessage::WorkspaceUpdate { message, .. } => {
+            let definition = workspace_core::WorkspaceDefinition {
+                project_root: message.definition.project_root.into(),
+                members: message
+                    .definition
+                    .agents
+                    .into_iter()
+                    .map(|member| workspace_core::WorkspaceMemberDefinition {
+                        name: member.name,
+                        driver: member.driver,
+                        home_root: member.home_root.into(),
+                    })
+                    .collect(),
+            };
+            let modification = if response == "workspace.create.result" {
+                workspace_core::WorkspaceModification::Create {
+                    address: message.address,
+                    definition,
+                }
+            } else {
+                workspace_core::WorkspaceModification::Update {
+                    address: message.address,
+                    definition,
+                }
+            };
+            build!(modification, (), workspace_core::WorkspaceError, minimal)
         }
-        ClientMessage::AgentStart { message, .. } => {
-            let definitions = state.definitions.clone();
-            let snapshot = tokio::task::spawn_blocking(move || definitions.reload())
-                .await
-                .map_err(|_| {
-                    frame(
-                        &response,
-                        &id,
-                        Err(error("ReloadFailed", "definition worker failed")),
-                    )
-                })?
-                .map_err(|e| frame(&response, &id, Err(e.external())))?;
-            build!(
-                AgentInput {
-                    start: message,
-                    snapshot
-                },
-                Entity,
-                agent_core::AgentError,
-                minimal
-            )
-        }
-        ClientMessage::AgentRestart { message, .. } => {
-            build!(message, Entity, agent_core::AgentError, minimal)
-        }
-        ClientMessage::AgentStop { message, .. } => {
-            build!(message, Entity, agent_core::AgentError, minimal)
-        }
+        ClientMessage::WorkspaceRename { message, .. } => build!(
+            workspace_core::WorkspaceModification::Rename {
+                address: message.address,
+                new_address: message.new_address
+            },
+            (),
+            workspace_core::WorkspaceError,
+            minimal
+        ),
+        ClientMessage::WorkspaceDelete { message, .. } => build!(
+            workspace_core::WorkspaceModification::Delete {
+                address: message.address
+            },
+            (),
+            workspace_core::WorkspaceError,
+            minimal
+        ),
         ClientMessage::MclExecute { message, .. } => {
             build!(message, mcl_core::MclValue, mcl_core::MclError, mcl_result)
         }
@@ -1304,12 +1225,12 @@ fn invalid_reply(text: &str) -> Option<Value> {
             | "workspace.start"
             | "workspace.stop"
             | "workspace.restart"
-            | "workspace.reload"
+            | "workspace.create"
+            | "workspace.update"
+            | "workspace.rename"
+            | "workspace.delete"
             | "agent.req"
             | "agent.ui.req"
-            | "agent.start"
-            | "agent.stop"
-            | "agent.restart"
             | "agent.turn.req"
             | "agent.turn.abort"
             | "agent.task.req"

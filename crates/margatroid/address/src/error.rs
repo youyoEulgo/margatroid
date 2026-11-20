@@ -17,7 +17,7 @@ impl fmt::Display for AddressError {
         match self {
             Self::InvalidFormat => write!(
                 formatter,
-                "invalid address format: expected type:scope/name[:tag]"
+                "invalid address format: expected type:scope/name:tag"
             ),
             Self::InvalidPart => write!(formatter, "invalid address part or unsupported file type"),
             Self::EntityMissing => write!(formatter, "no entity has this address"),

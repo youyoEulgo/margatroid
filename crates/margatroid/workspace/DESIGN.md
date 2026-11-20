@@ -29,7 +29,8 @@ System分别列出处理事件、接收闭包结果、提交闭包与产出事�
 WorkspaceDefinitions：Resource + Clone
     entries: Arc<RwLock<BTreeMap<PathBuf, WorkspaceDefinition>>>--私有，不借出可变缓存
     source: Option<PathBuf>
-    reload_lock: Arc<Mutex<()>>
+    reload_lock: Arc<Mutex<()>>--串行扫描、写入及活动标记
+    active: Arc<Mutex<BTreeSet<PathBuf>>>--从starting保留到真实停止完成的定义路径
     observer: Arc<OnceLock<DefinitionObserver>>
     open(source: impl Into<PathBuf>) -> Result<Self, WorkspaceError>
         行为：验证来源并首轮全量reload，失败不安装；不自动运行Workspace。
@@ -42,7 +43,21 @@ WorkspaceDefinitions：Resource + Clone
         行为：运行前仅装配一次typed观察，磁盘异步监控由DTO提供。
     reload(&self) -> Result<WorkspaceDefinitionSnapshot, WorkspaceError>
         行为：reload_lock覆盖读取、完整校验和发布；成功整体替换entries并调用observer(Ok(snapshot))，失败保留旧缓存并observer(Err(error))。
-        显式reload、启动/重启和磁盘监控共用此入口；返回不可变快照，运行实例仍保留自己启动使用的definition。
+        仅内部启动/重启和磁盘监控共用此入口；不公开workspace.reload网络API；返回不可变快照，运行实例仍保留自己启动使用的definition；定义不含name，名称只由资源地址创建时确定。
+    path_for(&self,address:&str) -> Result<PathBuf,WorkspaceError>
+        行为：只接受workspace:scope/name:tag，tag必须显式非空，禁止隐藏段/分隔符/控制字符；根据配置目录根构造root/scope/name/tag/workspace.yaml并拒绝路径符号链接，不通过展示名反查。
+    reserve(&self,path:&Path) -> Result<(),WorkspaceError>
+        行为：持reload_lock校验文件存在并登记active；重复路径报Duplicate，与modify共用操作门。
+    release(&self,path:&Path)
+        行为：真实停止完成或确认启动失败清理时，在同一操作门移除active。
+    modify(&self,operation:WorkspaceModification) -> Result<(),WorkspaceError>
+        行为：全程持reload_lock，按地址path_for定位，active路径拒绝Update/Rename/Delete；Create目标已存在拒绝。
+        Create/Update完整校验定义、绝对project_root/home_root及1MiB预算，以同目录create_new暂存文件write/fsync/rename并同步目录；Create创建受控资源目录，不启动运行实例。
+        Rename拒绝已存在目标，移动整个scope/name/tag目录及其配置/历史/快照，并同步父目录，不修改项目文件或运行地址。
+        Delete仅删除经过受控地址定位的整个Workspace目录，不跟随project_root；完成同步父目录。
+        修改完成调用reload_locked重新扫描并经原observer发布目录；不额外生成ECS同步或完成事件。
+    reload_locked(&self) -> Result<WorkspaceDefinitionSnapshot,WorkspaceError>
+        行为：由已持reload_lock的reload/modify共用，完整校验再整体发布；错误保留旧缓存并报告，磁盘已提交的修改不会因后续扫描失败回滚。
 WorkspaceDefinitionSnapshot
     entries: Arc<BTreeMap<PathBuf, WorkspaceDefinition>>
     get(&self, path: &Path) -> Option<&WorkspaceDefinition>
@@ -56,7 +71,7 @@ WorldWorkspaceExt
         行为：成员写入只调用update_workspace的AddMember/RemoveMember，原完整Entity校验保持。
 load_workspace_definitions(source: &Path) -> Result<BTreeMap<PathBuf, WorkspaceDefinition>, WorkspaceError>
 reject_definition_symlinks(path: &Path) -> Result<(), WorkspaceError>
-    行为：沿原路径规则加载全部workspace.yaml，拒绝不允许的symlink及不合法定义，任一错误不发布部分结果。
+    行为：目录来源扫描root/scope/name/tag/workspace.yaml，忽略隐藏目录，拒绝各层符号链接，完整身份用workspace_address校验；文件来源仅保留内部只读加载。加载全部workspace.yaml，拒绝不允许的symlink及不合法定义，任一错误不发布部分结果。
 ```
 
 公开，定义于workspace_plugin：
@@ -65,8 +80,6 @@ WorkspacePlugin
     schedule: String
     definitions: WorkspaceDefinitions
     program_root: PathBuf--Workspace定义程序的明确资源根
-    state: WorkspaceState--本次异步阶段
-    startup: Arc<StartupCompletion>--在途启动真实完成屏障
     root: Option<PathBuf>
     file: Option<PathBuf>
     new() -> Self
@@ -176,13 +189,13 @@ start_workspace_system(world: &mut World)
 crate公开：
 ```text
 update_workspace(world: &mut World, owner: Entity, change: WorkspaceChange) -> Result<(), WorkspaceError>
-    行为：唯一修改Workspace私有data的入口，统一处理状态、成员、故障、实际启动定义；变化后释放可变借用再context.notify，DTO探针提交owned运行快照并直投Clients。
+    行为：唯一修改Workspace私有data的入口，统一处理状态、成员、故障、实际启动定义；Definition只修改project_root及definition，不能覆盖从地址取得的name；变化后释放可变借用再context.notify，DTO探针提交owned运行快照并直投Clients。
 remove_workspace(world: &mut World, owner: Entity)
     行为：真实停止收口后销毁Entity，再通知完整目录更新；不以提前移除代替回收。
 WorkspaceState：Starting | Running | Error | Stopping，无Restarting；定义存在但无运行Entity时网络目录可投影inactive。
 
 handle_start_workspace(world: &mut World, request: StartWorkspace)
-    行为：保留原reply，校验request.path及重复启动，创建Starting实体并提交启动闭包；全量reload后目标必须存在，本次定义用于初始化Workspace.definition。
+    行为：保留原reply，校验request.path必须符合四段资源路径并据其生成Workspace Address，reserve同一目录操作门后创建Starting实体并提交启动闭包；全量reload后目标必须存在，本次定义用于初始化Workspace.definition。
 
 handle_stop_workspace(world: &mut World, request: StopWorkspace)
     行为：Starting/Running/Error均同步转Stopping；关闭新任务及成员创建受理，并立即取消本Workspace实际Lua执行，使未完成启动交接能收口。
@@ -195,7 +208,7 @@ handle_restart_workspace(world: &mut World, request: RestartWorkspace)
 
 handle_start_result(world: &mut World, result: Result<StartOutput, StartError>)
 handle_stop_result(world: &mut World, result: Result<StopOutput, StopError>)
-    行为：核对完整Entity和对应状态；启动成功转Running，关闭成功销毁Entity；失败清理完整时销毁，否则保留宿主并转Error；mount_executor将本次定义保存到Workspace.definition；失败时保存WorkspaceFailure；成员Lua启动失败先发布Error并通过原reply返回聚合MemberFailed，不发布Running；全成功才清除旧故障并Running。
+    行为：核对完整Entity和对应状态；启动成功转Running，关闭成功release定义路径后销毁Entity；失败清理完整时release并销毁，否则保留宿主并转Error；mount_executor将本次定义保存到Workspace.definition；失败时保存WorkspaceFailure；成员Lua启动失败先发布Error并通过原reply返回聚合MemberFailed，不发布Running；全成功才清除旧故障并Running。
 
 ```
 
@@ -274,6 +287,19 @@ WorkspaceLuaTask（lua_runtime_core组件）
     workspace: Entity
     name: String
     行为：管理Workspace定义自动启动的Lua执行实体；与Workspace所属Agent列表分开。停止先关闭新增创建受理，取消所属执行并真实等待，再排空所属Agent及执行线程。
+WorkspaceDefinition：Serialize/Deserialize，deny_unknown_fields
+    project_root: PathBuf
+    members: Vec<WorkspaceMemberDefinition>
+    行为：顶层无name；磁盘旧name明确拒绝，成员name保留。WorkspaceDocument只负责project_root及互斥members/agents输入规范化，不从文件设置Workspace名称。
+WorkspaceModification：Clone + Debug
+    Create { address:String, definition:WorkspaceDefinition }
+    Update { address:String, definition:WorkspaceDefinition }
+    Rename { address:String, new_address:String }
+    Delete { address:String }
+workspace_address(root:&Path,path:&Path) -> Result<String,WorkspaceError>
+    行为：严格四段scope/name/tag/workspace.yaml，校验组件并返回workspace:scope/name:tag。
+parse_workspace_address(address:&str) -> Result<(&str,&str,&str),WorkspaceError>
+    行为：Workspace core私有资源定位解析，不依赖其他领域core；禁止点段、隐藏段、分隔符及控制字符，必须显式提供tag。
 WorkspaceMemberDefinition
     name: String
     driver: String--公开程序locator，解析到base.lua，不要求manifest
