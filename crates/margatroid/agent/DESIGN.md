@@ -15,13 +15,13 @@ method(args) -> xxx
 # 板块定义
 
 ```text
-# lib        agent/core/src/lib.rs；agent/plugin/src/lib.rs  Agent自身扩展；Plugin安装
-# components agent/core/src/components.rs                    Agent组件
-# events     agent/core/src/events.rs                        启停、重启及异常事件
-# system     agent/plugin/src/system.rs                      事件收集与路由
-# handler    agent/plugin/src/handler.rs                     同步受理、异步流程与结果收口
-# types      agent/plugin/src/types.rs                       流程参数与闭包输出
-# types pub  agent/core/src/types.rs                         AgentState与启动参数
+# lib        agent/core/src/lib.rs；agent/plugin/src/lib.rs  公开启动契约与关闭句柄；Plugin安装
+# components agent/core/src/components.rs                    Agent组件；其他领域组件只引用其core定义
+# events     agent/core/src/events.rs                        StartAgent
+# system     agent/plugin/src/system.rs                      同步创建实体、挂载组件和回复
+# handler    agent/plugin/src/handler.rs                     关闭句柄的清理行为
+# types      agent/plugin/src/types.rs                       关闭操作的内部状态
+# types pub  agent/core/src/types.rs                         AgentHandle
 # error      agent/core/src/error.rs                         AgentError
 ```
 
@@ -31,49 +31,31 @@ method(args) -> xxx
 
 ```text
 -- 公开，定义于agent_core
-WorldAgentExt：Agent访问扩展，公开trait
-    agent_state(&self, agent: Entity) -> Result<&AgentState, AgentError>
-        行为：
-            读取Agent状态，目标不存在返回错误。
-    agent_transition(&mut self, agent: Entity, state: AgentState, turn: Option<String>) -> Result<(), AgentError>
-        行为：取得Agent必需上下文，调用update_agent(Transition)，只允许领域入口在其已验证操作中使用。
-    agent_ready(&mut self, agent: Entity) -> Result<(), AgentError>
-        行为：Agent领域检查Starting或Running且无turn，再经统一入口转Running；拒绝Error/Stopping及已有turn，MCL只调用此方法。
-    agent_start_turn(&mut self, agent: Entity) -> Result<String, AgentError>
-        行为：
-            仅Running允许；已有有效turn时直接返回同一标识，不生成或替换回合，不重复发布变化。
-            turn为空时同步生成并发布新turn，返回其标识；Agent始终Running。
-    agent_finish_turn(&mut self, agent: Entity, turn: &str) -> Result<(), AgentError>
-        行为：
-            只验证Running、传入turn非空且与当前有效turn一致；当前turn已空时允许原调用链幂等结束。
-            经统一入口清空turn，状态保持Running；不在本方法读取推理或工具组件，实际执行收口由调用方先等待；
-            有活动turn时核对匹配，中止后turn为空由当前Driver调用链完成；
-            调用方plugin核对实际执行来源及AgentSession，拒绝旧来源完成。
-    agent_abort_turn(&mut self, agent: Entity, turn: &str) -> Result<(), AgentError>
-        行为：
-            仅Running且turn匹配时同步清空turn，保持Running；
-            否则返回错误。此操作必须先于同帧MCL、推理和工具调用受理；
-            不在agent_core跨域取消任务，调用方随后通过各领域core执行推理取消和ToolTasks未return任务的原子强制return及清理。
-    impl WorldAgentExt for World
-        行为：
-            只访问Agent自身共享信息；ready/start_turn/finish_turn/abort_turn经同一AgentUpdateContext调用update_agent，不能直接修改字段或旁路同步。
-```
+AgentUpdateContext：组件变化和实际来源生命周期探针，公开Resource
+    publish: Arc<dyn Fn(&mut World, Entity, AgentUpdateKind) -> Vec<AgentObservationWait> + Send + Sync>
+    new(publish: impl Fn(&mut World, Entity, AgentUpdateKind) -> Vec<AgentObservationWait> + Send + Sync + 'static) -> Self
+    notify(&self, world: &mut World, owner: Entity, kind: AgentUpdateKind) -> Vec<AgentObservationWait>
+        行为：调用装配方注入的回调，core不引用客户端或其他core；普通Changed及Removed不产生异步清理等待。
+    impl Resource + Clone
 
-```text
+WorldAgentExt：Agent状态和回合的统一更新入口
+    agent_ready(&mut self, entity: Entity) -> Result<(), AgentError>
+        行为：调用Agent.ready()，实际变化后释放组件借用并调用AgentUpdateContext::notify(Changed)。
+    agent_start_turn(&mut self, entity: Entity) -> Result<String, AgentError>
+        行为：仅Running受理；已有turn返回原值，否则生成进程内唯一turn并经统一入口提交Changed。
+    agent_finish_turn(&mut self, entity: Entity, turn: &str) -> Result<(), AgentError>
+        行为：仅Running且当前turn为空或匹配时成功，清空实际turn后通知Changed；不在core等待推理或任务。
+    agent_abort_turn(&mut self, entity: Entity, turn: &str) -> Result<(), AgentError>
+        行为：仅Running且turn匹配时清空并通知Changed，调用方plugin再取消该回合执行。
+    agent_set_turn(&mut self, entity: Entity, turn: Option<String>) -> Result<(), AgentError>
+        行为：统一校验并提交turn改变，实际变化后经同一探针发布，不绕过状态与turn约束。
+    impl WorldAgentExt for World
+
 -- 公开，定义于agent_plugin
-AgentPlugin：生命周期插件，公开类型
-    schedule: String--启停System所属计划
-    sync: AgentUpdateContext
-    new(sync: AgentUpdateContext) -> Self
-        行为：必需发布上下文，默认schedule为UPDATE，不提供无上下文生产构造。
+AgentPlugin：Agent启动插件
     impl Plugin for AgentPlugin
         build(self, app: &mut App)
-            行为：
-                检查运行设施和计划，拒绝重复安装。
-                在同一schedule依次add_system：stop_agent_system、restart_agent_system、start_agent_system。
-                安装异常System；
-                各启停System收集自己的闭包结果。
-                使用mecs按挂载顺序同步执行的机制，不增加生命周期排序器或统一请求枚举。
+            行为：在RuntimePlugin::UPDATE安装start_agent_system和stop_agent_system。
 ```
 
 # components
@@ -81,34 +63,30 @@ AgentPlugin：生命周期插件，公开类型
 ## 类型
 
 ```text
--- 公开
-Agent：Agent领域组件，不可克隆
-    name: String--私有，只读访问器name() -> &String
-    workspace: Entity--私有，只读workspace() -> Entity
-    state: AgentState--私有，只读state() -> AgentState
-    turn: Option<String>--私有，只读turn() -> &Option<String>
-    fault: Option<AgentError>--私有，只读fault() -> Option<&AgentError>
-    updates: AgentUpdateContext
-    source_alive: Arc<AtomicBool>
-    removed: tokio::sync::watch::Sender<bool>--new初始false
-    removal(&self) -> tokio::sync::watch::Receiver<bool>
-        行为：返回该实际Agent实例移除观察；等待者在完整生命周期清理及Entity销毁前不能视为完成。
-    new(name: String, workspace: Entity, state: AgentState, turn: Option<String>, updates: AgentUpdateContext) -> Self
-    updates(&self) -> AgentUpdateContext
-    source_lease(&self) -> Arc<AtomicBool>
-    reset_source(&mut self)
-        行为：旧源失效后分配新的有效标记。
-    close_source(&self)
-    impl Component + Debug
-    impl Drop：关闭实际来源，发布removed=true；正常停止仅在真实清理及监控等待后移除Entity，旧推理帧不能复活。
-
-AgentResources：Component
-    parameters: AgentStartParameters--保留实际创建参数；UI目录是引用，配置目标为Agent持久文件
-AgentSession(String)：Component
-    new() -> Self
-    行为：每次实际Agent运行唯一，原TEMP Block命名空间沿用此id，结束时清理不落盘。
-
-
+-- 公开，定义于agent_core
+Agent：Agent自身运行组件
+    workspace: Entity--所属Workspace实体
+    parent: Entity--实际创建者，Workspace或Agent实体；完整Entity包含generation
+    task_id: String--创建者parent的ToolTasks中实际启动任务id，不是模型call_id
+    instance: String--本次Agent运行的唯一身份，用于TEMP命名空间及迟到结果校验
+    project_root: PathBuf--Driver传入并经校验的完整实际工作目录
+    state: AgentState--启动、运行、关闭
+    turn: Option<String>--当前回合，仅约束显式携带turn的调用
+    ready: tokio::sync::watch::Sender<AgentReadyState>--初始化Pending，关闭时立即置Closed
+    wake: Arc<Mutex<AgentWakeSlot>>--wake槽位，独立于Driver Lua VM
+    new(workspace: Entity, parent: Entity, task_id: String, project_root: PathBuf) -> Self
+        行为：同步创建唯一instance、Starting、turn=None及两个槽位；不读取文件或其他领域组件。
+    instance(&self) -> &str
+        行为：返回本次运行身份；不能由旧调用方覆盖。
+    task_owner(&self) -> (Entity, &str)
+        行为：返回parent及task_id，只定位真实创建任务，不从地址字符串猜测任务归属。
+    ready(&mut self) -> Result<(), AgentError>
+        行为：Starting转为Running并将ready槽位置为Ready；Running重复调用成功；Closing拒绝。公开修改经WorldAgentExt调用，在释放组件借用后通知探针。
+    set_state(&mut self, state: AgentState) -> bool
+        行为：仅实际变化返回true；Closing关闭新受理；由plugin统一入口通知探针，不持组件借用编码网络消息。
+    set_turn(&mut self, turn: Option<String>) -> Result<bool, AgentError>
+        行为：校验当前状态，改变turn返回true，相同值返回false；经WorldAgentExt调用并发布实际变化。
+    impl Component for Agent
 ```
 
 # events
@@ -116,35 +94,22 @@ AgentSession(String)：Component
 ## 类型
 
 ```text
--- 公开
-StartAgent：启动请求，公开事件
-    id: String
+-- 公开，定义于agent_core
+StartAgent<P>：Driver注入方法发出的Agent实体创建事件
     workspace: Entity
-    name: String
-    parameters: AgentStartParameters
-    reply: Arc<Mutex<Option<oneshot::Sender<Result<Entity, AgentError>>>>>
-    impl Event for StartAgent
-    creator: AgentCreator--真实创建任务，非可选；宿主受理时确定，实体注册前保存
+    parent: Entity--真实工具发起者
+    task_id: String--parent的ToolTasks内实际创建任务id
+    address: String--根据真实父节点与选定节点名确定的完整节点路径
+    project_root: PathBuf--Driver传入的完整实际工作目录
+    ui_path: PathBuf--Driver指定的实际UI来源
+    persistence: P--已连接的持久化组件；plugin使用storage_core::AgentStorage
+    reply: Arc<Mutex<Option<oneshot::Sender<Result<AgentHandle, AgentError>>>>>
+    impl<P: Send + Sync + 'static> Event for StartAgent<P>
 
-StopAgent：关闭请求，公开事件
-    id: String
-    agent: Entity
-    reply: Arc<Mutex<Option<oneshot::Sender<Result<Entity, AgentError>>>>>
+StopAgent：关闭目标Agent所属启动任务的事件
+    address: String--目标Agent的完整节点地址
+    reply: Arc<Mutex<Option<oneshot::Sender<Result<(), AgentError>>>>>
     impl Event for StopAgent
-
-RestartAgent：重启请求，公开事件
-    id: String
-    workspace: Entity
-    name: String
-    parameters: AgentStartParameters
-    reply: Arc<Mutex<Option<oneshot::Sender<Result<Entity, AgentError>>>>>
-    impl Event for RestartAgent
-
-AgentException：异常输入，公开事件
-    id: String
-    agent: Entity
-    error: AgentError
-    impl Event for AgentException
 ```
 
 # system
@@ -153,42 +118,34 @@ AgentException：异常输入，公开事件
 
 ```text
 -- crate公开
+start_agent_system(world: &mut World)
+    处理事件：StartAgent<storage_core::AgentStorage>
+    接收闭包结果：None
+    提交闭包：rollback_created_agent(handle: AgentHandle, reply: Option<AgentReply>, error: AgentError) -> Future<Output = ()>--仅创建后失败补偿
+    产出事件：None
+    行为：接收StartAgent并从原reply短锁take唯一AgentReply；已被认领则跳过；校验Workspace仍Running、parent仍存活。parent为Workspace时必须等于event.workspace，为Agent时其workspace必须等于event.workspace；其他实体不能作为Agent创建父节点。
+        核对parent的ToolTasks中task_id存在、未取消且仍允许绑定子Agent；在本System回复前绑定，事件不可伪造跨Workspace任务归属。
+        校验address的父节点对应完整parent，并检查地址未占用；检查event.persistence是已打开的存储，不在本System打开数据库。
+        同步建立实体，挂载Address及Agent::new(workspace, parent, task_id, project_root)。
+        同步挂载MclQueue::default()、Tools::new()、ToolTasks::new()、inference_core::ActiveInference::default()以及event.persistence。
+        在plugin构造AgentHandle；将其关闭回调和完成等待通过tool_core::ToolTaskHandle::bind_child登记到实际创建任务，再回复；parent任务已关闭时立即安排关闭新实体，不返回可用Agent。
+        组件全部就绪后依次notify(Installed)和notify(SourcesInstalled { ui_path: Some(event.ui_path) })，对象观察通过注入回调建立。
+        首次安装的完整Entity没有旧来源，Installed和首次SourcesInstalled回调必须返回空等待；来源替换仅由既有实体的独立异步受理流程完成，不把等待塞进本System。
+        bind_child拒绝或组件安装后失败时，将新句柄通过父任务retain_child_for_cleanup保存为补偿能力，再把句柄、原Sender及错误交给rollback_created_agent；必须等其close实际完成后才用原Sender回复Err。
+        创建监督在收到上述错误reply前始终持有节点操作凭证；不是先回复错误再后台清理。接收端丢失时也独立执行同一关闭监督，不丢弃新实例。
+        成功通过原reply返回AgentHandle；Sender接收者已丢失也由创建监督关闭刚创建的实体。
+        不读取文件、不提交初始化闭包、不启动Driver Lua VM；core事件以泛型P承载存储，agent_core不依赖storage_core。
+
 stop_agent_system(world: &mut World)
     处理事件：StopAgent
-    接收闭包结果：Result<StopOutput, StopError>
-    提交闭包：stop_flow(FlowContext) -> Future<Output = Result<StopOutput, StopError>>
-    产出事件：None
-    oneshot回复：Result<Entity, AgentError>
-    行为：
-        StopAgent -> handle_stop_agent；
-        Result<StopOutput, StopError> -> handle_stop_result。
-
-restart_agent_system(world: &mut World)
-    处理事件：RestartAgent
     接收闭包结果：None
-    提交闭包：等待StopAgent原oneshot的普通异步闭包，返回Result<(),AsyncTaskError>
-    闭包产出事件：停止成功后一次StartAgent
-    oneshot回复：停止失败直接回复原RestartAgent，成功由普通StartAgent完成原reply
-    行为：仅路由RestartAgent -> handle_restart_agent，不接收独立RestartOutput或运行第二套生命周期。
-
-start_agent_system(world: &mut World)
-    处理事件：StartAgent
-    接收闭包结果：Result<StartOutput, StartError>
-    提交闭包：start_flow(FlowContext) -> Future<Output = Result<StartOutput, StartError>>
-    闭包产出事件：InitToolTasks、InitInference
+    提交闭包：Future<Output = ()>
     产出事件：None
-    oneshot回复：Result<Entity, AgentError>
-    行为：
-        StartAgent -> handle_start_agent；
-        Result<StartOutput, StartError> -> handle_start_result。
+    行为：接收StopAgent，按完整节点查找Agent；不存在返回AgentMissing，地址重复返回错误。
+        从Agent读取parent、task_id，并核对该parent的实际Address与目标父节点一致；从parent.ToolTasks按task_id取得唯一ToolTaskHandle，不按工具路径、别名或参数猜测。
+        将句柄及原reply交给异步闭包调用finish()；该任务的异步子Agent清理调用AgentHandle.close，不再发送StopAgent。
+        任务及生命周期绑定的Agent全部实际关闭后回复Ok(())；失败回复AgentError并保留监督。目标及任务均在World同步阶段按完整Entity核对，闭包不借用World。
 
-agent_exception_system(world: &mut World)
-    处理事件：AgentException
-    接收闭包结果：None
-    提交闭包：None
-    产出事件：None
-    行为：
-        AgentException -> handle_agent_exception。
 ```
 
 # handler
@@ -197,76 +154,26 @@ agent_exception_system(world: &mut World)
 
 ```text
 -- crate公开
-update_agent(world: &mut World, owner: Entity, context: &AgentUpdateContext, change: AgentChange) -> Result<(), AgentError>
-    行为：
-        核对实际Agent存在，Transition只在此写入state/turn；Fault在同次入口记录故障、清turn并转Error。
-        成功进入Running清除旧故障；失败或可见值不变不发布。
-        释放Agent可变借用后调用context.notify(Changed)，同步探针在World线程取得owned公共投影并提交共享视图，然后直接通知Clients。
-        不把World捕获到异步prepare；异步网络读取的是owned版本化投影缓存。
-notify_agent_runtime(world: &mut World, owner: Entity, stopped: bool) -> Result<Vec<AgentObservationWait>, AgentError>
-    行为：实际安装重置推理来源租约、停止关闭来源，调用RuntimeInstalled/RuntimeStopped生命周期回调，返回旧文件/SQL监控的真实完成等待。
-remove_agent(world: &mut World, owner: Entity)
-    行为：真实停止收口后销毁Entity，再经同一上下文更新完整Agent目录并退休turn来源；仍有监控等待则属于未完成清理错误。
-wait_observers(observers: Vec<AgentObservationWait>) -> Future<Output = Result<(), AgentError>>
-    行为：并发等待所有真实监控完成，聚合失败为CleanupFailed，不以取消请求或丢Future替代。
-
-handle_start_agent(world: &mut World, request: StartAgent)
-    行为：
-        校验Workspace和成员创建请求；Agent作用域从实际Workspace地址组成<workspace.scope>-<workspace.name>-<workspace.tag>，构造agent:<组合scope>/<request.name>:dev并检查Address唯一，不计算父Agent地址哈希；
-        同步创建Agent Entity并经update_agent(Register)登记Starting公共视图，再提交start_flow；
-        拒绝时发送启动错误。
-
-handle_stop_agent(world: &mut World, request: StopAgent)
-    行为：
-        通过update_agent按白名单同步转Stopping并直接发布agent.sync；
-        Starting/Running/Error可受理；关闭新请求受理，再提交stop_flow，等待StartupBarrier真实完成后才清理资源；
-        拒绝时发送关闭错误。
-
-handle_restart_agent(world: &mut World, request: RestartAgent)
-    行为：按workspace/name定位既有Agent，保留请求parameters；直接调用handle_stop_agent，停止使用普通StopAgent的状态/取消/清理规则。
-        仅await真正StopAgent.reply；成功后提交普通StartAgent，携带原workspace/name/parameters及原重启reply；新Agent Entity和Session由StartAgent创建。
-        停止失败或回执丢失立即回复，不提交StartAgent；不检查ToolTasks是否非空、不提前校验启动参数、不额外改状态/装Barrier/重载定义、不保留旧Entity。
-
-handle_agent_exception(world: &mut World, event: AgentException)
-    行为：
-        仅当前Starting/Running可报告故障，Stopping/Error不被旧异常覆盖；通过update_agent设置Error、清turn，cancel_runtime关闭MCL及取消推理/任务，直接发布agent.sync；不伪报清理完成。
-
-handle_start_result(world: &mut World, result: Result<StartOutput, StartError>)
-    行为：
-        核对Entity及对应生命周期状态；
-        忽略失效结果。
-        资源挂载成功：保留Starting，通过原StartAgent.reply回复Entity；只有后续MCL ready进入Running。
-        失败：
-            有完整清理证明则经update_agent(Remove)移出公共目录再销毁Entity，否则保留宿主并将匹配本次FlowError.state的运行转Error，关闭普通受理。
-            通过原reply回复错误。
-
-handle_stop_result(world: &mut World, result: Result<StopOutput, StopError>)
-    行为：
-        核对Entity及对应生命周期状态；
-        忽略失效结果。
-        关闭成功：经update_agent(Remove)移出公共目录，再销毁Entity，通过原StopAgent.reply回复原Entity。
-        失败：
-            有完整清理证明则经update_agent(Remove)移出公共目录再销毁Entity，否则保留宿主并将匹配本次FlowError.state的运行转Error，关闭普通受理。
-            通过原reply回复错误。
-
-
 ```
 
 ```text
 -- 私有
-prepare(context: &FlowContext) -> Future<Output = Result<(AgentStorage, AgentResources), AgentError>>
-    行为：复用受监督blocking读取与open_storage；持久settings_path不存在时只读initial_settings_path并校验TOML，存在时不依赖或重读初值文件。
-        固定state.sqlite/setting.toml路径沿原symlink检查，已有配置保留不覆盖；AgentResources保留完整parameters，UI路径只用作监控来源，不创建UI目录、不复制文件、不读取旧Agent本地UI。
-install_runtime(context: &FlowContext, storage: AgentStorage, source: AgentResources) -> Future<Output = Result<(), AgentError>>
-    行为：复用原World挂载入口，核对旧推理/MCL/工具已收口；挂载storage、AgentSession、AgentWaitSlot、AgentResources、MclQueue和typed资源集合。
-        不创建Lua环境、VM或模型默认配置；模型由EFFECT model_set通过原typed入口安装。
-        notify_agent_runtime仅建立传入UI目录/COMMIT监控并等待旧监控真实退出。
-start_steps(context: &FlowContext) -> Future<Output = Result<(), StartFailure>>
-    行为：prepare与install_runtime后同时提交InitToolTasks/InitInference并收齐原oneshot；失败不提前丢弃另一项，不启动VM。
-stop_runtime(context: &FlowContext, _require_vm: bool) -> Future<Output = Result<(), AgentError>>
-    行为：关闭Agent受理、等待槽、推理及自己ToolTasks内任务；任务scope负责停止自己创建的Agent并等待实际移除，不读取creator做递归扫描、不反向等待创建者VM。
-        复用原tasks.finish、inference.wait_finished及MclDrain真实等待；之后按AgentSession调用DropTemporaryBlocks，保留持久Block和历史。
-        移除AgentResources并等待实际UI/记录监控收口；不读取或终止创建者VM，不销毁协调Entity。
+rollback_created_agent(handle: AgentHandle, reply: Option<AgentReply>, error: AgentError) -> Future<Output = ()>
+    行为：await handle.close()；reply为Some时成功后才通过原Sender返回原创建错误，失败则返回带清理失败原因的错误，关闭能力保留在父任务待清理项中供显式finish重试。
+        成功发送失败意味着接收端已丢失，此时reply=None仍完成关闭，不再尝试回复。
+        创建业务失败和补偿收口是两件事，父任务不能在补偿仍执行时宣布创建交接完成。
+request_agent_close(world: WorldClosureSender, entity: Entity, state: Arc<Mutex<AgentCloseState>>, runtime: AsyncRuntimeHandle) -> AgentCloseFuture
+    行为：同步短锁检查关闭状态；Idle或Failed时登记本次执行并由runtime.spawn启动独立close_agent监督，Running时订阅同一次结果，Closed时直接成功。
+        返回的Future只等待结果，不拥有清理执行；等待者取消或丢弃Future不会取消清理。失败后下一次显式close可重新执行尚未完成步骤，不恢复运行受理。
+close_agent(world: WorldClosureSender, entity: Entity, state: Arc<Mutex<AgentCloseState>>) -> Future<Output = ()>
+    行为：World闭包核对完整Entity；已不存在视为该实例已关闭，不作用于复用index的新实体。
+        将Agent.state置Closing、turn清空、ready置Closed并关闭wake；关闭自身MclQueue与ToolTasks的新受理，通知Changed并使旧生成租约失效。
+        克隆MclDrain、任务集合、实际推理句柄及存储句柄；向推理及所有自身任务请求取消，等待MCL、推理和任务真实收口。
+        仅关闭目标自身创建的子任务，绝不关闭Agent.parent中的创建者任务，避免父任务finish与Agent关闭互相等待。
+        调用notify(SourcesClosing)，等待UI、记录和配置来源监控及在途worker全部真实结束；收集错误但不提前丢弃其余等待，所有监控join后再返回聚合错误；工具的诊断引用在子Agent绑定关闭前释放，避免关闭后继续写库。
+        用blocking worker同步调用storage_core::close_storage并等待成功；所有克隆随后统一拒绝访问，不能只drop一个Arc。
+        World闭包再次核对Entity，despawn后notify(Removed)，然后将AgentCloseState置Closed，通知等待者Ok(())。
+        任一步失败置Failed并通知错误；保留Closing实体及尚未释放能力，允许下一次close继续。目录不在此处删除或移动。
 
 ```
 
@@ -275,31 +182,15 @@ stop_runtime(context: &FlowContext, _require_vm: bool) -> Future<Output = Result
 ## 类型
 
 ```text
--- 私有
-StartupCompletion：私有共享启动完成证明
-    done: AtomicBool
-    changed: tokio::sync::Notify
-    finish(&self)：Release发布真实启动Future完成并notify_waiters
-    wait(&self)：先注册通知后检查done，避免丢失唤醒
-StartupBarrier(Arc<StartupCompletion>)：私有Component
-    行为：仅StartAgent创建时安装；guarded_start在含panic收口后finish；stop_flow先wait，不能先销毁仍被初始化worker使用的宿主。
-FlowContext：闭包上下文
-    id: String--原请求ID
-    agent: Entity
-    parameters: Option<AgentStartParameters>--启动为Some，关闭为None
-    reply: Option<oneshot::Sender<Result<Entity, AgentError>>>--原请求回复端
-    startup: Arc<StartupCompletion>--同一实际启动工作完成屏障
-
-StartOutput / StopOutput：对应闭包的成功载荷
-    id: String--原请求ID
-    agent: Entity
-
-StartError / StopError：对应闭包的失败载荷
-    id: String--原请求ID
-    agent: Entity
-    error: AgentError
-    cleanup_completed: bool
-    state: Option<AgentState>--产生失败的实际阶段，旧阶段回调不能覆盖新操作
+-- 私有，定义于agent_plugin
+AgentCloseState：plugin内部关闭监督状态
+    phase: AgentClosePhase
+    result: watch::Sender<AgentCloseResult>
+AgentClosePhase
+    Idle | Running | Failed | Closed
+AgentCloseResult：Clone
+    Pending | Finished(Result<(), AgentError>)
+    行为：Running只对应一个独立监督任务；成功永久保存，失败允许显式重试，等待者不持任务清理所有权。
 
 ```
 
@@ -308,87 +199,56 @@ StartError / StopError：对应闭包的失败载荷
 ## 类型
 
 ```text
-
-AgentCreator：公开只读创建来源值
-    address: String--实际Workspace或调用方Agent Address
-    task_id: String--公开真实任务id，不是execution_id
-AgentTaskBinding：公开Component，字段私有
-    creator: AgentCreator
-    _guard: Option<Box<dyn Send+Sync>>--启动时creator先保存；runtime guard匹配同一引用后安装，内部guard阶段不影响公开creator非空性
-    reserve(world:&mut World,entity:Entity,creator:AgentCreator)
-        行为：仅在实体注册前保存必需创建来源，初始状态发布之前完成。
-    creator(&self) -> &AgentCreator
-    install(world:&mut World, entity:Entity, creator:AgentCreator, guard:Box<dyn Send+Sync>) -> Result<(),AgentError>
-        行为：校验目标Agent存在，取得其必需AgentUpdateContext，同一入口挂载绑定后notify Changed提交创建来源投影；不把工具私有类型引入agent_core，不存数据库，不允许调用方改写创建引用。
-AgentStartParameters
-    initial_settings_path: PathBuf--初始化配置文件，非运行配置位置
-    ui_path: PathBuf--直接引用的UI目录
-    project_root: PathBuf
-    home_root: PathBuf
-    database_path: PathBuf--Agent持久数据库
-    settings_path: PathBuf--Agent持久配置
-    行为：显式设置配置/UI来源材料、项目/存储路径；不读取driver.toml或启动VM。
-Agent
-    行为：AgentTaskBinding与Agent并列挂载，不在Agent中持有VM；绑定实际移除后其guard注销任务scope登记。
-    行为：归属决定持久路径及清理树，workspace始终表示根Workspace；不持DriverLuaVm或VM生命周期责任。
-StartAgent
-    owner: Entity
-    行为：仅创建Entity、复用prepare/open_storage/install_runtime及InitToolTasks/InitInference，资源安装完成返回实际Entity；ready由明确目标MCL推进。
-
--- 公开
+-- 公开，定义于agent_core
+AgentReply = oneshot::Sender<Result<AgentHandle, AgentError>>
 AgentObservationWait = Pin<Box<dyn Future<Output = Result<(), AgentError>> + Send>>
 AgentUpdateKind
-    Changed | RuntimeInstalled | RuntimeStopped | Removed
-AgentUpdateContext：必需typed同步发布能力，Resource + Clone
-    publish: Arc<dyn Fn(&mut World, Entity, AgentUpdateKind) -> Vec<AgentObservationWait> + Send + Sync>
-    public: Arc<dyn Fn(Entity, AgentPublicUpdate) + Send + Sync>
-    scope: Arc<AtomicBool>
-    scopes: Arc<Mutex<BTreeMap<Entity, Arc<AtomicBool>>>>
-    new(publish, public) -> Self
-    notify(&self, world: &mut World, owner: Entity, kind: AgentUpdateKind) -> Vec<AgentObservationWait>
-        行为：RuntimeStopped/Removed关闭旧资源scope，再调用所属生命周期探针；其他实际状态变化不会创建调查任务。
-    scoped(&self, owner: Entity) -> Self
-        行为：按实际来源衍生资源回调租约，停止/重启后旧回调失效。
-    update_public(&self, owner: Entity, value: AgentPublicUpdate)
-        行为：当前scope有效才提交安全公共纯值，DTO回调只更新共享投影，不访问World。
-AgentChange
-    Transition { state: AgentState, turn: Option<String> } | Fault(AgentError)
-AgentPublicUpdate
-    Tools(Vec<PublicToolInfo>) | Sandboxes(Vec<(String, PathBuf)>)
-    Sandbox(Option<String>) | Model(Option<PublicModelInfo>)
-PublicToolInfo
-    alias: String
-    path: PathBuf
-    description: String
-    input_schema: Value
-    owner_task_id: Option<String>
-    binding: Option<Value>
-PublicModelInfo
-    id: String
-    model: String
-    provider: String
-    api_type: String
-    context_window_tokens: u64
-    thinking: Option<String>
-    reasoning_effort: Option<String>
-    行为：只含安全公共字段，不含endpoint/凭据。
+    Installed--组件装配完成，初始化状态与集合观察
+    Changed--状态或turn实际改变
+    SourcesInstalled { ui_path: Option<PathBuf> }--实际持久化组件及可选UI来源已就绪
+    SourcesClosing--来源失效、取消监控并返回真实结束等待
+    Removed--实体已销毁，移除视图和网络来源
 
-AgentStartParameters：启动参数，公开类型
-    initial_settings_path: PathBuf
-    ui_path: PathBuf--显式配置/UI初值资源定位
-    project_root: PathBuf
-    home_root: PathBuf
-    database_path: PathBuf
-    settings_path: PathBuf
+AgentReadyState：Clone + Copy
+    Pending | Ready | Closed
 
-AgentState：生命周期状态，公开枚举
-    Starting--创建/挂载/初始化；允许MCL，不允许新推理或工具执行
-    Running--ready完成；普通MCL可用；推理/工具仅在请求明确携带turn时检查有效关联，自由调用不要求当前turn
-    Error--明确异常；只允许查询诊断及关闭清理，不接受普通MCL
-    Stopping--真实停止监督正在执行，清理完成才移除Entity
-    行为：不存在Idle、Working或Restarting；turn为独立Option<String>，回合开始、中止和结束不修改Running。
+AgentState
+    Starting--组件已挂载，等待ready；无turn调用可受理
+    Running--ready已完成；有turn调用必须与当前有效turn一致，无turn调用不要求伪造回合
+    Closing--关闭已开始，拒绝新执行及ready，实际清理完成后销毁实体
 
+AgentWakeSlot
+    sender: Option<(u64, oneshot::Sender<()>)>--等待代号与唤醒端
+    next_waiter: u64--递增等待代号，取消guard只能清理自己登记的代号
+    pending_wake: bool--无人等待时保留一次唤醒
+    waiter: Option<u64>--当前等待代号，发送唤醒后仍保留到本等待guard退出
+    closed: bool--关闭后拒绝新等待和唤醒
+    new() -> Self
+        行为：同步创建空槽位，pending_wake及closed为false，waiter=None，next_waiter从1递增。
+    wake(&mut self) -> Result<(), AgentError>
+        行为：已关闭则返回错误；存在等待者则唤醒，否则记录pending_wake；重复唤醒合并。
+    wait(slot: Arc<Mutex<Self>>) -> Future<Output = Result<(), AgentError>>
+        行为：已关闭或已有等待者时返回错误；pending_wake为true时消费并立即成功，否则创建oneshot并等待唤醒。
+            等待guard只在waiter仍等于自己代号时清空waiter及对应sender；唤醒take sender不清除代号，避免取消旧等待时误删新等待。不持锁跨await。
+    close(&mut self)
+        行为：置closed，清空pending_wake并释放sender，使正在等待者结束并返回关闭错误。
 
+AgentCloseFuture = Pin<Box<dyn Future<Output = Result<(), AgentError>> + Send>>
+
+AgentHandle：Agent实体的关闭句柄
+    entity: Entity--私有，完整Entity，包含generation
+    ready: tokio::sync::watch::Receiver<AgentReadyState>--私有，对应Agent的ready槽位
+    close: Arc<dyn Fn() -> AgentCloseFuture + Send + Sync>--私有，由agent_plugin注入的关闭能力
+    new(entity: Entity, ready: tokio::sync::watch::Receiver<AgentReadyState>, close: impl Fn() -> AgentCloseFuture + Send + Sync + 'static) -> Self
+        行为：保存实体身份、ready观察及调用方提供的关闭能力，不创建实体、不挂载组件。
+    entity(&self) -> Entity
+        行为：返回本句柄对应的实际Entity。
+    wait_ready(&self) -> Future<Output = Result<(), AgentError>>
+        行为：克隆ready接收端；Ready时成功，Pending等待，Closed或发送端关闭时返回错误；实体Closing但尚未销毁也能结束等待。
+    close(&self) -> AgentCloseFuture
+        行为：调用已注入能力立即请求受监督关闭，返回结果等待；重复请求共享当前执行，失败允许显式重试，core不读其他组件或发停止事件。
+    impl Clone for AgentHandle
+        行为：共享同一实际Agent的关闭能力，不创建或复制实体。
 ```
 
 # error
@@ -396,15 +256,11 @@ AgentState：生命周期状态，公开枚举
 ## 类型
 
 ```text
--- 公开
-AgentError：生命周期错误，公开类型
-    kind: AgentErrorKind
-    message: String
+-- 公开，定义于agent_core
+AgentError：Agent创建或关闭错误
+    message: String--地址校验、实体创建或实际清理的失败说明
+    impl Clone + Debug
     impl Display + std::error::Error
-
-AgentErrorKind：错误类别，公开枚举
-    InvalidRequest | AgentMissing | StateRejected
-    StartFailed | StopFailed | RestartFailed | CleanupFailed | ReplyClosed
 ```
 
 # 持有关系
@@ -413,17 +269,41 @@ AgentErrorKind：错误类别，公开枚举
 World
 └── Agent Entity
     ├── Address（address）
-    ├── Agent（私有状态，所有变更经AgentUpdateContext）
-    ├── ToolTasks（tool_core，InitToolTasks挂载）
-    ├── ActiveInference（inference_core，InitInference挂载）
-    ├── AgentSession与AgentWaitSlot（不拥有执行者）
-    ├── MclQueue（MCL领域core）
-    ├── 数据库与历史组件（存储领域core）
-    └── 各资源路径集合（所属领域core）
+    ├── Agent（agent_core）
+    │   ├── workspace、parent: Entity
+    │   ├── task_id、instance: String
+    │   ├── project_root: PathBuf
+    │   ├── state: AgentState
+    │   ├── turn: Option<String>
+    │   ├── ready槽位
+    │   └── wake槽位
+    ├── MclQueue（mcl_core）
+    ├── Tools（tool_resource_core）
+    ├── ToolTasks（tool_core）
+    ├── ActiveInference（inference_core）
+    └── AgentStorage（storage_core）
 
-异步闭包
-└── FlowContext
-    ├── Entity
-    ├── owned参数及事件发送能力
-    └── 本步骤oneshot接收端
+StartAgent<P>
+├── workspace: Entity
+├── parent: Entity
+├── task_id: String
+├── address: String
+├── project_root、ui_path: PathBuf
+├── persistence: P
+└── reply: Arc<Mutex<Option<oneshot::Sender<Result<AgentHandle, AgentError>>>>>
+
+StopAgent
+├── address: String
+└── reply: Arc<Mutex<Option<oneshot::Sender<Result<(), AgentError>>>>>
+
+调用方
+└── AgentHandle（agent_core）
+    ├── entity: Entity
+    ├── ready观察接收端
+    └── 关闭能力（agent_plugin注入）
+        └── AgentCloseState
+            └── 完整Entity、WorldClosureSender及独立关闭监督状态
+
+AgentUpdateContext
+└── 注入回调 → plugin内的版本化公共视图及实际监控归属
 ```

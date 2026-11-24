@@ -26,19 +26,26 @@ DtoPlugin：无字段，Default
     impl Plugin
         build(self, app: &mut App)
             行为：检查Runtime/AsyncRuntime/Axum及MargatroidConfig，复用World唯一Clients；存在的typed绑定必须与该槽位一致。
-                取得或创建应用级WorkspaceSyncBinding及AgentUpdateContext，安装资源probe工厂，初始化DtoState及只持监控归属的SyncObservations；存在ModelConfigFile时install_model_config_monitor。
-                为安装前已有Agent初始化实际来源观察，在应用启动建立一次Workspace定义磁盘监控。
+                取得装配层提供的WorkspaceUpdateContext与AgentUpdateContext，复用World唯一Clients，初始化公共视图和SyncObservations；存在ModelConfigFile时安装其原有来源监控。
+                对安装前已有实体初始化一次探针来源；后续只由实际Installed、SourcesInstalled、Changed、Closing及Removed回调驱动，不逐帧查找。
+                Workspace登记来自workspace_core数据库确认提交通知，不再建立workspace.yaml定义监控；目录加载由Workspace初始化System负责。
                 注册GET /ws及GET/HEAD /{workspace}/{*path}；文件handler复用既有ingress、AxumLifetime及WorldClosureSender，不新增业务System或公共事件。
                 只安装PRE_UPDATE的abort_control_system和UPDATE的dto_route_system，不安装同步System。
-task_sync_binding(clients: Clients) -> TaskSyncBinding
-    行为：构造Task完整快照的DTO编码函数和同一共享槽位，注入ToolPlugin。
-agent_sync_context(clients: Clients) -> AgentUpdateContext
-    行为：创建一个应用级AgentViews、完整Agent集合来源及per-Agent turn来源；World同步入口提交owned投影，公共资源回调提交typed派生字段。
-resource_sync_bindings(context: AgentUpdateContext) -> (ToolResourceSyncBinding, SandboxSyncBinding, SandboxSelectionSyncBinding)
-model_sync_binding(context: AgentUpdateContext) -> ModelSyncBinding
-    行为：按owner衍生实际来源scope，映射安全Tools/沙箱/模型纯值；旧scope失效后回调不生效，不跨plugin依赖。
-workspace_sync_binding(clients: Clients) -> WorkspaceSyncBinding
-    行为：创建应用级WorkspaceViews，定义成功/错误观察和生命周期探针共同更新同一owned列表。
+sync_bindings(clients: Clients) -> DtoSyncBindings
+    行为：一次创建共享AgentViews、WorkspaceViews和SyncObservations，再从同一个DtoSyncState衍生全部探针；不能分别以Clients构造互不共享的Agent投影。
+    Agent和Workspace生命周期回调捕获同一state；工具、任务、沙箱及模型回调只持其中对应视图Weak及实例来源标记，所有发送使用同一个Clients。
+task_sync_binding(state: Arc<DtoSyncState>) -> TaskObserverBinder
+    行为：按完整Entity及TaskUpdateContext.same_collection幂等绑定；旧来源先退休，snapshot_source只持集合Weak，observe变更后更新同一版本化任务来源。
+agent_sync_context(state: Arc<DtoSyncState>) -> agent_core::AgentUpdateContext
+    行为：构造AgentUpdateKind回调，Installed绑定Agent/turn和集合；SourcesInstalled安装实际监控，SourcesClosing返回真实结束等待，Removed退休来源。
+resource_sync_bindings(state: Arc<DtoSyncState>) -> ToolObserverBinder
+    行为：通过Tools.observe将完整工具记录提交同一AgentViews；按Entity及Agent.instance核对来源，不从闭包持有World或Tools强引用。
+model_sync_binding(state: Arc<DtoSyncState>) -> inference_core::ModelObserverFactory
+    行为：创建每对象的ModelChanged回调，映射安全公共字段到同一AgentViews，不包含端点和凭据。
+sandbox_sync_binding(state: Arc<DtoSyncState>) -> sandbox_resource_core::SandboxObserverFactory
+    行为：构造列表与选择的通用回调，更新同一AgentViews；来源退休后旧回调失效。
+workspace_sync_binding(state: Arc<DtoSyncState>) -> workspace_core::WorkspaceUpdateContext
+    行为：Installed发布运行字段并订阅数据库确认快照；Changed只改运行字段，Closing取消来源，Removed移除视图；登记类别与运行状态不混为一份字段。
 sync_selectors() -> Arc<[ClientSelector]>
     行为：返回仅含ClientSelector::Type("webui")的固定Arc数组；状态、任务、资源和持久记录与推理出口统一，不从配置或任意wire消息推导投递范围。
 
@@ -53,7 +60,7 @@ crate公开：
 dto_route_system(world: &mut World)
     处理事件：DtoRequest
     接收闭包结果：None
-    产出事件：RegisterClient、StartWorkspace、StopWorkspace、RestartWorkspace、MclCommand
+    产出事件：RegisterClient、CreateWorkspace、DeleteWorkspace、StartWorkspaceAgent、StopAgent、ArchiveAgent、MclCommand
     回复：各请求原oneshot
     行为：逐条受理普通请求，业务更新由所属领域统一入口直接同步，不在此轮询投影。
 
@@ -73,8 +80,8 @@ crate公开：
 ```text
 workspace_file_handler(State(state): State<DtoState>, ConnectInfo(peer): ConnectInfo<SocketAddr>, headers: HeaderMap, uri: OriginalUri, method: Method, path: Result<Path<(String, String)>, PathRejection>) -> Future<Output = Response>
     行为：GET/HEAD只读访问，不需要Agent、turn、MCL或预先注册WebSocket；使用现有ingress策略检查peer、Host和可选Origin，不将缺失Origin当成自动授权。
-        workspace为encodeURIComponent(完整Workspace Address)对应的单个URL段，解码一次后验证kind=workspace；不接受展示名称、定义文件路径、主机绝对路径或其他kind作为别名。
-        通过state.world提交一次原World闭包，按完整Address取得实际Workspace，读取其project_root及生命周期；不存在404、Stopping409，Starting/Running/Error允许读取；不从重载定义的project_root代替仍在运行实例的实际工作目录。
+        workspace为encodeURIComponent(完整Workspace节点路径)对应的单个URL段，解码一次并通过World核对Workspace组件；不接受展示名称、定义文件路径、主机绝对路径或其他kind作为别名。
+        通过state.world提交一次原World闭包，按完整Address取得实际Workspace，读取其project_root及生命周期；不存在404、Deleting409，Running/Error允许读取；不从重载定义的project_root代替仍在运行实例的实际工作目录。
         取得owned根路径后在持有AxumWorkGuard的受监督blocking读取中调用read_workspace_file；只允许工作目录内的普通文件，不产生写入、任务、历史或MCL审计；文件响应由同一Axum普通HTTP生命周期监督，不借出World或数据库。
         成功返回200、准确Content-Type、Content-Length、Cache-Control: no-store、X-Content-Type-Options: nosniff；GET原始字节流，HEAD相同响应头且无正文；不base64包装，不重定向到文件系统路径，不返回目录列表。
         路径/编码不合法400，越界/符号链接或权限拒绝403，Workspace/文件不存在或不是普通文件404，关闭中的Workspace409，服务停止503，其他读取失败500；非Unix目标在尚无安全锚定打开实现时返回501，不降级为不安全路径读取；错误正文为空，不泄露主机路径。
@@ -104,7 +111,7 @@ handle_abort_control(world: &mut World, event: AbortTurnControl)
 projection::address(world: &World, entity: Entity) -> Option<String>
 projection::workspaces(world: &World) -> Vec<WorkspaceInfoDto>
 projection::agents(world: &World) -> Vec<AgentStateDto>
-    行为：从agent_core::AgentTaskBinding只读投影creator={address,task_id}，从实体注册前必需的创建引用读取，不允许缺失，不查任务集合、不持有工具插件私有结构；逐字投影starting/running/error/stopping，不将资源挂载或无turn误报ready；turn通过独立投影发布。
+    行为：读取当前Agent组件的workspace/state/turn及已挂载的Tools、ToolTasks、推理公共信息；状态来自Starting/Running/Closing，不从目录类别或任务returned推断运行状态。turn独立发布，creator取Agent.parent地址和task_id，运行会话取Agent.instance，不依赖旧任务绑定组件；error仅从parent任务的公开错误投影，Agent自身不新增fault字段。
 projection::turn(world: &World, entity: Entity) -> Option<AgentTurnStateDto>
 projection::tasks(world: &World, entity: Entity) -> Option<AgentTaskStateDto>
     行为：仅服务req的非破坏性只读查询，从所属领域共享状态取得完整快照；不创建观察、不推进脚本cursor、不触发sync或IO调查。
@@ -118,16 +125,24 @@ initialize_agent_sources(world: &mut World)
 get_or_create_agent_context(world: &mut World) -> AgentUpdateContext
 install_resource_bindings(world: &mut World, context: AgentUpdateContext)
     行为：复用装配层现存能力，独立DTO测试未安装时从同一Clients构造并插入typed工厂。
-refresh_ui_watch(world: &mut World, entity: Entity) -> Vec<AgentObservationWait>
+refresh_ui_watch(world: &mut World, entity: Entity, ui_path: Option<PathBuf>) -> Vec<AgentObservationWait>
 refresh_record_watch(world: &mut World, entity: Entity) -> Vec<AgentObservationWait>
-    行为：只在实际来源安装回调核对对应实体；同来源无操作，旧来源取消并返回真实完成等待，新来源建立一次owned monitor并持有AxumWorkGuard。
+    行为：只在SourcesInstalled回调绑定实际AgentStorage及显式ui_path；路径和数据库共享身份相同则不重复建立。先订阅真实来源再取初始快照，旧来源失效、取消并返回真实完成等待，新来源持AxumWorkGuard。
+        ui_path来自Driver创建注入方法的可信宿主材料，不从tool_path、Workspace目录或配置内容猜测；持久化来源从实际AgentStorage取得。
+        read、req/res与重复ready不创建监控，SourcesClosing必须等待已返回的完成句柄。
 stop_ui_watch(world: &mut World, entity: Entity) -> Vec<AgentObservationWait>
 stop_record_watch(world: &mut World, entity: Entity) -> Vec<AgentObservationWait>
+refresh_settings_watch(world: &mut World, entity: Entity) -> Vec<AgentObservationWait>
+stop_settings_watch(world: &mut World, entity: Entity) -> Vec<AgentObservationWait>
     行为：移除并失效对应source、请求取消，返回Completion等待；Agent生命周期真实await之后才能宣告资源释放。
 run_ui_watch(context: UiMonitorContext) -> Future<Output = Result<(), DtoAsyncError>>
-    行为：驱动现有Driver文件观察；稳定变化更新版本化UiDelivery并经SyncContext直投StateKey，重复内容/错误不发布；取消仍等待实际文件worker。
+    行为：先挂notify观察再初读实际ui_path，覆盖文件及目录新增、删除和原子替换；Access和无关路径忽略，连续构建变更在安静窗口合并。
+        稳定变化由blocking worker读取完整UI集合，更新版本化UiDelivery并经同一SyncContext直投StateKey，重复revision或相同错误不发布。
+        只监控本次实际UI目录，不复制或回退旧来源；取消后仍等待当前文件worker和monitor真实结束，再完成MonitorCompletion。
 run_record_watch(context: RecordMonitorContext) -> Future<Output = Result<(), DtoAsyncError>>
-    行为：等待实际COMMIT的watch高水位，只对新增sequence执行有界索引查询；encode_batch生成具体有序帧，Clients.send_scoped直接选择当前接收者，追齐后等待，不产出ECS同步事件。
+    行为：先取得record_changes接收端和当前真实高水位作为初始position，不自动重放旧历史；等待实际COMMIT的watch高水位，只对新增sequence执行有界索引查询。
+        通知合并时持续按真实sequence追齐，所有批次保持升序；encode_batch生成有序帧，经同一Clients.send_scoped直接选择当前接收者，追齐后等待，不产出ECS同步事件。
+        取消时停止新读取，等待在途blocking读取结束后完成monitor；来源替换使用独立active标记，旧批次不能投递到新实例。
 read_batch(storage: &AgentStorage, position: RecordWatermarks, high: RecordWatermarks) -> Result<RecordBatch, StorageError>
 encode_batch(address: &str, batch: &RecordBatch) -> Result<Vec<Arc<ClientFrame>>, DtoAsyncError>
     行为：每类最多50条，当前高水位限定排他范围；有request_id的assistant/error由推理通道完成，记录监控跳过其网络投影但照常推进游标；compact历史虽保留request_id但不属于assistant生成去重分支，仍交付generation=null的持久记录；非生成消息full保留真实持久序号、generation=null，MCL和日志过滤内部VM信息，完整编码/预算失败明确重试诊断而不重复旧记录。
@@ -143,11 +158,18 @@ ModelConfigView::refresh_locked(&self) -> Future<Output=Result<String,ProtocolEr
         replace先await inference的完整校验和原子写入能力，成功后refresh_locked，再完成请求；校验/写入失败返回原错误，不伪造成功。
 model_config(world: &World, object: Box<dyn Any+Send>, write:bool)
     行为：按req/update取Prepared，校验真实注册Client，克隆ModelConfigView并在持AxumWorkGuard的普通异步闭包执行read/replace，原oneshot回复；不创建Workspace/Agent/turn或新领域事件。
-install_workspace_monitor(world: &mut World)
-    行为：安装前已有定义和运行状态先发布，绑定同一WorkspaceDefinitions.observe回调；实际配置来源存在时建立一次watch_definitions，归属AxumLifetime。
-watch_definitions(source: PathBuf, definitions: WorkspaceDefinitions, lifetime: AxumLifetime) -> Future<Output = Result<(), String>>
-    行为：notify观察来源父目录及子树，定义仅接受scope/name/tag/workspace.yaml；scope/name/tag目录Create/Remove/Rename也触发，过滤Access/Agent数据库等无关路径；先挂观察再初读，100ms安静窗口合并；同一时间只一个blocking reload，完整校验后由定义入口observe直接发布。
-        错误保留最后有效定义并记录现有错误状态，恢复清故障；取消等待实际reload返回，完整Future释放guard，不发同步事件或唤醒帧。
+install_workspace_monitor(world: &mut World, owner: Entity)
+    行为：仅Workspace Installed时取得实际Workspace.database，调用subscribe_changes，先登记来源再提交其当前确认快照；同数据库共享身份已有观察则不重复安装。
+        克隆watch接收端、只持Weak公共视图的发布闭包及取消能力交给watch_workspace_records，不将World放入异步任务；持AxumWorkGuard直到真实结束。
+watch_workspace_records(context: WorkspaceRecordMonitorContext) -> Future<Output = ()>
+    行为：等待数据库watch变化，将最近确认WorkspaceRecordsSnapshot投影进该Workspace视图；保留同步探针提交的当前运行字段，按相同来源和递增revision提交，拒绝旧版本或已退休来源。
+        同值不发布；版本可合并，内容始终是完整已提交列表。不监听SQLite/WAL文件，不轮询数据库，不因来源完成再次扫描Workspace目录。
+        watch为None、关闭或取消时结束；当前投影worker结束后释放guard并标记MonitorCompletion。
+watch_agent_settings(context: AgentSettingsMonitorContext) -> Future<Output = ()>
+    行为：绑定实际AgentStorage的settings_path，目录不存在时观察可用的父来源并报告读取状态；观察父目录以覆盖原子替换、删除及恢复；先订阅再读取，过滤Access与无关路径，读取在blocking worker执行。
+        配置内容是Driver自定义值，仅通过storage_core既有CONFIG读取入口做通用语法验证和发布；不推断alias、模型、归档或启动规则，不代替Driver热更新执行。
+        当前消息目录没有配置正文sync，本监控只记录来源读状态及去重的tracing诊断，不新增网络消息或持久配置缓存；CONFIG查询读取当前真实来源，不靠监控缓存代替。
+        Agent关闭或来源替换先取消，再等待当前worker和监控实际完成。
 
 ```
 
@@ -169,7 +191,9 @@ prepare_request(state: &DtoState, connection: ConnectionId, message: ClientMessa
         从唯一Clients.claim取得ticket，创建具体领域Result的原oneshot。
         普通请求包装DtoRequest，中止包装AbortTurnControl；注册只携带ConnectionId及自报标签，不复制sender或网络注册表。
         注册成功后Client领域已经原子发布身份；一次性回复不绕回DTO完成事件。
-        Agent生命周期网络入口已删除；Workspace生命周期、MCL及只读Agent请求保留，不为Agent创建构造定义快照。
+        workspace.create/delete按原reply转交CreateWorkspace/DeleteWorkspace；agent.start按Existing/New构造StartWorkspaceAgent<ToolExecuteResponse, ToolError>并原样转交reply，agent.stop/archive对应StopAgent/ArchiveAgent。
+        不再接收workspace.start/stop/restart/update/rename；agent.start只发起Driver工具调用，不在网络层准备Agent持久化组件或创建实体。
+        客户端断开仅结束网络等待，已受理业务由所属监督收口，不能丢弃已打开连接或待绑定实体。
         UI查询沿原oneshot返回观察状态；base64和wire编码保持在网络边界。
 
 request<T, R, E>(ticket: Arc<RequestTicket>, route: &str, input: T, response: &str, project: impl FnOnce(R) -> Result<Value, ProtocolErrorDto> + Send + 'static) -> (DtoRequest, ReplyFuture)
@@ -180,12 +204,11 @@ query<T, R>(world: &World, object: Box<dyn Any + Send>, read: impl FnOnce(&World
     行为：校验真实Client及目标后只读并完成原reply。
 records(world: &World, route: &str, object: Box<dyn Any + Send>)
     行为：克隆实际AgentStorage，由worker调用对应分页core函数，通过原reply返回，不建立监控。
-workspace_modify(world:&World,object:Box<dyn Any+Send>)
-    行为：认领Prepared<WorkspaceModification,(),WorkspaceError>，校验Client并持AxumLifetime guard；原异步执行器运行blocking definitions.modify并等待真实完成，通过原oneshot回复，不发完成或同步中转事件。
-    行为：CRUD值形状在协议边界校验，具体路径/完整定义/活动状态/目录变更和发布由WorkspaceDefinitions承担；无公开reload路由。
+workspace_modify(world: &mut World, object: Box<dyn Any + Send>)
+    行为：对CreateWorkspaceDto和DeleteWorkspaceDto分别校验真实Client及输入，转交原oneshot领域事件；不在DTO执行文件修改，不投递额外完成事件。
 
 query_agent_ui(world: &World, object: Box<dyn Any + Send>)
-    行为：核对当前Agent及实际AgentResources.parameters.ui_path来源，读取该来源已有观察状态；未就绪返回AgentUiNotReady，不创建监控。
+    行为：按实际Agent实体读取SourcesInstalled绑定的UI来源已有观察状态；未就绪返回AgentUiNotReady，不依赖旧AgentResources组件，不创建监控。
 
 project_agent_ui(value: Option<Arc<DriverUiBundle>>) -> Result<Option<AgentUiBundleDto>, ProtocolErrorDto>
     行为：保持原字节、排序相对路径、媒体类型、entry及内容revision，data使用标准base64。
@@ -218,10 +241,20 @@ clean_internal(value: &mut Value)
 
 公开：
 ```text
-WorkspaceSyncBinding
-    updates: WorkspaceUpdateContext
-    views: Arc<WorkspaceViews>
-    impl Resource + Clone
+TaskObserverBinder = Arc<dyn Fn(Entity, String, &tool_core::ToolTasks) + Send + Sync>
+ToolObserverBinder = Arc<dyn Fn(Entity, String, &mut tool_resource_core::Tools) + Send + Sync>
+DtoSyncBindings：装配方取得的通用绑定包
+    agent: agent_core::AgentUpdateContext
+    workspace: workspace_core::WorkspaceUpdateContext
+    tasks: TaskObserverBinder
+    tools: ToolObserverBinder
+    models: inference_core::ModelObserverFactory
+    sandboxes: sandbox_resource_core::SandboxObserverFactory
+DtoSyncState：DTO内部共享状态
+    clients: Clients
+    agents: Arc<AgentViews>
+    workspaces: Arc<WorkspaceViews>
+    observations: Arc<Mutex<SyncObservations>>
 ```
 
 私有：
@@ -267,10 +300,12 @@ IntoEvent
     type Event: core_plugin::Event
     into_event(self, world: &World) -> Result<Self::Event, ()>
 RegisterClientDto(Prepared<RegisterConnectionDto, RegisteredClient, ClientError>)
-    行为：start/restart通过definitions.path_for(address)取得受控定义路径；stop用同一地址定位路径和运行Entity，不接收客户机任意路径。
-StartWorkspaceDto(Prepared<WorkspaceTargetDto, WorkspaceOperationOutput, WorkspaceError>)
-StopWorkspaceDto(Prepared<WorkspaceTargetDto, WorkspaceOperationOutput, WorkspaceError>)
-RestartWorkspaceDto(Prepared<WorkspaceTargetDto, WorkspaceOperationOutput, WorkspaceError>)
+CreateWorkspaceDto(Prepared<WorkspaceCreateDto, Entity, WorkspaceError>)
+DeleteWorkspaceDto(Prepared<WorkspaceTargetDto, (), WorkspaceError>)
+AgentStartDto(Prepared<AgentStartInputDto, tool_core::ToolExecuteResponse, tool_core::ToolError>)
+    行为：Existing和New都经workspace领域；New的node_name/alias在arguments内，不重复追加顶层字段。
+AgentStopDto(Prepared<AgentTargetDto, (), agent_core::AgentError>)
+AgentArchiveDto(Prepared<AgentArchiveInputDto, (), workspace_core::WorkspaceError>)
 MclCommandDto(Prepared<MclExecuteDto, MclValue, MclError>)
     impl TryFrom<Box<dyn Any + Send>> + IntoEvent
 BoundaryError
@@ -279,7 +314,41 @@ BoundaryError
 SyncObservations：Resource
     records: BTreeMap<Entity, RecordWatchSlot>
     ui: BTreeMap<Entity, UiWatchSlot>
+    workspaces: BTreeMap<Entity, WorkspaceRecordWatchSlot>
+    settings: BTreeMap<Entity, AgentSettingsWatchSlot>
+    tasks: BTreeMap<Entity, TaskWatchSlot>
     行为：只持监控归属和查询能力，不保存每连接全量投影或每帧发送位置。
+TaskWatchSlot
+    collection: tool_core::TaskUpdateContext--same_collection比较实际集合身份
+    source: SyncContext<tool_core::AgentTaskSnapshot>
+    active: Arc<AtomicBool>
+    impl Drop：失效active并退休source；快照读取只持集合Weak，不等待任何轮询任务。
+WorkspaceRecordWatchSlot
+    database_path: PathBuf
+    completion: Arc<MonitorCompletion>
+    cancel: CancellationToken
+    active: Arc<AtomicBool>
+    impl Drop：先active=false再取消，实际结束仍由completion确认。
+WorkspaceRecordMonitorContext
+    changes: watch::Receiver<Option<workspace_core::WorkspaceRecordsSnapshot>>
+    publish: Arc<dyn Fn(workspace_core::WorkspaceRecordsSnapshot) + Send + Sync>--只捕获视图Weak及当前来源标记
+    completion: MonitorCompletionGuard
+    cancel: CancellationToken
+    guard: AxumWorkGuard
+AgentSettingsWatchSlot
+    path: PathBuf
+    state: Arc<Mutex<SettingsReadState>>
+    completion: Arc<MonitorCompletion>
+    cancel: CancellationToken
+SettingsReadState
+    Initializing | Available | Failed(String)
+AgentSettingsMonitorContext
+    state: Arc<Mutex<SettingsReadState>>
+    storage: storage_core::AgentStorage
+    path: PathBuf
+    completion: MonitorCompletionGuard
+    cancel: CancellationToken
+    guard: AxumWorkGuard
 UiWatchSlot
     completion: Arc<MonitorCompletion>
     ui_path: PathBuf
@@ -336,15 +405,16 @@ WorkspaceViews
     view: View<Vec<WorkspaceInfoDto>>
     sync: SyncContext<Vec<WorkspaceInfoDto>>
 Catalog
-    definitions: BTreeMap<PathBuf, WorkspaceDefinition>
-    running: BTreeMap<PathBuf, LiveWorkspace>
-    definition_error: Option<String>
-LiveWorkspace
-    definition: Option<WorkspaceDefinition>
-    status: String
-    address: Option<String>
-    error: Option<ProtocolErrorDto>
-    行为：定义读取和运行投影的最终列表/版本提交受同一catalog锁串行，避免旧owned结果晚提交回滚状态。
+    workspaces: BTreeMap<Entity, WorkspaceViewEntry>
+WorkspaceViewEntry
+    address: String
+    alias: String
+    project_root: PathBuf
+    state: workspace_core::WorkspaceState
+    records: Vec<workspace_core::WorkspaceAgent>
+    database_revision: u64
+    source_active: Arc<AtomicBool>
+    行为：组件探针与数据库监控在同一视图锁下只修改自己负责的字段，运行状态不落数据库；来源替换先失效旧标记，旧owned快照不能覆盖新状态。
 MonitorCompletion
     done: AtomicBool
     changed: Notify
@@ -360,7 +430,7 @@ DtoInitialized
 compose
 ├── 唯一Clients Arc槽位
 ├── DTO具体编码函数及typed probe工厂
-│   ├── Workspace定义磁盘监控及运行信息统一入口
+│   ├── Workspace组件探针及数据库确认提交监控
 │   ├── Agent/Turn/Tools/Sandbox/Model公共信息统一入口
 │   ├── Task创建、输出、Return、错误、移除统一入口
 │   ├── 创建时传入的UI目录磁盘监控

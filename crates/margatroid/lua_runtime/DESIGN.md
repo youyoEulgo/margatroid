@@ -42,7 +42,7 @@ LuaRuntimePlugin：VM执行插件
     config: LuaRuntimeConfig
     impl Plugin for LuaRuntimePlugin
         build(self, app: &mut App)
-            行为：检查运行设施及预算，拒绝重复安装；依次安装stop_driver_lua_vm_system、start_driver_lua_vm_system、driver_lua_vm_exit_system。
+            行为：检查运行设施及预算，拒绝重复安装，初始化plugin私有VmThreads资源；依次安装stop_driver_lua_vm_system、start_driver_lua_vm_system、driver_lua_vm_exit_system。
 ```
 
 # components
@@ -113,7 +113,7 @@ start_driver_lua_vm_system(world: &mut World)
 driver_lua_vm_exit_system(world: &mut World)
     处理事件：DriverLuaVmExited
     接收闭包结果：None
-    提交闭包：None
+    提交闭包：stop_vm(StopContext) -> Future<Output = Result<StopOutput, StopError>>--仅自然退出且无人收口时
     产出事件：None
     oneshot回复：None
     行为：DriverLuaVmExited -> handle_driver_lua_vm_exited。
@@ -128,25 +128,27 @@ crate公开：
 handle_start_driver_lua_vm(world: &mut World, request: StartDriverLuaVm)
     行为：
         认领reply，检查owner、workspace及预算，拒绝已有VM
-        owner为实际执行实体，WorkspaceExecutor仍是执行线程入口；AgentStorage仅为可选日志能力，不要求已有Agent。
-        安装新实例和通知组件，复用ToolTaskHandle创建LuaExecutionTask；配置有TaskSyncBinding时为Workspace内部任务派生execution_only，不投Agent专属网络同步。
-        从workspace_core取得提交入口，提交run_driver工厂及start_vm闭包
+        owner为调用方分配的Lua执行宿主实体，不能默认视为Agent或Workspace；此嵌入VM入口不参与新的Driver工具启动链，Driver工具在其runner进程内运行。
+        运行线程归本次VM，不由Workspace组件持有；日志使用注入回调，不在core引用AgentStorage。
+        安装新实例和VM通知组件，由lua_runtime_plugin的VmThread::spawn创建受监督线程及其当前线程Tokio Runtime/LocalSet，运行本次run_driver；将共享线程控制存入VmThreads，再提交start_vm启动等待。
+        task、workspace、日志、Agent创建等能力均来自LuaServices及宿主回调；本plugin不依赖workspace_core的专属执行线程，不重复创建工具任务。
         提交失败撤销本次安装并回复错误，不修改启动事件字段
 
 handle_start_result(world: &mut World, result: Result<StartOutput, StartError>)
     行为：核对实例，通过原reply回复；失败且无退出证明时保留组件。
 
 handle_stop_driver_lua_vm(world: &mut World, request: StopDriverLuaVm)
-    行为：认领reply，核对实例并取走原ended；请求cancel、关闭wake并提交stop_vm；重复等待返回StopAlreadyWaiting。
+    行为：认领reply，核对实例并取走原ended；从VmThreads克隆本实例的线程控制，请求cancel、关闭wake并提交stop_vm；重复等待返回StopAlreadyWaiting。
 
 handle_stop_result(world: &mut World, result: Result<StopOutput, StopError>)
-    行为：核对实例；成功移除本次VM组件；通过原reply回复；失败保留控制能力；不销毁owner或Workspace。
+    行为：核对实例；成功移除本次VM组件及VmThreads条目；通过原reply回复；失败保留控制能力；不销毁owner或Workspace。
 
 handle_driver_lua_vm_exited(world: &mut World, event: DriverLuaVmExited)
     行为：
         核对实例并报告已完成原始诊断记录的简洁执行错误
         不重复记录入口已捕获的同一Lua异常
-        不修改Agent状态，不消费ended，不替代启停回复
+        不修改Agent状态；若尚无停止等待者，取出ended并克隆线程控制，直接提交stop_vm自动收口，内部reply=None，不生成公共停止完成事件。
+        已有停止等待者时只记录实际退出，不重复取ended；自动收口结果仍由stop_driver_lua_vm_system接收处理。
 ```
 
 私有：
@@ -155,16 +157,16 @@ start_vm(context: StartContext) -> Future<Output = Result<StartOutput, StartErro
     行为：等待ready；失败或超时请求cancel，发送StopDriverLuaVm并等待oneshot，返回错误及退出事实。
 
 stop_vm(context: StopContext) -> Future<Output = Result<StopOutput, StopError>>
-    行为：等待原ended；VM退出且Lua释放后返回成功，通道丢失返回EndNotificationLost。
+    行为：等待原ended后调用thread.wait_finished()；Lua、process registry及线程真实退出才返回成功。ended丢失时仍join线程再报告EndNotificationLost，不丢弃线程控制。
 
 run_driver(context: RunContext) -> LocalFuture
-    行为：沿原Workspace线程和监督运行execute_lua，捕获诊断；有AgentStorage时按原append_agent_log落库，无目标存储时通过运行日志记录。
-        执行完成后等待process registry真实cleanup，再经LuaServices.execution_finished关闭实际任务scope并等待创建的全部Agent实际移除，成功后经World complete_cleanup移除任务。Agent停止仍由公共服务提交原StopAgent完成，不在Lua运行器复制清理流程。
+    行为：沿本次VM线程运行execute_lua，捕获诊断；日志只用宿主注入回调，有实际Agent则沿存储提交，无Agent则tracing，不创建独立日志库。
+        执行完成后等待process registry真实cleanup，再经LuaServices.execution_finished关闭实际任务scope并等待创建的全部Agent实际移除，成功后经World complete_cleanup移除任务。Agent清理由公共服务登记的关闭句柄监督完成，不发送StopAgent关闭自身所属任务；独立VM不拥有Agent领域清理逻辑。
         进程真实清理后通过LuaServices.execution_finished交付本次执行诊断，等待在途创建交接、绑定Agent真实停止及日志提交，再完成ended及DriverLuaVmExited；服务清理失败设置cleanup_result/ended错误且不确认task清理完成；尚未交接启动则短任务正常结束确认成功、失败确认原错误。
 execute_lua(context, environment, logger, processes) -> Future<Output = Result<(), LuaRuntimeError>>
     行为：调用共享create_environment，安装取消hook后复用configuration_globals/load_program；configure返回ToolConfiguration，纯阶段能力未启用。
         enable_execution加载同一标准库并恢复保存全局，Margatroid.enable安装相同公共方法；读取execute并异步调用，配置超时同时约束CPU及等待。
-        source身份为执行Entity/实例，目标由方法显式指定；context包含workspace/name/resource_dir/task_id/task_address，不预造agent_info。
+        source为实际执行Entity/执行instance，目标由方法显式指定；context含workspace/resource_dir/task_id/task_address和独立arguments副本，不预造Agent，不从Lua副本判定Driver身份。
         公共服务回调通过LuaServices，文件/data/text/process沿既有共享安装器；全程不按HostKind裁剪API。
 
 ```
@@ -176,14 +178,31 @@ execute_lua(context, environment, logger, processes) -> Future<Output = Result<(
 私有：
 ```text
 StartContext：启动等待上下文--instance、ready接收端、cancel、RuntimeEventSender、原reply
-StopContext：停止等待上下文--instance、ended接收端、原reply
+StopContext：停止等待上下文--instance、ended接收端、thread: VmThread、可选原reply；内部自动收口不带业务reply
 DriverLogger：私有诊断上下文--可选storage、LuaServices、真实LuaExecutionIdentity、World发送能力、origin及待捕获诊断
-    append：已有storage沿原blocking提交；无storage的主动log通过execution_log提交已绑定Agent；无Agent或未处理故障通过RunContext.runtime_logs提交完整应用报告，不能只打印控制台；故障另由execution_finished逐绑定完成Agent报告。
-RunContext：执行上下文--instance、program、environment、wake、ready发送端存储、ended发送端、cancel、RuntimeEventSender、可选AgentStorage、workspace、LuaServices及宿主固定关联
+    append：已有存储沿blocking提交，无Agent或来源已关闭时沿既有tracing输出，不维护runtime_logs持久库；故障通过execution_finished完成对应任务诊断。
+VmThreads：lua_runtime_plugin私有Resource
+    entries: BTreeMap<String, VmThread>--按start_id定位，取用时复核完整owner Entity
+VmJoinState：Clone
+    Idle | Joining | Joined(Result<(), LuaRuntimeError>)
+VmThread：lua_runtime_plugin私有共享线程监督
+    join: Arc<Mutex<Option<std::thread::JoinHandle<()>>>>
+    joined: Arc<watch::Sender<VmJoinState>>
+    runtime: AsyncRuntimeHandle
+    cancel: CancellationToken
+    done: watch::Receiver<Option<Result<(), LuaRuntimeError>>>
+    spawn(context: RunContext, runtime: AsyncRuntimeHandle) -> Result<Self, LuaRuntimeError>
+        行为：std::thread::Builder创建一次执行线程，线程内构造当前线程Runtime和LocalSet运行run_driver，所有退出路径发送done；线程创建失败返回错误。
+    wait_finished(&self) -> Future<Output = Result<(), LuaRuntimeError>>
+        行为：先等待done，再在共享joined状态中裁决唯一受监督blocking join；其他等待者等同一Joined结果，不能因join句柄已取走而提前成功。
+        取消等待者不取消独立join监督，线程真实完成后才允许移除VM组件，不在World线程join。
+    impl Clone
+        行为：只共享同一线程控制和完成状态，不启动新线程。
+RunContext：执行上下文--instance、program、environment、wake、ready发送端存储、ended发送端、cancel、RuntimeEventSender、workspace、LuaServices及宿主注入的日志/任务回调
 StartOutput：启动成功载荷--instance、原reply
 StartError：启动失败载荷--instance、原reply、LuaRuntimeError、cleanup_completed
-StopOutput：停止成功载荷--instance、原reply
-StopError：停止失败载荷--instance、原reply、LuaRuntimeError
+StopOutput：停止成功载荷--instance、可选原reply
+StopError：停止失败载荷--instance、可选原reply、LuaRuntimeError；线程控制仍留在VmThreads中
 ```
 
 # types pub
@@ -214,8 +233,8 @@ LuaAgentMonitor：Component（不持VM所有权）
     unlink: Option<Box<dyn FnOnce() + Send + Sync>>
     new(unlink) -> Self
     impl Drop：取出并调用精确解绑动作，Agent旧会话不再接收执行故障；不等待、不取消源VM。
-AgentWaitSlot(Arc<Mutex<DriverWakeSlot>>)：Component + Default + Debug，不可Clone
-    impl Drop：关闭槽位，即使等待者还持Arc也能结束等待。
+Agent等待能力：由LuaServices转交agent_core::Agent.wake，不在lua_runtime_core重复定义Agent槽位组件
+    关闭通知来自Agent关闭句柄，不由Lua对象Drop代替。
     行为：wait(agent)登记一次唤醒，wake取出发送；取消/关闭解除并结束等待，保留未消费唤醒避免注册竞态。
 
 DriverLuaVmInstance：VM实例
@@ -332,10 +351,11 @@ margatroid.mcl:execute(target: String, instruction: String, arguments: Option<Ve
         成功始终返回结果对象，Unit返回空JSON对象{}，在Lua中保留object标记；MCL执行失败返回Error对象，可由Lua检查后继续。
 margatroid.agent:stop(target: String) -> Future<Value>
     行为：同工具bin公共注入服务，不走MCL，提交原StopAgent并外部监督，不拥有或终止创建者VM。
-margatroid.agent:create({name: String, config_path: String, ui_path: String}) -> Future<Value>
-    行为：无需既有MCL队列，公共服务发送StartAgent并等待资源安装返回，Agent归属与Lua执行生命周期独立；config_path只初始化持久配置，ui_path只保存引用并直接监控，均不从执行程序路径推导。
+margatroid.agent:create({node_name: Option<String>, alias: Option<String>, project_root: String, config_path: String, ui_path: String}) -> Future<Value>
+    行为：Lua绑定只把参数交给LuaServices，真实实现由tool_plugin注入；执行上下文固定Driver实际路径、原arguments、Workspace、parent与task_id。
+        公共服务按Tool设计检查节点归属、准备文件、连接存储、登记记录，再发送携带已连接句柄的StartAgent等待原reply；创建的Agent绑定真实创建任务，Lua Future取消不丢失创建监督。
 margatroid:wait(agent_address: String) -> Future<()>
-    行为：公共服务在目标AgentWaitSlot上登记一次等待，复用DriverWakeSlot防丢失唤醒及取消guard；初次等待交接自动执行启动，Agent.ready不拥有VM。
+    行为：公共服务取得目标Agent.wake并调用agent_core::AgentWakeSlot::wait，唤醒和取消只操作相同等待代号；初次等待交接自动执行启动，Agent.ready不拥有VM。
 HostNamespace::callback(name: &str) -> Result<Function, LuaError>
     行为：
         根据命名空间和固定执行身份查找冻结的回调，具体共享方法签名见Tool设计
@@ -370,7 +390,7 @@ margatroid.agent:data_dir(address: String) -> Future<Output = String>
     行为：必须提供实际Agent完整Address，通过公共agent_data_dir服务按确切执行身份和同Workspace边界查询AgentStorage::data_dir；不创建目录，不读取配置正文，不公开临时目录。
 margatroid.context.workspace
     address: String
-    name: String
+    alias: String
     project_root: PathBuf
     行为：运行环境注入所属Workspace固定身份；不注入会过期的成员快照，不暴露Entity或VM实例。
 工具task.read_output/send/finish
@@ -389,9 +409,9 @@ margatroid.context.workspace
 LuaRuntimeError：VM错误
     kind: LuaRuntimeErrorKind
     description: String
-    impl Display + std::error::Error
+    impl Clone + Display + std::error::Error
 
-LuaRuntimeErrorKind：错误类别，公开枚举
+LuaRuntimeErrorKind：错误类别，公开枚举，Clone
     InvalidRequest | InstanceNotFound | InstanceMismatch | AlreadyReady
     SourceTooLarge | EnvironmentFailed | CompileFailed | ExecutionFailed
     StartupTimeout | Cancelled | CleanupFailed | StopAlreadyWaiting
@@ -402,25 +422,16 @@ LuaRuntimeErrorKind：错误类别，公开枚举
 # 持有关系
 
 ```text
-Agent Entity
-├── Agent（agent_core）
-└── DriverLuaVm（lua_runtime_core）
-    ├── instance
-    ├── wake及ready
-    ├── ended接收端
-    └── cancel
+工具Driver调用
+└── ToolTask监督 → runner子进程内Lua VM
+    ├── 冻结的真实执行上下文与arguments副本
+    ├── 公共LuaServices → tool_plugin注入的宿主实现
+    └── 创建的Agent → 任务的异步子关闭能力
 
-Workspace专属线程
-└── run_driver
-    ├── Lua与LocalFuture
-    ├── Margatroid共享宿主对象
-    │   ├── 公共能力、日志与只读context
-    │   ├── mcl/agent/workspace/wait -> LuaServices
-    │   └── tools/task -> 实际LuaExecutionTask与原工具任务能力
-    ├── AgentStorage克隆句柄 -> agent_logs
-    ├── LuaServices（复用原MCL/Agent事件与oneshot）
-    ├── AgentWaitSlot（一次等待，不拥有VM）
-    └── ended发送端
+独立嵌入VM调用
+└── Lua执行宿主Entity → DriverLuaVm
+    ├── 实例、通知及取消能力
+    └── VmThread → run_driver及当前线程Runtime/LocalSet
 
 mecs全局异步设施
 ├── start_vm

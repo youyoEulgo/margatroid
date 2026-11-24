@@ -40,6 +40,12 @@ ModelRoutes：安全模型投影和model_set使用的最近校验快照，公开
     replace(&mut self, routes: BTreeMap<String, ModelRoute>, configs: &[AgentInferenceConfig])
         行为：内部路由替换的唯一入口，替换调用方已校验的路由集合后，对传入受影响配置调用publish_current提交安全模型投影；不增加网络reload接口，不把端点或密钥交给回调。
     impl Resource for ModelRoutes
+ModelChanged = Arc<dyn Fn(Option<PublicModelInfo>) + Send + Sync>
+ModelObserverFactory：core定义的通用观察构造能力
+    bind: Arc<dyn Fn(Entity) -> ModelChanged + Send + Sync>
+    for_owner(&self, owner: Entity) -> ModelChanged
+        行为：只调用注入构造函数；不引用客户端，不持World。
+    impl Resource + Clone
 ModelConfigFuture<T> = Pin<Box<dyn Future<Output=Result<T,InferenceError>> + Send>>
 ModelConfigFile：公开Resource，Clone；不缓存文件内容
     path: PathBuf
@@ -81,17 +87,19 @@ InferencePlugin：单次推理执行插件
 -- 公开
 AgentInferenceConfig
     data: AgentInferenceData--只读Deref，不提供DerefMut
-    updates: UpdateProbe<Option<PublicModelInfo>>
-    new(parameters: InferenceParameters, updates: UpdateProbe<Option<PublicModelInfo>>) -> Self
+    updates: Arc<dyn Fn(Option<PublicModelInfo>) + Send + Sync>--通用值回调，不含客户端或其他core类型
+    new(parameters: InferenceParameters, updates: impl Fn(Option<PublicModelInfo>) + Send + Sync + 'static) -> Self
     set(&mut self, parameters: InferenceParameters, routes: &ModelRoutes)
         行为：更新同一配置并publish_current，发送端公共视图去重未变化内容。
     publish_current(&self, routes: &ModelRoutes)
-        行为：从实际模型键选择安全路由字段，缺失为None；通过必需typed probe提交Agent公共视图。
+        行为：从实际模型键选择安全路由字段，缺失为None；通过必需通用回调提交安全公共值，网络绑定在plugin内完成。
 AgentInferenceData
     parameters: InferenceParameters
 
 ActiveInference：该Agent的当前推理句柄，公开组件
     current: Option<InferenceHandle>--初始化为None，不放入ToolTasks
+    default() -> Self
+        行为：同步创建current=None，不创建HTTP任务。
     impl Component for ActiveInference
 ```
 
@@ -141,7 +149,7 @@ inference_system(world: &mut World)
     行为：
         所在schedule严格晚于中止System所在schedule；
         InferenceRequest -> handle_inference；
-        闭包启动结果只收口启动交接，InferenceCleanupFinished核对Agent来源租约及真实完成后才唤醒AgentWaitSlot。
+        闭包启动结果只收口启动交接，InferenceCleanupFinished核对Agent来源租约及真实完成后才唤醒Agent.wake。
 ```
 
 # handler
@@ -167,7 +175,7 @@ handle_init_inference(world: &mut World, request: InitInference)
 
 handle_inference(world: &mut World, request: InferenceRequest)
     行为：
-        认领reply，检查完整Agent Entity、当前AgentSession/来源租约、请求取消能力及所需运行组件；Error/Stopping拒绝普通请求。
+        认领reply，检查完整Agent Entity、当前Agent.instance及本次生成来源租约、请求取消能力及所需运行组件；Closing拒绝普通请求。
         turn=None时为自由调用：Starting/Running可受理，不要求Agent已有turn，当前恰有turn也不隐式绑定。
         turn=Some(id)时要求非空、Agent为Running且当前有效turn与id一致；失效或不匹配沿原中止响应收口，不创建HTTP或监督任务。
         两种调用均执行ActiveInference检查，保留同Agent单个活跃推理限制，不用无turn绕过推理互斥。
@@ -175,7 +183,7 @@ handle_inference(world: &mut World, request: InferenceRequest)
         直接遍历当前Agent的Tools，以每条记录的alias、description及input_schema构造本次工具定义。
         将本次owned工具定义快照与请求交付监督闭包，文件型来源的HTTP请求在重新读文件后才构造。
         无文件服务的显式内存测试仍在受理时prepare_domain/build_request并交付已有http_request；后续工具调用始终按当前Tools查找并校验参数。
-        从World的唯一Clients资源克隆同一共享槽位及当前Agent来源有效租约，固定Agent/AgentSession、显式可选turn及generation身份；每次发送重新筛选当前webui接收者，不固定起始发送器快照；
+        从World唯一Clients克隆共享槽位；使用本次InferenceHandle持有的source_alive租约，固定完整Agent Entity/Agent.instance、显式可选turn及generation身份；每次发送重新筛选当前webui接收者，不固定起始发送器快照；
         同步登记尚未启动的共享InferenceHandle，防止异步提交窗口受理重叠请求；
         通过send_async_closure提交launch_inference。
         launch_inference在闭包内部创建监督任务并把JoinHandle交给同一共享句柄，不依赖全局执行器。ClientFrame::Text只携带已编码分片，不导入Axum消息、DTO插件或服务器框架发送器。
@@ -205,7 +213,7 @@ supervise_inference(context: InferenceContext) -> Future<Output = ()>
         用户中止且清理成功返回冻结内容的Completed结果；
         清理预算耗尽及时返回CleanupFailed并发送完整error同步，原监督继续真实清理；若先前已交付终态则只记录CleanupFailed诊断并继续真实清理，不再次回复oneshot或发送第二条full。
         全部真实清理结束发送绑定Agent、实际来源有效租约和request_id的私有完成事件；
-        确认监督任务已结束后才唤醒目标AgentWaitSlot，未结束则下一帧复查，过期事件丢弃，不自动finish_turn。
+        通过原共享InferenceHandle的真实退出完成观察唤醒目标Agent.wake；完整Entity及Agent.instance仍匹配且非Closing时才唤醒。退出观察未完成则由异步等待者继续等待后提交一次World闭包，不逐帧复查，不自动finish_turn。
         不写历史、不执行工具、不重试推理。
 
 read_provider(client:reqwest::Client,request:ProviderHttpRequest,cancel:CancellationToken,sender:mpsc::Sender<ProviderFragment>) -> Future<Output = Result<(), InferenceError>>
@@ -263,15 +271,6 @@ build_request(input: DomainRequest, route: ModelRoute) -> Result<ProviderHttpReq
 ```text
 -- 私有
 InferenceContext：请求执行材料--原请求及reply、可选http_request、model_config: Option<ModelConfigFile>、tools: Vec<InferenceToolDefinition>、deadline、HTTP客户端、取消能力和推流投影；原样保留Option<String>回合，不将None改成当前turn
-ModelSyncBinding = ProbeFactory<Option<PublicModelInfo>>
-PublicModelInfo
-    id: String
-    model: String
-    provider: String
-    api_type: String
-    context_window_tokens: u64
-    thinking: Option<String>
-    reasoning_effort: Option<String>
 
 StreamDelivery：前端出口，私有类型
     id: String--生成关联，wire中为generation，不是前端请求id
@@ -279,7 +278,7 @@ StreamDelivery：前端出口，私有类型
     instance: String
     turn: Option<String>
     clients: Clients
-    source_alive: Arc<AtomicBool>--实际Agent来源租约；正常生成结束不关闭它，停止/替换后writer丢弃旧来源帧
+    source_alive: Arc<AtomicBool>--本次InferenceHandle持有的来源租约，不来自Agent字段；停止Agent、取消本生成或回合中止时关闭，正常生成结束不抹掉已入队full
 InferenceLaunchOutput：已将监督任务交给共享句柄的启动事实
 InferenceLaunchError：InferenceError及原回复、共享句柄关联，实现From<AsyncTaskError>
 
@@ -358,12 +357,22 @@ ProviderHttpRequest：HTTP请求--method、url、headers、body及格式响应�
 ## 类型
 
 ```text
+PublicModelInfo
+    id: String
+    model: String
+    provider: String
+    api_type: String
+    context_window_tokens: u64
+    thinking: Option<String>
+    reasoning_effort: Option<String>
+
 -- 公开
 InferenceHandle：本次推理句柄，公开类型
     request_id: String
     turn: Option<String>
     cancel: CancellationToken
     stop_stream: Arc<dyn Fn() + Send + Sync>--本次StreamGate关闭函数，由inference_plugin构造
+    source_alive: Arc<AtomicBool>--本次生成租约，构造为true，正常完成不提前失效已入队full
     task: Arc<InferenceTaskState>--共享启动状态、Mutex<Option<JoinHandle<()>>>及完成通知
     attach_task(&self, task: JoinHandle<()>) -> Result<(), InferenceError>
         行为：
@@ -372,12 +381,14 @@ InferenceHandle：本次推理句柄，公开类型
     is_finished(&self) -> bool
         行为：
             区分未启动、运行中、启动失败和真实join完成，不以slot为None推断完成。
+    source_lease(&self) -> Arc<AtomicBool>
+        行为：返回同一生成的租约，plugin的stream及writer共享；取消入口先失效它再请求任务取消。
     wait_finished(&self) -> Future<Output = Result<(), InferenceError>>
         行为：
             Agent退出流程等待真实监督任务结束或明确启动失败，不跨await持锁，不通过取走句柄使其他读者误判完成。
     cancel(&self)
         行为：
-            同步调用stop_stream冻结接受门，再触发cancel，不直接abort监督任务。
+            先将source_alive置false，再同步调用stop_stream冻结接受门并触发cancel，不直接abort监督任务。
             回合中止仅对handle.turn==Some(被中止turn)调用；自由推理不受其他回合的start/finish/abort影响。Agent关闭及调用者取消仍取消并等待真实收口。
 
 InferenceParameters：单次模型参数

@@ -73,6 +73,8 @@ MclQueue：目标Entity的命令队列，公开组件
     accepting: bool
     drain: MclDrain
     cancel: CancellationToken
+    default() -> Self
+        行为：同步创建空命令和active集合、未关闭cancel及接受门，不要求Driver VM或文件资源。
     impl Component for MclQueue
 ```
 
@@ -118,7 +120,7 @@ mcl_command_system(world: &mut World)
 -- crate公开
 handle_command(world: &mut World, request: MclCommand)
     行为：
-        核对来源和目标完整Entity、实际Lua执行实例、入队门及重复id；目标统一仅Starting/Running可接受，Error/Stopping拒绝，不按具体指令增加状态或turn受理条件。
+        核对来源和目标完整Entity、实际Lua执行实例、入队门及重复id；目标统一仅Starting/Running可接受，Closing拒绝，不按具体指令增加状态或turn受理条件。
         入目标FIFO；
         拒绝通过reply返回错误。
 
@@ -153,14 +155,14 @@ read_expression(context: &CommandContext, expression: MessageExpression) -> Futu
 
 prepare_sources(context: &CommandContext, expression: MessageExpression) -> Future<Output = Result<Vec<storage_core::MessageSource>, MclError>>
     行为：
-        Selector转换为存储选择器，携带目标AgentSession；
+        Selector转换为存储选择器，携带目标Agent.instance；instance每次实体创建唯一，不再依赖AgentSession组件；
         PromptAlias按已导入路径在blocking worker读取，按资源角色构造Literal来源；
         保留来源书写顺序，不在此改写目标Block。
 
 execute_operation(context: &CommandContext) -> Future<Output = Result<MclValue, MclError>>
     行为：
         执行前检查命令及执行取消标记，按MclOperation分派；
-        Create转换CreateBlock，TEMP绑定目标AgentSession；Get调用read_expression并返回Array.Message；
+        Create转换CreateBlock，TEMP绑定目标Agent.instance；Get调用read_expression并返回Array.Message；
         Inject将手工数组、空数组或表达式转换为消息来源，交存储ReplaceMessages完成替换，等待结果返回Unit；
         Config转换ReadConfig、SetConfig或DeleteConfig，仅访问当前Agent设置，读取返回Config，修改确认后返回Unit；
         Import及Effect分别调用execute_import和execute_effect，不在本函数回复原请求或写命令审计。
@@ -174,7 +176,7 @@ execute_effect(context: &CommandContext, name: &str, arguments: Vec<EffectParame
         同步存储能力在blocking worker执行并等待真实join；不在此函数发送原请求reply或写入统一命令审计；
         ready转交Agent core的agent_ready；start_turn调用agent_start_turn并返回MclValue::Turn(String)，其值是实际当前turn；finish_turn同样调用Agent领域方法，不在MCL重复判断状态或turn策略。
         不提供agent_stop effect，关闭由Lua agent.stop注入或StopAgent领域请求处理。
-        model_set校验InferenceParameters及真实ModelRoutes后使用AgentInferenceConfig统一入口安装/更新，返回安全模型元数据Config；不读取Driver manifest。
+        model_set校验InferenceParameters及真实ModelRoutes，首次安装从inference_core::ModelObserverFactory.for_owner取得通用回调，再使用AgentInferenceConfig统一入口安装/更新，返回安全模型元数据Config；不读取Driver manifest。
         history_append取得目标owned AgentStorage，复检命令及取消，在worker调用append_message_history并返回Array.Message。
 
 finish_turn(context: &CommandContext) -> Future<Output = Result<MclValue, MclError>>
@@ -187,7 +189,7 @@ execute_block_effect(context: &CommandContext, name: &str, parameters: Vec<Effec
     行为：
         按既有标识符规则校验Block名，恢复参数校验为SQLite范围内正整数；不接收物理路径
         通过World闭包check_action复检命令、来源及取消，克隆目标AgentStorage，不跨await借用World
-        owned句柄及目标AgentSession命名空间交给blocking worker，提交前复检取消，执行对应存储能力并await真实join
+        owned句柄及目标Agent.instance命名空间交给blocking worker，提交前复检取消，执行对应存储能力并await真实join
         将存储结果转换为Unit或BlockSnapshots，错误沿storage_error转换，worker失败为CleanupFailed
         不在本函数写审计或发送原请求reply，不自动重试
 

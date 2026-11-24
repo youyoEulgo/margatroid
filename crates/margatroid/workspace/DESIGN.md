@@ -26,69 +26,25 @@ System分别列出处理事件、接收闭包结果、提交闭包与产出事�
 
 公开，定义于workspace_core：
 ```text
-WorkspaceDefinitions：Resource + Clone
-    entries: Arc<RwLock<BTreeMap<PathBuf, WorkspaceDefinition>>>--私有，不借出可变缓存
-    source: Option<PathBuf>
-    reload_lock: Arc<Mutex<()>>--串行扫描、写入及活动标记
-    active: Arc<Mutex<BTreeSet<PathBuf>>>--从starting保留到真实停止完成的定义路径
-    observer: Arc<OnceLock<DefinitionObserver>>
-    open(source: impl Into<PathBuf>) -> Result<Self, WorkspaceError>
-        行为：验证来源并首轮全量reload，失败不安装；不自动运行Workspace。
-    source(&self) -> Option<&Path>
-    same_instance(&self, other: &Self) -> bool
-    get(&self, path: &Path) -> Option<WorkspaceDefinition>
-    list(&self) -> Vec<(PathBuf, WorkspaceDefinition)>
-        行为：只读取已发布缓存，不隐式IO或建立监控。
-    observe(&self, observer: DefinitionObserver)
-        行为：运行前仅装配一次typed观察，磁盘异步监控由DTO提供。
-    reload(&self) -> Result<WorkspaceDefinitionSnapshot, WorkspaceError>
-        行为：reload_lock覆盖读取、完整校验和发布；成功整体替换entries并调用observer(Ok(snapshot))，失败保留旧缓存并observer(Err(error))。
-        仅内部启动/重启和磁盘监控共用此入口；不公开workspace.reload网络API；返回不可变快照，运行实例仍保留自己启动使用的definition；定义不含name，名称只由资源地址创建时确定。
-    path_for(&self,address:&str) -> Result<PathBuf,WorkspaceError>
-        行为：只接受workspace:scope/name:tag，tag必须显式非空，禁止隐藏段/分隔符/控制字符；根据配置目录根构造root/scope/name/tag/workspace.yaml并拒绝路径符号链接，不通过展示名反查。
-    reserve(&self,path:&Path) -> Result<(),WorkspaceError>
-        行为：持reload_lock校验文件存在并登记active；重复路径报Duplicate，与modify共用操作门。
-    release(&self,path:&Path)
-        行为：真实停止完成或确认启动失败清理时，在同一操作门移除active。
-    modify(&self,operation:WorkspaceModification) -> Result<(),WorkspaceError>
-        行为：全程持reload_lock，按地址path_for定位，active路径拒绝Update/Rename/Delete；Create目标已存在拒绝。
-        Create/Update完整校验定义、绝对project_root/home_root及1MiB预算，以同目录create_new暂存文件write/fsync/rename并同步目录；Create创建受控资源目录，不启动运行实例。
-        Rename拒绝已存在目标，移动整个scope/name/tag目录及其配置/历史/快照，并同步父目录，不修改项目文件或运行地址。
-        Delete仅删除经过受控地址定位的整个Workspace目录，不跟随project_root；完成同步父目录。
-        修改完成调用reload_locked重新扫描并经原observer发布目录；不额外生成ECS同步或完成事件。
-    reload_locked(&self) -> Result<WorkspaceDefinitionSnapshot,WorkspaceError>
-        行为：由已持reload_lock的reload/modify共用，完整校验再整体发布；错误保留旧缓存并报告，磁盘已提交的修改不会因后续扫描失败回滚。
-WorkspaceDefinitionSnapshot
-    entries: Arc<BTreeMap<PathBuf, WorkspaceDefinition>>
-    get(&self, path: &Path) -> Option<&WorkspaceDefinition>
-    list(&self) -> Vec<(PathBuf, WorkspaceDefinition)>
-WorldWorkspaceExt
-    workspace_definitions(&self) -> Result<&WorkspaceDefinitions, WorkspaceError>
-    workspace_state(&self, workspace: Entity) -> Result<&WorkspaceState, WorkspaceError>
-    workspace_agents(&self, workspace: Entity) -> Result<Vec<Entity>, WorkspaceError>
-    workspace_insert_agent(&mut self, workspace: Entity, agent: Entity) -> Result<(), WorkspaceError>
-    workspace_remove_agent(&mut self, workspace: Entity, agent: Entity) -> Result<(), WorkspaceError>
-        行为：成员写入只调用update_workspace的AddMember/RemoveMember，原完整Entity校验保持。
-load_workspace_definitions(source: &Path) -> Result<BTreeMap<PathBuf, WorkspaceDefinition>, WorkspaceError>
-reject_definition_symlinks(path: &Path) -> Result<(), WorkspaceError>
-    行为：目录来源扫描root/scope/name/tag/workspace.yaml，忽略隐藏目录，拒绝各层符号链接，完整身份用workspace_address校验；文件来源仅保留内部只读加载。加载全部workspace.yaml，拒绝不允许的symlink及不合法定义，任一错误不发布部分结果。
+WorkspaceConfig：工作区运行配置，公开Resource
+    root: PathBuf--Workspace目录根路径
+    impl Resource for WorkspaceConfig
+
+WorkspaceUpdateContext：Workspace组件生命周期探针，公开Resource
+    publish: Arc<dyn Fn(&mut World, Entity, WorkspaceUpdateKind) + Send + Sync>--由装配方注入，core不依赖客户端
+    new(publish: impl Fn(&mut World, Entity, WorkspaceUpdateKind) + Send + Sync + 'static) -> Self
+    notify(&self, world: &mut World, owner: Entity, kind: WorkspaceUpdateKind)
+        行为：同步调用注入回调；组件安装、实际状态修改和实体移除均由plugin的统一入口调用，不发送同步事件。
+    impl Resource + Clone
 ```
 
 公开，定义于workspace_plugin：
 ```text
-WorkspacePlugin
-    schedule: String
-    definitions: WorkspaceDefinitions
-    program_root: PathBuf--Workspace定义程序的明确资源根
-    root: Option<PathBuf>
-    file: Option<PathBuf>
-    new() -> Self
-    open(root: impl Into<PathBuf>) -> Result<Self, WorkspaceError>
-    with_schedule(self, schedule: impl Into<String>) -> Self
-    impl Default + Plugin
+WorkspacePlugin：工作区插件
+    root: PathBuf--插件安装时提供的Workspace目录根路径
+    impl Plugin for WorkspacePlugin
         build(self, app: &mut App)
-            行为：检查运行设施及必需WorkspaceUpdateContext，安装唯一definitions Resource和既有Stop/Restart/Start三个System。
-            定义监控由DTO在其安装阶段启动一次，不隐藏在World帧轮询中。
+            行为：将root写入独立的WorkspaceConfig资源；在只执行一次的RuntimePlugin::STARTUP安装load_workspace_system，在RuntimePlugin::UPDATE安装create_workspace_system、start_workspace_system、delete_workspace_system、start_agent_system和archive_agent_system。
 ```
 
 # components
@@ -97,28 +53,13 @@ WorkspacePlugin
 
 公开：
 ```text
-Workspace：Component + Clone + Debug
-    data: WorkspaceData--私有，不实现DerefMut
-    updates: WorkspaceUpdateContext
-    new(name, definition_path, project_root, state, agents, definition, updates) -> Self
-    updates(&self) -> WorkspaceUpdateContext
-    impl Deref<Target = WorkspaceData>：只读字段访问
-WorkspaceData
-    name: String
-    definition_path: PathBuf
-    project_root: PathBuf--运行实例实际工作目录；HTTP文件访问只以此目录为根，不根据同名展示条目或新定义缓存替换
-    state: WorkspaceState
-    agents: BTreeSet<Entity>
-    definition: Option<WorkspaceDefinition>
-    error: Option<WorkspaceError>
-WorkspaceFailure(WorkspaceError)
-    impl Component
-    行为：原运行诊断组件保留，实际故障投影由统一入口同步维护。
-WorkspaceExecutor
-    entry: WorkspaceExecutionEntry
-    close: WorkspaceExecutionClose
-    impl Component
-    impl Drop：关闭外部新提交受理，不冒充真实线程退出。
+Workspace：工作区组件，定义于workspace_core
+    alias: String--展示名称
+    project_root: PathBuf--工作区基础工作目录，供Driver上下文使用
+    state: WorkspaceState--当前实体的运行状态，不写入数据库
+    database: WorkspaceDatabase--该Workspace数据库的访问句柄，记录所属的全部Agent
+    set_state(&mut self, state: WorkspaceState) -> bool
+        行为：相同状态返回false；实际修改后返回true，由plugin释放组件借用后调用WorkspaceUpdateContext::notify(Changed)。
 ```
 
 # events
@@ -127,27 +68,43 @@ WorkspaceExecutor
 
 公开：
 ```text
-WorkspaceOperationReply
-    Arc<Mutex<Option<oneshot::Sender<Result<WorkspaceOperationOutput, WorkspaceError>>>>>
+CreateWorkspace：工作区文件创建事件，定义于workspace_core
+    address: String--工作区的完整节点地址
+    alias: String--展示名称
+    project_root: PathBuf--工作区基础工作目录
+    reply: Arc<Mutex<Option<oneshot::Sender<Result<Entity, WorkspaceError>>>>>
+    impl Event for CreateWorkspace
 
-StartWorkspace
-    id: String
-    path: PathBuf
-    reply: WorkspaceOperationReply
-    impl Event + Clone + Debug
+StartWorkspace：工作区启动事件，定义于workspace_core
+    address: String--工作区实体的完整节点地址，由workspace_plugin使用address校验
+    alias: String--展示名称
+    project_root: PathBuf--工作区基础工作目录
+    database: WorkspaceDatabase--已打开的工作区数据库句柄
+    reply: Option<Arc<Mutex<Option<oneshot::Sender<Result<Entity, WorkspaceError>>>>>>--创建请求转交，加载为None
+    impl Event for StartWorkspace
 
-StopWorkspace
-    id: String
-    workspace: Entity
-    reply: WorkspaceOperationReply
-    impl Event + Clone + Debug
+DeleteWorkspace：工作区删除事件，定义于workspace_core
+    workspace: Entity--待删除的Workspace实体
+    reply: Arc<Mutex<Option<oneshot::Sender<Result<(), WorkspaceError>>>>>--原请求的唯一回复端
+    impl Event for DeleteWorkspace
 
-RestartWorkspace
-    id: String
-    path: PathBuf
-    reply: WorkspaceOperationReply
-    impl Event + Clone + Debug
+StartWorkspaceAgent<R, E>：启动Driver工具调用的事件枚举，定义于workspace_core
+    Existing
+        workspace: Entity--所属Workspace实体，指定查询的数据库
+        node_name: String--该Workspace内已登记Agent的单段相对节点名
+        reply: Arc<Mutex<Option<oneshot::Sender<Result<R, E>>>>>
+    New
+        workspace: Entity--发起工具调用的Workspace实体
+        tool_path: PathBuf--实际Driver工具入口路径
+        arguments: serde_json::Value--原样传给Driver的工具调用参数
+        reply: Arc<Mutex<Option<oneshot::Sender<Result<R, E>>>>>
+    impl<R: Send + 'static, E: Send + 'static> Event for StartWorkspaceAgent<R, E>
 
+ArchiveAgent：工作区Agent归档事件，定义于workspace_core
+    workspace: Entity--所属Workspace实体，指定查询的数据库
+    node_name: String--该Workspace内的单段相对节点名
+    reply: Arc<Mutex<Option<oneshot::Sender<Result<(), WorkspaceError>>>>>--归档完成的唯一回复端
+    impl Event for ArchiveAgent
 ```
 
 # system
@@ -156,29 +113,71 @@ RestartWorkspace
 
 crate公开：
 ```text
-stop_workspace_system(world: &mut World)
-    处理事件：StopWorkspace
-    接收闭包结果：Result<StopOutput, StopError>
-    提交闭包：stop_flow(WorkspaceFlowContext) -> Future<Output = Result<StopOutput, StopError>>
-    产出事件：None
-    oneshot回复：Result<WorkspaceOperationOutput, WorkspaceError>
-    行为：StopWorkspace -> handle_stop_workspace；Result<StopOutput, StopError> -> handle_stop_result。
-
-restart_workspace_system(world: &mut World)
-    处理事件：RestartWorkspace
+create_workspace_system(world: &mut World)
+    处理事件：CreateWorkspace
     接收闭包结果：None
-    提交闭包：等待StopWorkspace原oneshot的普通异步闭包，返回Result<(),AsyncTaskError>
-    闭包产出事件：停止成功后一次StartWorkspace
-    oneshot回复：停止失败直接回复原RestartWorkspace，成功由普通StartWorkspace完成原reply
-    行为：仅路由RestartWorkspace -> handle_restart_workspace，不接收独立RestartOutput或执行第二套生命周期。
+    提交闭包：create_workspace(root: PathBuf, event: CreateWorkspace, events: EventSender) -> Future<Output = ()>
+    产出事件：None
+    行为：收到CreateWorkspace后，取得WorkspaceConfig.root及事件发送器，使用AsyncRuntimeHandle::spawn提交create_workspace异步闭包。
+
+load_workspace_system(world: &mut World)
+    处理事件：None
+    接收闭包结果：None
+    提交闭包：load_workspaces(root: PathBuf, events: EventSender) -> Future<Output = ()>
+    产出事件：None
+    行为：在初始化schedule执行一次，取得WorkspaceConfig.root及事件发送器，使用AsyncRuntimeHandle::spawn提交load_workspaces异步闭包。
 
 start_workspace_system(world: &mut World)
     处理事件：StartWorkspace
-    接收闭包结果：Result<StartOutput, StartError>
-    提交闭包：start_flow(WorkspaceFlowContext) -> Future<Output = Result<StartOutput, StartError>>
+    接收闭包结果：None
+    提交闭包：None
     产出事件：None
-    oneshot回复：Result<WorkspaceOperationOutput, WorkspaceError>
-    行为：StartWorkspace -> handle_start_workspace；Result<StartOutput, StartError> -> handle_start_result。
+    行为：接收StartWorkspace，将事件交给handle_start_workspace。
+
+delete_workspace_system(world: &mut World)
+    处理事件：DeleteWorkspace
+    接收闭包结果：Result<WorkspaceCleanupOutput, WorkspaceCleanupError>
+    提交闭包：Future<Output = Result<WorkspaceCleanupOutput, WorkspaceCleanupError>>
+    产出事件：None
+    行为：接收DeleteWorkspace，校验目标Workspace及其管理目录，目录必须位于WorkspaceConfig.root内，且不包含project_root；仅Running或Error状态可受理删除，记录目录后将状态置为Deleting；Deleting状态拒绝重复删除；受理失败通过原reply直接回复错误。
+        状态实际转为Deleting后，通过WorkspaceUpdateContext::notify(Changed)发布变化。
+        同步关闭Workspace.database.close_admission()及ToolTasks.close_admission()，同时禁止直接Path工具请求和Lua新建Agent受理。
+        克隆ToolTasks、数据库及原reply交给异步闭包；先取消所有已受理任务并等待finish()，再等待database.wait_idle()确认在途创建及归档凭证全部释放。
+        任一任务清理失败时仍等待本轮其他已请求关闭项收口，再返回清理错误，不继续wait_idle或关闭数据库。
+        任务必须将已受理Agent创建监督收口，取消不会丢失StartAgent的reply或遗留未绑定实体。
+        清理完成后返回携带完整Entity及原reply的闭包结果，不跨await持有World或组件借用。
+        System接收成功结果后，复核完整Entity仍对应原Workspace且状态为Deleting，同步调用Workspace.database.close()关闭数据库；此时无在途操作，若受理计数非零则返回Busy而不阻塞World。
+        数据库关闭前调用WorkspaceUpdateContext::notify(Closing)，使该Workspace的数据库和任务同步来源失效；数据库关闭通知须使观察者结束，不等待需由World处理的额外轮询。
+        数据库关闭成功后销毁实体，释放其所有组件，调用WorkspaceUpdateContext::notify(Removed)，再删除已记录的管理目录；不删除project_root或共享资源。
+        任务清理或数据库关闭失败时保留实体及目录，将状态置为Error并通过原reply返回错误，不恢复任务受理；调用WorkspaceUpdateContext::notify(Changed)发布实际Error状态，可再次收到删除事件后重试。
+        目录删除失败时实体已经销毁，通过原reply返回包含entity_removed=true和已校验管理路径的错误；不能再按已销毁Entity重试，不自动重建实体，残留目录须显式修复。
+        实体销毁且目录删除完成后，通过原reply返回Ok(())；所有成功或失败分支均take唯一Sender，只回复一次，不另发删除完成事件。
+
+start_agent_system(world: &mut World)
+    处理事件：StartWorkspaceAgent<tool_core::ToolExecuteResponse, tool_core::ToolError>
+    接收闭包结果：None
+    提交闭包：None
+    产出事件：tool_core::ToolExecuteRequest::Path
+    行为：接收StartWorkspaceAgent并检查Workspace Running；Existing按Workspace内唯一node_name读取普通记录并调用database.ensure_startable(id)，New使用请求的tool_path和arguments。
+        Driver工具参数是对象，专用node_name、alias及相对工作目录path由Driver参数提供；node_name缺省或null为临时，提供时必须为非空单段名且不能使用保留前缀~temporary-。
+        New若arguments.node_name已登记则拒绝；Existing使用数据库原tool_arguments，不覆盖Driver参数。
+        Existing读取记录parent_node并定位实际父实体；顶层记录父实体为Workspace，子Agent记录要求原父Agent仍存在且可受理，否则拒绝，不改变节点归属。
+        构造ToolExecuteRequest::Path，initiator为选定父实体，path和arguments取自变体材料，原reply直接转交；工具登记必须重新检查initiator的ToolTasks受理门。
+        同步阶段不准备Agent文件、不打开Agent数据库、不预登记；工具实际执行agent:create时统一检查Driver归属、准备文件、登记及创建实体。
+        专用节点名和别名只经arguments进入Driver；ToolExecuteRequest::Path保持initiator/path/arguments/reply四字段，不增加隐式待传材料。
+
+archive_agent_system(world: &mut World)
+    处理事件：ArchiveAgent
+    接收闭包结果：None
+    提交闭包：Future<Output = ()>
+    产出事件：None
+    行为：同步阶段检查Workspace Running，调用database.try_operation(node_name)取得该节点归档操作凭证；已有创建或归档操作直接返回Busy，不阻塞World。
+        从数据库读取记录及其parent_node，普通按node_name、临时按runtime_name定位记录；构造完整目标节点并查找Agent；找到后核对workspace、parent，从Agent.task_id在Agent.parent的ToolTasks取实际任务句柄。匹配Agent存在但父任务缺失是错误，不能当成None。
+        无Agent时为None；节点已有在途创建则try_operation已拒绝，不能在此窗口创建新的同节点实体。
+        将Option<ToolTaskHandle>、操作凭证、数据库及原reply交给异步闭包；Some先调用finish()，等任务及其绑定Agent、存储和来源监控真实关闭，None跳过。
+        blocking worker调用database.archive_agent，在同一受保护操作下记录归档意图、移动目录并提交类别及曾用名；成功后通过原reply回复。
+        移动或提交失败返回带阶段的WorkspaceError，保留数据库内归档意图阻止该节点重启；不丢失新旧目录路径，不假报回滚。
+        所有分支释放操作凭证；不能恢复一致的归档意图必须在后续显式修复或加载恢复完成后才能继续操作。
 
 ```
 
@@ -188,51 +187,31 @@ start_workspace_system(world: &mut World)
 
 crate公开：
 ```text
-update_workspace(world: &mut World, owner: Entity, change: WorkspaceChange) -> Result<(), WorkspaceError>
-    行为：唯一修改Workspace私有data的入口，统一处理状态、成员、故障、实际启动定义；Definition只修改project_root及definition，不能覆盖从地址取得的name；变化后释放可变借用再context.notify，DTO探针提交owned运行快照并直投Clients。
-remove_workspace(world: &mut World, owner: Entity)
-    行为：真实停止收口后销毁Entity，再通知完整目录更新；不以提前移除代替回收。
-WorkspaceState：Starting | Running | Error | Stopping，无Restarting；定义存在但无运行Entity时网络目录可投影inactive。
-
-handle_start_workspace(world: &mut World, request: StartWorkspace)
-    行为：保留原reply，校验request.path必须符合四段资源路径并据其生成Workspace Address，reserve同一目录操作门后创建Starting实体并提交启动闭包；全量reload后目标必须存在，本次定义用于初始化Workspace.definition。
-
-handle_stop_workspace(world: &mut World, request: StopWorkspace)
-    行为：Starting/Running/Error均同步转Stopping；关闭新任务及成员创建受理，并立即取消本Workspace实际Lua执行，使未完成启动交接能收口。
-        stop_flow仍等待StartupBarrier真实完成，再按原路径停止Lua、Agent和线程；已Stopping拒绝重复提交，由原监督者等待收口。
-
-handle_restart_workspace(world: &mut World, request: RestartWorkspace)
-    行为：按request.path定位运行Entity，直接调用handle_stop_workspace，使用普通StopWorkspace的受理/取消/初始化等待及真实清理。
-        仅await StopWorkspace.reply；成功后提交普通StartWorkspace，携带原path、id和原reply。停止失败/回执丢失不启动；不查询ToolTasks、不提前reload定义、不额外改状态/装Barrier、不保留旧Entity。
-        定义全量reload及新Entity/线程/Driver创建仅发生在普通StartWorkspace路径。
-
-handle_start_result(world: &mut World, result: Result<StartOutput, StartError>)
-handle_stop_result(world: &mut World, result: Result<StopOutput, StopError>)
-    行为：核对完整Entity和对应状态；启动成功转Running，关闭成功release定义路径后销毁Entity；失败清理完整时release并销毁，否则保留宿主并转Error；mount_executor将本次定义保存到Workspace.definition；失败时保存WorkspaceFailure；成员Lua启动失败先发布Error并通过原reply返回聚合MemberFailed，不发布Running；全成功才清除旧故障并Running。
-
+handle_start_workspace(world: &mut World, event: StartWorkspace)
+    行为：用event.address构造并校验Address，检查地址；已占用时先按下述复用/拒绝规则完成，不再建立实体。
+        地址空闲时建立实体，直接挂载Address组件。
+        用event.alias、event.project_root、event.database构造Workspace，state初始化为Running，并直接挂载到同一实体。
+        将tool_core公开的ToolTasks::new()挂载到同一实体。
+        组件全部就绪后调用WorkspaceUpdateContext::notify(Installed)，由注入探针发布初始Workspace视图并绑定任务集合及数据库提交通知；event.reply为Some时通过原Sender返回Entity。
+        地址已占用时若现有Workspace使用同一管理目录且元数据一致，复用现有实体；仅在same_connection为false时关闭本次独立重复连接，绝不关闭现有共享连接，原reply返回该Entity；否则关闭本次连接并回复错误。加载无reply时记录tracing，不重复挂载。
 ```
 
 私有：
 ```text
-start_flow(context: WorkspaceFlowContext) -> Future<Output = Result<StartOutput, StartError>>
-    行为：调用fresh_definition取得本次全量重载缓存中的定义；失败不启动。mount_executor后start_members，不再单独读取目标文件。
+create_workspace(root: PathBuf, event: CreateWorkspace, events: EventSender) -> Future<Output = ()>
+    行为：在异步闭包内通过blocking worker，根据CreateWorkspace创建Workspace目录及数据库文件，写入address、alias、project_root。
+        Workspace地址只允许根下单段/name，管理目录为root/name；创建目录必须独占，不覆盖。创建workspace.sqlite和agents/normal、temporary、archived并初始化Schema。
+        等待实际写入提交及目录同步完成，构造以空Agent列表为初始changes快照的数据库句柄，通过events直接发送携带address、alias、project_root、database及Some(event.reply)的StartWorkspace。
+        目标已存在或写入失败时不覆盖已有Workspace，通过原reply返回错误，不发送启动事件；只回收本次独占创建且尚未对外发布的目录，回收失败在原错误中保留路径。
+        不在创建流程建立实体或挂载组件。
 
-fresh_definition(context: &WorkspaceFlowContext) -> Future<Output = Result<WorkspaceDefinition, WorkspaceError>>
-    行为：owned definitions及path交blocking worker，调用reload并从返回缓存快照get目标定义；缺失明确失败，再调用prepare_definition。
-
-prepare_definition(path: &Path, definition: WorkspaceDefinition) -> Result<WorkspaceDefinition, WorkspaceError>
-    行为：仅使用已从缓存取得的定义，核验成员目录和固定state.sqlite/setting.toml路径，构造原AgentStartParameters；不读取Workspace定义文件。
-
-mount_executor(context, definition, state) / start_members(context, definition)
-    行为：将本次定义保存到Workspace.definition，创建并挂载专属执行线程。
-        为每个定义创建独立执行Entity和WorkspaceLuaTask，发送StartDriverLuaVm并保留原oneshot，join_all等待全部启动交接。
-        一个StartDriverLuaVm只携带一个程序及其注入环境，结果按原成员顺序收齐；任一Lua任务失败仍等待其他启动交接收口。
-
-stop_flow(context: WorkspaceFlowContext) -> Future<Output = Result<StopOutput, StopError>>
-    行为：等待已受理创建收口，先关闭新提交并逐个停止WorkspaceLuaTask对应实际执行，等待StopDriverLuaVm原oneshot及ended；移除独立执行Entity。
-        再经World逐个核对该Workspace所有Agent；任务scope清理已移除的成员跳过，Stopping成员等待Agent::removal，其他成员提交原StopAgent并等待reply及实际移除；不存在owner树；Agent工具任务scope负责其创建实例的清理；最后执行线程退出并在线程外join，不销毁协调Entity。
-
-
+load_workspaces(root: PathBuf, events: EventSender) -> Future<Output = ()>
+    行为：在异步闭包内通过blocking worker检查root下所有Workspace目录。
+        每个Workspace目录使用workspace.sqlite；只读写打开已存在文件，校验schema后recover_archives，再取得地址、别名和项目根构造句柄。
+        初始化root/agents/normal、temporary、archived布局只由创建流程建立；加载不对不匹配结构静默补齐。
+        初始化数据库句柄时读取一次已提交记录作为changes初始快照；不以SQLite/WAL文件事件冒充数据库提交。
+        每发现一个有效Workspace，通过events发送携带address、alias、project_root、database及reply=None的StartWorkspace。
+        无效或读取失败的目录记录tracing错误并继续检查其他目录；不创建目录或数据库，不在闭包内建立实体或挂载组件。
 ```
 
 # types
@@ -241,39 +220,15 @@ stop_flow(context: WorkspaceFlowContext) -> Future<Output = Result<StopOutput, S
 
 私有：
 ```text
-WorkspaceFlowContext：生命周期闭包材料
-    id: String
-    workspace: Entity
-    events: RuntimeEventSender
-    path: PathBuf
-    definitions: WorkspaceDefinitions
-    program_root: PathBuf--Workspace定义程序的明确资源根
-    state: WorkspaceState--本次异步阶段
-    startup: Arc<StartupCompletion>--在途启动真实完成屏障
-    reply: WorkspaceOperationReply
-    world: WorldClosureSender
+WorkspaceCleanupOutput
+    workspace: Entity--实际完成任务清理的完整实体标识
+    directory: PathBuf--删除受理时已校验并记录的管理目录
+    reply: Arc<Mutex<Option<oneshot::Sender<Result<(), WorkspaceError>>>>>--来自DeleteWorkspace
 
-StartOutput / StopOutput：成功载荷
+WorkspaceCleanupError
     workspace: Entity
-    members: Vec<Entity>
-    member_errors: Vec<MemberDiagnostic>
-    reply: WorkspaceOperationReply
-
-StartError / StopError = FlowError
-    workspace: Option<Entity>
     error: WorkspaceError
-    cleanup_completed: bool
-    state: Option<WorkspaceState>--只允许当前匹配阶段处理失败，停止不能被旧启动结果覆盖
-    reply: WorkspaceOperationReply
-
-StartupCompletion：私有共享启动完成证明
-    done: AtomicBool
-    changed: tokio::sync::Notify
-    finish(&self)：真实启动Future完成后发布并通知
-    wait(&self)：先注册后检查done，停止先等待所有启动工作真实收口
-StartupBarrier(Arc<StartupCompletion>)：Component
-    行为：仅初始创建安装，guarded_start完成后finish；stop_flow先wait，避免晚到程序创建落在关闭快照之后。
-MemberDiagnostic：成员诊断
+    reply: Arc<Mutex<Option<oneshot::Sender<Result<(), WorkspaceError>>>>>--来自DeleteWorkspace
 ```
 
 # types pub
@@ -282,29 +237,107 @@ MemberDiagnostic：成员诊断
 
 公开：
 ```text
+WorkspaceUpdateKind
+    Installed--组件装配完成，建立一次实际来源观察
+    Changed--组件状态或可见字段实际改变
+    Closing--失效数据库和任务同步来源
+    Removed--实体已销毁，从运行视图移除
 
-WorkspaceLuaTask（lua_runtime_core组件）
-    workspace: Entity
-    name: String
-    行为：管理Workspace定义自动启动的Lua执行实体；与Workspace所属Agent列表分开。停止先关闭新增创建受理，取消所属执行并真实等待，再排空所属Agent及执行线程。
-WorkspaceDefinition：Serialize/Deserialize，deny_unknown_fields
-    project_root: PathBuf
-    members: Vec<WorkspaceMemberDefinition>
-    行为：顶层无name；磁盘旧name明确拒绝，成员name保留。WorkspaceDocument只负责project_root及互斥members/agents输入规范化，不从文件设置Workspace名称。
-WorkspaceModification：Clone + Debug
-    Create { address:String, definition:WorkspaceDefinition }
-    Update { address:String, definition:WorkspaceDefinition }
-    Rename { address:String, new_address:String }
-    Delete { address:String }
-workspace_address(root:&Path,path:&Path) -> Result<String,WorkspaceError>
-    行为：严格四段scope/name/tag/workspace.yaml，校验组件并返回workspace:scope/name:tag。
-parse_workspace_address(address:&str) -> Result<(&str,&str,&str),WorkspaceError>
-    行为：Workspace core私有资源定位解析，不依赖其他领域core；禁止点段、隐藏段、分隔符及控制字符，必须显式提供tag。
-WorkspaceMemberDefinition
-    name: String
-    driver: String--公开程序locator，解析到base.lua，不要求manifest
-    home_root: PathBuf
-    行为：不预创建Agent；Workspace准备读取沿read_driver原预算及blocking worker，注入workspace/name/resource_dir，公共Lua创建方法按需发送StartAgent。
+WorkspaceRecordsSnapshot：数据库确认提交的Agent登记快照
+    revision: u64--进程内来源版本，不是Agent运行状态
+    agents: Vec<WorkspaceAgent>--仅已提交的持久记录
+
+WorkspaceState：工作区实体状态，定义于workspace_core
+    Running--已启动，可受理操作
+    Deleting--已受理删除，正在清理，不接受新操作或重复删除
+    Error--删除清理失败，保留实体及资源，不接受新任务，可重试删除
+    行为：启动挂载时为Running；删除受理时Running或Error转为Deleting。
+        任务清理或数据库关闭失败时Deleting转为Error；成功后销毁实体，不保留已删除状态。
+
+WorkspaceAgent：Workspace数据库中的Agent记录，定义于workspace_core
+    parent_node: String--实际创建者的完整节点路径；用于按原层级重启，不是运行Entity
+    id: String--记录的唯一标识
+    tool_path: PathBuf--实际工具入口文件路径
+    tool_arguments: serde_json::Value--宿主捕获的Driver完整调用参数，含其专用参数
+    node_name: Option<String>--当前普通节点名；临时及归档记录为None
+    alias: Option<String>--当前展示别名
+    category: AgentCategory--持久目录类别，不代表实时运行状态
+    directory_name: String--类别目录下实际名，不包含分隔符；普通为node_name，临时为记录id
+    runtime_name: String--普通为node_name，临时为~temporary-<id>；归档后不可启动
+    previous_node_name: Option<String>--归档前曾用的普通节点名
+    previous_alias: Option<String>--归档前曾用的别名
+
+AgentCategory：Agent目录类别，定义于workspace_core
+    Normal--普通Agent，directory_name为node_name
+    Temporary--临时Agent，节点名未提供，directory_name独立分配
+    Archived--归档Agent，directory_name在归档时重新分配
+
+WorkspaceAdmission：私有，workspace_core内部
+    accepting: bool
+    nodes: BTreeSet<String>--正在创建或归档的节点操作键，不是Workspace删除集合
+    count: usize
+WorkspaceOperation：公开不透明RAII句柄
+    key: String
+    database_identity: usize--内部共享数据库身份，不能用于网络寻址
+    admission: Arc<Mutex<WorkspaceAdmission>>
+    idle: Arc<Notify>
+    impl Drop
+        行为：短锁移除自身key并减count，解锁后Notify唤醒wait_idle；不改持久类别。
+
+WorkspaceDatabase：工作区数据库访问句柄，定义于workspace_core
+    path: PathBuf--私有，数据库文件的绝对路径
+    connection: Arc<Mutex<Option<rusqlite::Connection>>>--私有，None表示已关闭
+    admission: Arc<Mutex<WorkspaceAdmission>>--私有，只管理在途操作，不是运行状态数据库
+    idle: Arc<Notify>
+    changes: Arc<watch::Sender<Option<WorkspaceRecordsSnapshot>>>--共享确认快照；None表示来源已关闭
+    subscribe_changes(&self) -> watch::Receiver<Option<WorkspaceRecordsSnapshot>>
+        行为：返回共享提交来源的独立接收端，当前值为最近确认快照；只建立进程内观察，不查询、写入数据库或发送网络消息。
+    publish_committed(&self, agents: Vec<WorkspaceAgent>)
+        行为：私有，调用方持数据库操作锁，在事务确认提交后提交owned快照；内容相同不推进revision；先更新来源快照再释放操作锁，避免迟到旧快照覆盖新提交。
+    path(&self) -> &Path
+        行为：返回数据库文件路径。
+    same_connection(&self, other: &Self) -> bool
+        行为：比较共享connection的Arc身份；同路径的新连接也返回false。
+    try_operation(&self, key: &str) -> Result<WorkspaceOperation, WorkspaceError>
+        行为：短锁检查受理门及节点操作占用，冲突立即Busy；普通键为Workspace唯一节点名；临时键为~temporary-<新随机id>，同时作为该临时Agent的runtime_name。成功登记操作并返回RAII凭证，不持数据库连接锁跨异步等待。
+    close_admission(&self)
+        行为：同步关闭新操作受理；已受理凭证继续清理，不立即关闭连接。
+    wait_idle(&self) -> Future<Output = ()>
+        行为：用Notify等待操作计数归零，先登记等待再检查计数，不轮询、不阻塞World。
+    prepare_agent(&self, operation: &WorkspaceOperation, parent_node: String, node_name: Option<String>, alias: Option<String>, tool_path: PathBuf, arguments: serde_json::Value) -> Result<WorkspaceAgent, WorkspaceError>
+        行为：读取记录并校验Driver规范路径及parent_node一致；原记录归档或存在归档意图时拒绝，普通记录仅允许同Driver同父复用。
+            无记录时分配唯一id并构造候选记录，不提交agents行；临时id由本次临时操作键的随机部分确定，普通目录为node_name，临时目录为id及~temporary-<id>运行名。
+            在节点凭证保护下把该候选记录交给注入方法准备文件；新记录的目录若已经存在但无对应数据库记录，返回UnregisteredDirectory，不复用未知归属文件、不自动删除修补。
+    commit_agent(&self, operation: &WorkspaceOperation, record: WorkspaceAgent) -> Result<WorkspaceAgent, WorkspaceError>
+        行为：确认凭证与目标节点一致，事务重新核对原记录Driver/父节点及id，插入新记录或更新原工具参数和显式alias；并发冲突拒绝，不覆盖其他记录。
+            确认提交后publish_committed，相同值不通知；文件准备、StartAgent回复及子Agent绑定都持有同一operation，跨await不持SQL锁。
+    agent_by_node(&self, node_name: &str) -> Result<WorkspaceAgent, WorkspaceError>
+        行为：优先按普通node_name，保留前缀节点按临时runtime_name返回记录，缺失返回错误。读到归档中原记录不代表它可启动；Existing只允许Normal且ensure_startable通过，临时不重放成另一实例。
+    ensure_startable(&self, id: &str) -> Result<(), WorkspaceError>
+        行为：要求记录非Archived且无archive_intents，存在意图返回ArchivePending；不改变数据。
+    archive_agent(&self, operation: &WorkspaceOperation, id: &str) -> Result<WorkspaceAgent, WorkspaceError>
+        行为：同步数据库/文件操作，由plugin在blocking worker调用；operation须属于目标节点，实际运行任务由plugin事先关闭。
+            若已有同记录归档意图，按recover_archives的单记录规则继续完成，使用原意图目标目录，不重新分配、不重复移动；正常受理凭证保护下可以再次显式ArchiveAgent恢复。
+            无意图时在同一数据库archive_intents表确认写入id、原类别及目录名、新分配归档名；归档名使用新随机值，不复用原名。
+            用std::fs::rename将整个目录移入agents/archived，sync父目录；再事务标记Archived、保存previous_node_name及previous_alias、清空当前node_name、更新directory_name并删除意图，确认提交后publish_committed。
+            rename失败且确认仍在原位置时清除意图并返回失败；rename成功但提交失败时保留意图、返回ArchivePending，禁止此节点再启动，不假称回滚。
+    recover_archives(&self) -> Result<(), WorkspaceError>
+        行为：加载数据库时、发布初始快照之前处理archive_intents。原目录存在而目标不存在则完成移动；目标存在而原目录不存在则完成数据库提交；两处同时存在或都不存在则拒绝加载，绝不覆盖猜测。
+            仅恢复已持久受理的归档操作，不迁移旧结构、不创建备份。目录检查及移动限制在Workspace管理根，不跟随越界链接。
+    close(&self) -> Result<(), WorkspaceError>
+        行为：取得连接访问锁并直接关闭连接；所有共享句柄随后拒绝数据库访问。
+            受理计数必须为零，先关闭受理，已关闭时成功返回；成功关闭后将changes置为None，使所有持有接收端的监控结束；关闭失败保留连接和来源并返回错误。
+    impl Clone for WorkspaceDatabase
+        行为：克隆访问句柄，共享同一连接和changes来源，不复制或重新打开数据库。
+
+Workspace数据库结构
+    PRAGMA user_version = 1；不匹配明确失败，不自动迁移
+    workspace：单行address、alias、project_root
+    agents：id主键，parent_node、node_name、alias、category、directory_name、runtime_name、tool_path、tool_arguments、previous_node_name、previous_alias
+        node_name非空时在整个Workspace唯一；category只允许Normal/Temporary/Archived，tool_arguments为JSON对象。
+        Normal必须有合法node_name且directory_name等于node_name，Temporary无node_name，Archived只保留previous_node_name；所有目录名禁止路径分隔符及父级遍历。
+    archive_intents：agent_id主键及外键，source_category、source_directory、destination_directory
+        仅表示尚未提交完成的目录移动；不作为实时Agent状态。
 
 ```
 
@@ -314,36 +347,82 @@ WorkspaceMemberDefinition
 
 公开：
 ```text
-WorkspaceError：工作区错误，公开类型
+WorkspaceError：工作区操作错误
     kind: WorkspaceErrorKind
     message: String
-    impl Display + std::error::Error
-
-WorkspaceErrorKind：错误类别，公开枚举
-    InvalidRequest | InvalidDefinition | Missing | Duplicate | StateRejected | Busy
-    MemberFailed | ThreadStartFailed | ThreadCloseFailed | CleanupFailed
+    phase: Option<String>--发生失败的实际步骤
+    managed_directory: Option<PathBuf>--需要显式修复的已验证管理路径
+    entity_removed: bool--删除是否已经移除实体
+    impl Clone + Display + std::error::Error
+WorkspaceErrorKind：Clone
+    InvalidRequest | Missing | Busy | Closed | DriverMismatch | ParentMismatch | DuplicateNode
+    UnregisteredDirectory | DatabaseFailed | CloseFailed | ArchivePending | RecoveryFailed | DeleteFailed
 ```
 
 # 持有关系
 
 ```text
+WorkspacePlugin
+└── root: PathBuf
+
 World
-├── WorkspaceDefinitions: Resource
-│   └── Arc<RwLock<BTreeMap<PathBuf, WorkspaceDefinition>>>
-└── Workspace Entity
-    ├── Address（address）
-    ├── Workspace（workspace_core）
-    │   └── BTreeSet<Agent Entity>
-    └── WorkspaceExecutor（workspace_core）
-        ├── WorkspaceExecutionEntry
-        └── WorkspaceExecutionClose
-            └── 专属线程join能力
+├── WorkspaceConfig（Resource）
+│   └── root: PathBuf
+└── WorkspaceUpdateContext（Resource）
+    └── 组件生命周期回调 → plugin公共视图及来源绑定
 
-mecs全局异步设施
-└── Workspace生命周期闭包
-    ├── owned参数、Entity及事件发送能力
-    └── 各步骤oneshot接收端
+Workspace实体
+├── Address（address定义）
+├── ToolTasks（tool_core定义）
+└── Workspace
+    ├── alias: String
+    ├── project_root: PathBuf
+    ├── state: WorkspaceState
+    └── database: WorkspaceDatabase
+        ├── path: PathBuf
+        ├── connection: Arc<Mutex<Option<rusqlite::Connection>>>
+        └── changes → 确认提交的登记快照及关闭通知
 
-Workspace专属线程
-└── 已提交的Driver等本地任务
+CreateWorkspace
+├── address: String
+├── alias: String
+├── project_root: PathBuf
+└── reply: 原创建请求Sender
+
+StartWorkspace
+├── address: String
+├── alias: String
+├── project_root: PathBuf
+├── database: WorkspaceDatabase
+└── reply: 可选原创建请求Sender
+
+DeleteWorkspace
+├── workspace: Entity
+└── reply: Arc<Mutex<Option<oneshot::Sender<Result<(), WorkspaceError>>>>>
+
+StartWorkspaceAgent<R, E>
+├── Existing
+│   ├── workspace: Entity
+│   ├── node_name: String
+│   └── reply: Arc<Mutex<Option<oneshot::Sender<Result<R, E>>>>>
+└── New
+    ├── workspace: Entity
+    ├── tool_path: PathBuf
+    ├── arguments: serde_json::Value
+    └── reply: Arc<Mutex<Option<oneshot::Sender<Result<R, E>>>>>
+
+ArchiveAgent
+├── workspace: Entity
+├── node_name: String
+└── reply: Arc<Mutex<Option<oneshot::Sender<Result<(), WorkspaceError>>>>>
+
+Workspace管理目录
+├── Workspace数据库文件
+└── agents
+    ├── normal
+    │   └── <节点名>：普通Agent的完整持久化目录
+    ├── temporary
+    │   └── <分配名>：临时Agent的独立目录
+    └── archived
+        └── <归档时新分配名>：整体移入的数据目录，数据库保留曾用节点名和别名
 ```

@@ -27,11 +27,17 @@ System分别列出事件、闭包结果、提交闭包及oneshot回复，使用R
 公开，定义于storage_core：
 ```text
 open_storage(database_path: &Path, settings_path: &Path, default_settings: &str) -> Result<AgentStorage, StorageError>
-    行为：打开Agent管理库及Block工作文件及快照管理器，验证管理库和已登记Block文件的目标schema与映射；settings不存在时以不覆盖方式写入默认模板，存在则读取并校验；返回共享句柄，不缓存消息正文；用已有持久记录的真实最大sequence初始化record_changes通知值。
+    行为：同步打开Agent管理库及Block工作文件及快照管理器，验证管理库和已登记Block文件的目标schema与映射；settings不存在时以不覆盖方式写入默认模板，存在则读取并校验；全部必要初始化成功后返回已连接、可直接使用的AgentStorage；异常关闭本次部分连接并返回错误，不返回半初始化组件；不缓存消息正文；用已有持久记录的真实最大sequence初始化record_changes通知值。
+
+close_storage(storage: &AgentStorage) -> Result<(), StorageError>
+    行为：同步操作，异步调用者放blocking worker并等待真实结束；同管理库受理锁下置retired，阻止新的配置、记录、Block读写，等待已持锁操作释放。
+        关闭全部Block工作连接及管理库Connection，成功将共享连接置None；所有AgentStorage克隆统一变为不可访问，record_changes只用于已提交事实不制造新记录。
+        SQLite关闭失败保留仍可关闭的Connection，retired仍为true，只允许后续close_storage显式重试，不能恢复业务受理；已成功关闭部分不重复使用。
+        Agent关闭调用此方法前必须完成子任务、推理、MCL及记录/UI监控收口；外部分页读取在管理锁中完成后才能实际关闭。
 
 execute_storage(storage: &AgentStorage, operation: StorageOperation) -> Result<StorageValue, StorageError>
     行为：
-        按StorageOperation分派；Block操作通过共享受理门解析timeline，管理库操作使用管理库事务，设置操作使用设置文件锁
+        取得共享受理门并检查非retired且Connection存在，关闭后统一返回Closed；再按StorageOperation分派；Block操作通过共享受理门解析timeline，管理库操作使用管理库事务，设置操作使用设置文件锁
         CreateBlock的TEMP只在DatabaseState.temporary创建内存集合，已存在仅比较子项名，不清空；持久Block调用blocks::create发布工作库及timeline
         ReadMessages/ReadMessageSources固定各来源工作文件视图，读取期间阻止内部写入及回档穿过操作边界
         ReplaceMessages先读取全部来源，不按sequence查历史或比较内容；TEMP在受理门内完成范围替换，持久目标在单个写事务内读取、校验范围并替换
@@ -71,6 +77,8 @@ read_record_watermarks(storage: &AgentStorage) -> Result<RecordWatermarks, Stora
 
 subscribe_record_changes(storage: &AgentStorage) -> RecordChanges
     行为：取得共享管理库record_changes的独立watch接收端，当前值为已提交的三个真实高水位；只登记进程内观察者，不修改业务数据或发ECS事件。
+        同一共享数据库句柄的所有成功写入经publish_record_changes统一推进；失败、回滚、相同配置写入、分页读取和工具输出游标读取不制造新增记录通知。
+        plugin在实际存储来源挂载后先取得接收端和当前高水位，再建立监控，通知可合并但读取位置以数据库真实sequence为准。
 
 snapshot_block(storage: &AgentStorage, name: &str, instance: Option<&str>) -> Result<(), StorageError>
     行为：
@@ -258,6 +266,10 @@ AgentStorage：Agent持久存储，公开组件
     settings_lock: Arc<Mutex<()>>--私有，协调该文件读写
     impl Component for AgentStorage
     impl Clone for AgentStorage
+    is_open(&self) -> bool
+        行为：同步检查共享连接存在且未retired；只是受理检查，不外借Connection。
+    settings_path(&self) -> &Path
+        行为：返回实际设置来源路径供plugin建立文件观察，不读取或缓存配置。
     data_dir(&self) -> &Path
         行为：返回本Agent实际绝对settings_path的父目录，不创建其他目录或缓存配置。
     same_database(&self, other: &Self) -> bool
@@ -331,7 +343,7 @@ StorageTaskError：执行失败载荷--owner、原reply、StorageError
 公开：
 ```text
 DatabaseState：私有，定义于storage/core/src/types.rs
-    connection: Mutex<Connection>--管理库连接同时作为Block串行受理门
+    connection: Mutex<Option<Connection>>--管理库连接同时作为串行受理门；None表示已物理关闭
     retired: AtomicBool
     record_changes: tokio::sync::watch::Sender<RecordWatermarks>
     block_root: PathBuf--管理库完整路径追加.blocks
@@ -471,6 +483,7 @@ StorageError：存储错误，公开类型
     impl Display + std::error::Error
 
 StorageErrorKind：错误类别，公开枚举
+    Closed | CloseFailed--共享来源关闭及关闭失败，可重复close收口
     OwnerMissing | Closed | InvalidRequest | InvalidRecord
     SchemaMismatch | LifecycleMismatch | BlockMissing | FieldMissing | InvalidRange
     ConfigInvalid | ConfigPathInvalid | ConfigTypeMismatch

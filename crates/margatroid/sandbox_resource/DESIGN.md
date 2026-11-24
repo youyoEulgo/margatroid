@@ -45,7 +45,7 @@ SandboxResourcePlugin
     limits: SandboxReadLimits
     impl Plugin
         build(self, app: &mut App)
-            行为：检查运行设施并拒绝重复安装，安装sandbox_resource_system；成功导入实际创建集合时必须取得SandboxSyncBinding。
+            行为：检查运行设施并拒绝重复安装，安装sandbox_resource_system；导入创建集合时从core的SandboxObserverFactory取得通用回调，不依赖其他plugin类型。
 ```
 
 ## 函数
@@ -64,8 +64,8 @@ read_sandbox(path: &Path, limits: &SandboxReadLimits) -> Result<SandboxInput, Sa
 ```text
 Sandboxes：沙箱路径集合，公开组件
     entries: BTreeMap<String, PathBuf>--私有alias到规范路径
-    updates: UpdateProbe<Vec<(String, PathBuf)>>--构造必需，不允许缺少同步上下文
-    new(updates: UpdateProbe<Vec<(String, PathBuf)>>) -> Self
+    updates: Arc<dyn Fn(Vec<(String, PathBuf)>) + Send + Sync>--core通用值回调，不引用client_core
+    new(updates: impl Fn(Vec<(String, PathBuf)>) + Send + Sync + 'static) -> Self
     get(&self, alias: &str) -> Option<&Path>
         行为：借用路径。
     insert(&mut self, alias: String, path: PathBuf) -> Option<PathBuf>
@@ -78,8 +78,8 @@ Sandboxes：沙箱路径集合，公开组件
 
 SelectedSandbox：当前选择，Component + Clone + Debug
     data: SelectedSandboxData--不实现DerefMut
-    updates: UpdateProbe<Option<String>>
-    new(alias: Option<String>, updates: UpdateProbe<Option<String>>) -> Self
+    updates: Arc<dyn Fn(Option<String>) + Send + Sync>--core通用值回调
+    new(alias: Option<String>, updates: impl Fn(Option<String>) + Send + Sync + 'static) -> Self
     set(&mut self, alias: Option<String>)
         行为：实际改变alias后publish；重复值不发布。
     publish_current(&self)
@@ -155,17 +155,21 @@ ImportError：校验失败载荷--ImportContext及SandboxResourceError
 
 公开：
 ```text
+SandboxChanged = Arc<dyn Fn(Vec<(String, PathBuf)>) + Send + Sync>
+SandboxSelectionChanged = Arc<dyn Fn(Option<String>) + Send + Sync>
+SandboxObserverFactory：core通用回调构造能力
+    bind: Arc<dyn Fn(Entity) -> (SandboxChanged, SandboxSelectionChanged) + Send + Sync>
+    for_owner(&self, owner: Entity) -> (SandboxChanged, SandboxSelectionChanged)
+        行为：调用注入构造函数，不依赖client_core或其他业务core。
+    impl Resource + Clone
 SandboxInput：本次沙箱策略
     policy: serde_json::Value--JSON对象
     origin: PathBuf
 
 SandboxReadLimits：读取预算
     policy_bytes: usize
-SandboxSyncBinding = ProbeFactory<Vec<(String, PathBuf)>>
-SandboxSelectionSyncBinding = ProbeFactory<Option<String>>
-    行为：按owner创建的typed入口上下文，转换为Agent公共沙箱列表或当前选择，保持实际来源scope。
 Sandboxes::publish_current(&self)
-    行为：克隆同一entries的完整alias/path后调用updates.publish，不读取策略、不发ECS事件。
+    行为：克隆同一entries的完整alias/path后调用updates通用回调，不读取策略、不发ECS事件。
 
 ```
 

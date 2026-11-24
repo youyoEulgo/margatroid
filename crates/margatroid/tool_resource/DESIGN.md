@@ -47,6 +47,9 @@ ToolResourcePlugin：工具路径登记插件
             行为：
                 检查异步设施，拒绝重复安装；
                 安装tool_resource_system。
+
+ToolResourceSyncBinding = ProbeFactory<Vec<(String, ToolEntry)>>--定义于plugin
+    行为：由plugin取得对象同步来源，将发布能力通过Tools.observe注入，不作为core构造参数。
 ```
 
 ## 函数
@@ -67,11 +70,14 @@ read_tool(path: &Path) -> Result<ToolInput, ToolResourceError>
 
 公开：
 ```text
-Tools：Agent唯一工具集合，公开组件
+Tools：通用工具集合，tool_resource_core公开组件
     entries: BTreeMap<String, ToolEntry>
     registrations: BTreeMap<String, BoundRegistration>--私有alias记录
-    updates: UpdateProbe<Vec<(String, ToolEntry)>>--构造必需，绑定当前Agent来源及公共信息发布
-    new(updates: UpdateProbe<Vec<(String, ToolEntry)>>) -> Self
+    updates: Option<Arc<dyn Fn(Vec<(String, ToolEntry)>) + Send + Sync>>--通用变更回调，不绑定对象或客户端
+    new() -> Self
+        行为：同步创建空entries、registrations及None观察回调，不要求对象、同步探针、文件读取或组件挂载。
+    observe(&mut self, changed: impl Fn(Vec<(String, ToolEntry)>) + Send + Sync + 'static)
+        行为：登记通用变更回调；对象及客户端同步由plugin装配，未登记时不影响工具集合使用。
     get(&self, alias: &str) -> Option<&ToolEntry>
         行为：
             return entries.get(alias)
@@ -193,10 +199,8 @@ ToolInput：本次工具材料
     input_schema: serde_json::Value
     program: String
     origin: PathBuf
-ToolResourceSyncBinding = ProbeFactory<Vec<(String, ToolEntry)>>
-    行为：compose/DTO注入按owner创建的typed回调，转换为AgentPublicUpdate::Tools；回调仅捕获当前来源scope。
 Tools::publish_current(&self)
-    行为：从同一entries克隆完整公开记录后调用updates.publish，交付Agent公共视图，不发事件或借用World。
+    行为：从同一entries克隆完整公开记录后调用已登记的updates回调；None时不发布，不影响集合操作。core不依赖client_core、不发事件或借用World。
 
 RegisterToolsRequest：Serialize + Deserialize，deny_unknown_fields
     agent: Option<String>

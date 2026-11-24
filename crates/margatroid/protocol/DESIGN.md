@@ -30,7 +30,7 @@ valid_request_id(id: &str) -> bool
     行为：检查非空白、无控制字符及512字节上限。
 
 validate_server_value(value: &serde_json::Value) -> Result<(), ProtocolError>
-    行为：检查50种严格wire type、回执成功/失败互斥、查询载荷、分页游标presence、nullable字段、记录顺序及完整消息序号关联。
+    行为：检查当前目录46种严格wire type、回执成功/失败互斥、查询载荷、分页游标presence、nullable字段、记录顺序及完整消息序号关联。
         诊断details/context按日志报告处理，不按内部AgentMessage递归解释原错误快照。
         agent.ui.res成功必须出现可空ui，失败省略ui并提供error；agent.ui.sync始终出现ui及error，error非空时ui为null。
 
@@ -41,7 +41,7 @@ validate_ui_bundle(value: &AgentUiBundleDto) -> Result<(), ProtocolError>
     行为：校验sha256内容摘要格式、entry=index.html、files路径唯一且升序、相对路径段、媒体类型及标准base64；预算按实际网络信封UTF-8计算。
 
 logical_name / validate_path / validate_target / validate_address / validate_image
-    行为：检查纯网络值形状、目标kind、路径及标准媒体编码，不依赖领域core。
+    行为：检查纯网络值形状、绝对节点路径及文件资源路径和标准媒体编码；Workspace/Agent类型由DTO在World验证，不从地址kind猜测，不依赖领域core。
 ```
 
 # types pub
@@ -56,18 +56,16 @@ AgentCreatorDto { address: AddressDto, task_id: String }
 ModelConfigUpdateDto { content: String }--无路径参数；UTF-8最多1MiB
     行为：model.config.res成功必有content，失败省略；sync必有content/error且不带id，可选值均nullable，content为文本时error必须为null；update.result只有success/error，沿原请求id关联。
 
-ClientMessage：20种入站枚举，每个variant均为type、id和message信封
+ClientMessage：请求入站枚举，每个variant均为type、id和message信封
     ConnectionRegister { id: String, message: RegisterConnectionDto }
     ModelConfigReq { id: String, message: EmptyDto }
     ModelConfigUpdate { id: String, message: ModelConfigUpdateDto }
     WorkspaceReq { id: String, message: EmptyDto }
-    WorkspaceStart { id: String, message: WorkspaceTargetDto }
-    WorkspaceStop { id: String, message: WorkspaceTargetDto }
-    WorkspaceRestart { id: String, message: WorkspaceTargetDto }
-    WorkspaceCreate { id:String,message:WorkspaceWriteDto }
-    WorkspaceUpdate { id:String,message:WorkspaceWriteDto }
-    WorkspaceRename { id:String,message:WorkspaceRenameDto }
+    WorkspaceCreate { id:String,message:WorkspaceCreateDto }
     WorkspaceDelete { id:String,message:WorkspaceTargetDto }
+    AgentStart { id: String, message: AgentStartInputDto }
+    AgentStop { id: String, message: AgentTargetDto }
+    AgentArchive { id: String, message: AgentArchiveInputDto }
     AgentReq { id: String, message: EmptyDto }
     AgentUiReq { id: String, message: AgentTargetDto }
     AgentTurnReq { id: String, message: AgentTargetDto }
@@ -78,20 +76,18 @@ ClientMessage：20种入站枚举，每个variant均为type、id和message信封
     AgentMclReq { id: String, message: AgentRecordsQueryDto }
     MclExecute { id: String, message: MclExecuteDto }
 
-ServerMessage：30种出站枚举，type之外的字段位于顶层，不包message
+ServerMessage：响应及同步出站枚举，type之外的字段位于顶层，不包message
     ConnectionRegisterResult { id: String, success: bool, client: Option<ClientInfoDto>, error: Option<ProtocolErrorDto> }
     ModelConfigRes { id: String, success: bool, content: Option<String>, error: Option<ProtocolErrorDto> }
     ModelConfigSync { content: Option<String>, error: Option<ProtocolErrorDto> }
     ModelConfigUpdateResult { id: String, success: bool, error: Option<ProtocolErrorDto> }
     WorkspaceRes { id: String, success: bool, workspaces: Option<Vec<WorkspaceInfoDto>>, error: Option<ProtocolErrorDto> }
     WorkspaceSync { workspaces: Vec<WorkspaceInfoDto> }
-    WorkspaceStartResult { id: String, success: bool, error: Option<ProtocolErrorDto> }
-    WorkspaceStopResult { id: String, success: bool, error: Option<ProtocolErrorDto> }
-    WorkspaceRestartResult { id: String, success: bool, error: Option<ProtocolErrorDto> }
     WorkspaceCreateResult { id:String,success:bool,error:Option<ProtocolErrorDto> }
-    WorkspaceUpdateResult { id:String,success:bool,error:Option<ProtocolErrorDto> }
-    WorkspaceRenameResult { id:String,success:bool,error:Option<ProtocolErrorDto> }
     WorkspaceDeleteResult { id:String,success:bool,error:Option<ProtocolErrorDto> }
+    AgentStartResult { id: String, success: bool, error: Option<ProtocolErrorDto> }
+    AgentStopResult { id: String, success: bool, error: Option<ProtocolErrorDto> }
+    AgentArchiveResult { id: String, success: bool, error: Option<ProtocolErrorDto> }
     AgentRes { id: String, success: bool, agents: Option<Vec<AgentStateDto>>, error: Option<ProtocolErrorDto> }
     AgentSync { agents: Vec<AgentStateDto> }
     AgentUiRes { id: String, success: bool, address: AddressDto, ui: Option<AgentUiBundleDto>, error: Option<ProtocolErrorDto> }
@@ -117,6 +113,7 @@ ServerMessage：30种出站枚举，type之外的字段位于顶层，不包mess
     impl Deserialize
         行为：先读取JSON并validate_server_value，再反序列化严格ServerWire转换为公开variant，不接受旧type或额外字段。
     行为：
+        agent.start的成功是Driver工具调用成功返回，不代表任务结束或Agent已ready；stop须等待实际任务清理，archive须等待目录及数据库完成。
         command result始终回复原id；状态类成功仅success=true，失败success=false及error，不重复状态或目标
         连接注册成功必须提供client；MCL成功的非Unit值提供data，Unit省略data；失败省略成功载荷
         res成功提供对应集合或state，合法空集合仍返回；失败不提供集合/state/分页游标，不能用空数组冒充失败
@@ -136,13 +133,18 @@ ClientInfoDto
     address: AddressDto
     client_type: String
 WorkspaceTargetDto
-    address: AddressDto--kind=workspace；生命周期/删除都不接收path
-WorkspaceWriteDto
+    address: AddressDto--完整Workspace节点路径，通过World组件校验类型
+WorkspaceCreateDto
     address: AddressDto
-    definition: WorkspaceDefinitionDto--完整替换；绝对project_root和成员home_root
-WorkspaceRenameDto
-    address: AddressDto
-    new_address: AddressDto--目标必须不存在，不接受覆盖/合并
+    alias: String
+    project_root: String--绝对目录
+AgentStartInputDto：以mode为判别字段
+    Existing { workspace: AddressDto, node_name: String }
+    New { workspace: AddressDto, tool_path: String, arguments: serde_json::Value }
+    行为：mode分别为existing/new；普通节点名及alias属于Driver arguments，不重复放在New顶层；工具参数必须为对象。
+AgentArchiveInputDto
+    workspace: AddressDto
+    node_name: String--Workspace内唯一普通节点名
 AgentTargetDto
     address: AddressDto
 AgentTurnAbortDto
@@ -165,24 +167,26 @@ MclExecuteDto
 
 ```text
 WorkspaceInfoDto
-    path: String
-    definition: WorkspaceDefinitionDto
-    status: String
-    address: Option<AddressDto>
-    error: Option<ProtocolErrorDto>
-WorkspaceDefinitionDto
+    address: AddressDto
+    alias: String
     project_root: String
-    agents: Vec<WorkspaceAgentDefinitionDto>
-WorkspaceAgentDefinitionDto
-    name: String
-    driver: String
-    home_root: String
-    行为：仅配置成员定义，不附带成员active、运行地址、status或member_failures
+    status: String--running/deleting/error，来自实际Workspace组件
+    agents: Vec<WorkspaceAgentInfoDto>--数据库确认提交的登记，不冒充运行实体
+WorkspaceAgentInfoDto
+    id: String
+    parent_node: AddressDto
+    node_name: Option<String>
+    alias: Option<String>
+    category: String--normal/temporary/archived
+    tool_path: String
+    tool_arguments: serde_json::Value
+    previous_node_name: Option<String>
+    previous_alias: Option<String>
 AgentStateDto
-    行为：status严格为starting/running/error/stopping，turn通过独立消息提供，不保留旧ready/working/restarting/failed枚举。
+    行为：status严格为starting/running/closing，turn通过独立消息提供，不保留旧ready/working/restarting/failed枚举。
     address: AddressDto
     workspace: AddressDto
-    creator: AgentCreatorDto--必有非空，首次公开前已从真实任务取得
+    creator: AgentCreatorDto--取Agent.parent实际地址及task_id，首次公开前绑定真实任务
     status: String
     tools: Vec<AgentToolDto>
     sandboxes: Vec<AgentSandboxDto>

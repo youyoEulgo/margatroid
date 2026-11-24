@@ -129,13 +129,12 @@ DriverUiError
 # 持有关系
 
 ```text
-Workspace程序准备闭包
-├── 定义携带的Lua程序定位字符串
-├── address::resolve_file返回的临时PathBuf
-└── agent_driver_core::read_driver返回的AgentDriverInput
-    └── program与origin
+创建Agent的注入方法
+├── Driver显式传入的config_path与ui_path
+├── 配置缺失时调用read_initial_settings取得原文
+└── 文件准备并连接后发送StartAgent<AgentStorage>
 
-DTO直接监控AgentResources.parameters.ui_path
+SourcesInstalled通知携带实际ui_path，由DTO绑定通用UI观察回调
 ├── DriverUiWatch
 │   └── Arc<DriverUiShared>
 │       ├── 稳定完整资源集合或错误
