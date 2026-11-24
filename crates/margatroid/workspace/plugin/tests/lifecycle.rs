@@ -1,393 +1,723 @@
-use address::Address;
-use agent_core::{AgentError, AgentErrorKind, AgentStartParameters, AgentState, StopAgent};
+use address::{Address, WorldAddressExt};
+use agent_core::Agent;
 use app_runtime_plugin::RuntimePlugin;
 use async_runtime_plugin::AsyncRuntimePlugin;
-use closure_plugin::{AppClosureExt, ClosurePlugin};
-use core_plugin::{App, Resource, World};
+use closure_plugin::{AppClosureExt, ClosurePlugin, WorldClosureExt};
+use core_plugin::{App, Entity, Resource, World};
+use serde_json::json;
 use std::{
-    collections::BTreeMap,
+    fs,
     path::{Path, PathBuf},
+    sync::{
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Arc, Mutex,
+    },
     time::{Duration, Instant},
 };
-use tool_core::{ToolExecutionLimits, ToolTaskHandle, ToolTasks};
+use tokio::sync::{oneshot, watch};
+use tool_core::{
+    TaskFinish, ToolError, ToolErrorKind, ToolExecuteRequest, ToolExecuteResponse,
+    ToolExecutionLimits, ToolTaskHandle, ToolTasks,
+};
 use workspace_core::*;
 use workspace_plugin::WorkspacePlugin;
 
-#[test]
-fn legacy_agents_map_starts_with_original_state_paths_and_ignores_hidden_backups() {
-    let root = tempfile::tempdir().unwrap();
-    let path = file(root.path(), "demo");
-    let source = "project_root: /projects/demo\nagents:\n  coder:\n    driver: margatroid/coder:dev\n  reviewer:\n    driver: margatroid/reviewer:dev\n";
-    std::fs::write(&path, source).unwrap();
-    for hidden in [".operations", ".trash", ".backup"] {
-        let directory = root.path().join(hidden);
-        std::fs::create_dir_all(&directory).unwrap();
-        std::fs::write(directory.join("workspace.yaml"), "broken: [").unwrap();
-    }
-    let database = path.parent().unwrap().join("agents/coder/state.sqlite");
-    std::fs::create_dir_all(database.parent().unwrap()).unwrap();
-    std::fs::write(&database, b"existing state must stay here").unwrap();
-    let mut app = app(WorkspacePlugin::open(root.path())
-        .unwrap()
-        .with_program_root(root.path().join("agent-drivers")));
-    assert_eq!(app.world().workspace_definitions().unwrap().list().len(), 1);
-    let output = start(&mut app, &path, "start-legacy");
-    assert_eq!(output.members.len(), 2);
-    let starts = &app.world().get_resource::<FakeAgents>().unwrap().starts;
-    assert_eq!(starts[0].0, "coder");
-    assert!(starts[0]
-        .1
-        .initial_settings_path
-        .ends_with("margatroid/coder/dev/setting.toml"));
-    assert_eq!(starts[0].1.database_path, database);
-    assert_eq!(
-        starts[0].1.settings_path,
-        database.parent().unwrap().join("setting.toml")
-    );
-    assert_eq!(
-        std::fs::read(&database).unwrap(),
-        b"existing state must stay here"
-    );
-    assert_eq!(std::fs::read_to_string(&path).unwrap(), source);
-    app.world().emit_event(StartWorkspace {
-        id: "hidden".into(),
-        reply: request_reply("hidden"),
-        path: root.path().join(".trash/workspace.yaml"),
-    });
-    assert_eq!(
-        wait(&mut app, "hidden").unwrap_err().kind,
-        WorkspaceErrorKind::InvalidRequest
-    );
-    stop(&mut app, output.workspace, "stop-legacy");
-    for hidden in [".operations", ".trash", ".backup"] {
-        assert_eq!(
-            std::fs::read_to_string(root.path().join(hidden).join("workspace.yaml")).unwrap(),
-            "broken: ["
-        );
-    }
-}
-#[test]
-fn legacy_file_is_read_fresh_and_mutually_exclusive_forms_never_start_from_cached_definition() {
-    let root = tempfile::tempdir().unwrap();
-    let path = file(root.path(), "demo");
-    std::fs::write(
-        &path,
-        "project_root: /project\nagents: {coder: {driver: margatroid/coder:dev}}\n",
-    )
-    .unwrap();
-    let mut app = app(WorkspacePlugin::open(root.path())
-        .unwrap()
-        .with_program_root(root.path().join("agent-drivers")));
-    let invalid =
-        "project_root: /project\nagents: {coder: {driver: margatroid/coder:dev}}\nmembers: []\n";
-    std::fs::write(&path, invalid).unwrap();
-    app.world().emit_event(StartWorkspace {
-        id: "changed".into(),
-        reply: request_reply("changed"),
-        path: path.clone(),
-    });
-    assert_eq!(
-        wait(&mut app, "changed").unwrap_err().kind,
-        WorkspaceErrorKind::InvalidDefinition
-    );
-    assert!(app
-        .world()
-        .get_resource::<FakeAgents>()
-        .unwrap()
-        .starts
-        .is_empty());
-    assert!(app.world().query_with::<Workspace>().result().is_empty());
-    assert_eq!(
-        app.world()
-            .workspace_definitions()
-            .unwrap()
-            .get(&path)
-            .unwrap()
-            .members[0]
-            .driver,
-        "driver:margatroid/coder:dev"
-    );
-    assert_eq!(std::fs::read_to_string(path).unwrap(), invalid);
-}
-
 #[derive(Default)]
-struct FakeAgents {
-    starts: Vec<(String, AgentStartParameters)>,
-    stops: usize,
-    fail_stop: bool,
-    close_stop_reply: bool,
-    results: BTreeMap<String, Result<WorkspaceOperationOutput, WorkspaceError>>,
-}
-impl Resource for FakeAgents {}
-fn fake_agents(world: &mut World) {
-    let starts = world
-        .event_reader::<lua_runtime_core::StartDriverLuaVm>()
+struct Captured(Vec<ToolExecuteRequest>);
+impl Resource for Captured {}
+fn capture_tools(world: &mut World) {
+    let events = world
+        .event_reader::<ToolExecuteRequest>()
         .into_iter()
         .cloned()
         .collect::<Vec<_>>();
-    for request in starts {
-        let Some(reply) = request.reply.lock().unwrap().take() else {
-            continue;
-        };
-        let execution = world
-            .get_component::<lua_runtime_core::WorkspaceLuaTask>(request.owner)
-            .unwrap();
-        let name = execution.name.clone();
-        let workspace = execution.workspace;
-        let home = world
-            .get_component::<Workspace>(workspace)
-            .unwrap()
-            .definition_path
-            .parent()
-            .unwrap()
-            .join("agents")
-            .join(&name);
-        let parameters = AgentStartParameters {
-            initial_settings_path: request
-                .program
-                .origin
-                .parent()
-                .unwrap()
-                .join("setting.toml"),
-            ui_path: request.program.origin.parent().unwrap().join("ui"),
-            project_root: world
-                .get_component::<Workspace>(workspace)
-                .unwrap()
-                .project_root
-                .clone(),
-            home_root: home.clone(),
-            database_path: home.join("state.sqlite"),
-            settings_path: home.join("setting.toml"),
-        };
-        world
-            .get_resource_mut::<FakeAgents>()
-            .unwrap()
-            .starts
-            .push((name.clone(), parameters));
-        if name == "bad" {
-            let _ = reply.send(Err(lua_runtime_core::LuaRuntimeError::new(
-                lua_runtime_core::LuaRuntimeErrorKind::ExecutionFailed,
-                "fake Lua task failure",
-            )));
-            continue;
-        }
-        let entity = world.spawn();
-        world.insert_component(
-            entity,
-            agent_core::Agent::new(
-                name,
-                workspace,
-                AgentState::Running,
-                None,
-                crate::test_agent_context(),
-            ),
-        );
-        world.insert_component(entity, test_tasks());
-        let _ = reply.send(Ok(lua_runtime_core::DriverLuaVmInstance {
-            owner: request.owner,
-            start_id: "test-task".into(),
-        }));
-    }
-    let stops: Vec<_> = world
-        .event_reader::<StopAgent>()
-        .into_iter()
-        .cloned()
-        .collect();
-    for request in stops {
-        let Some(reply) = request.reply.lock().unwrap().take() else {
-            continue;
-        };
-        let state = world.get_resource_mut::<FakeAgents>().unwrap();
-        state.stops += 1;
-        if state.close_stop_reply {
-            drop(reply);
-            continue;
-        }
-        if state.fail_stop {
-            let _ = reply.send(Err(AgentError::new(
-                AgentErrorKind::StopFailed,
-                "fake unconfirmed cleanup",
-            )));
-        } else {
-            world.despawn(request.agent);
-            let _ = reply.send(Ok(request.agent));
-        }
-    }
+    world
+        .get_resource_mut::<Captured>()
+        .unwrap()
+        .0
+        .extend(events);
 }
-fn app(plugin: WorkspacePlugin) -> App {
+fn app(root: &Path) -> App {
     let mut app = App::new();
-    app.world_mut()
-        .insert_resource(workspace_core::WorkspaceUpdateContext::new(|_, _| {}));
     app.add_plugin(RuntimePlugin::default())
         .add_plugin(ClosurePlugin)
         .add_closure_system(RuntimePlugin::UPDATE)
-        .add_plugin(AsyncRuntimePlugin)
-        .add_plugin(plugin)
-        .add_system(RuntimePlugin::UPDATE, fake_agents);
-    let definitions = app.world().workspace_definitions().unwrap().clone();
-    let source = definitions.source().unwrap();
-    let root = if source.is_file() {
-        source.parent().unwrap()
-    } else {
-        source
-    };
-    for (_, definition) in definitions.list() {
-        for member in definition.members {
-            let parsed = address::ParsedAddress::parse(&member.driver).unwrap();
-            let directory = root
-                .join("agent-drivers")
-                .join(parsed.scope)
-                .join(parsed.name)
-                .join(parsed.tag);
-            std::fs::create_dir_all(&directory).unwrap();
-            std::fs::write(
-                directory.join("base.lua"),
-                "function configure()return {timeout_ms=0}end function execute()end",
-            )
-            .unwrap();
-        }
-    }
-    app.world_mut().insert_resource(FakeAgents::default());
+        .add_plugin(AsyncRuntimePlugin);
+    app.world_mut().insert_resource(Captured::default());
+    app.add_plugin(WorkspacePlugin { root: root.into() })
+        .add_system(RuntimePlugin::UPDATE, capture_tools);
     app
 }
-fn wait(app: &mut App, id: &str) -> Result<WorkspaceOperationOutput, WorkspaceError> {
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
+fn until(app: &mut App, mut condition: impl FnMut(&App) -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while !condition(app) {
         app.tick();
-        if let Some(result) = poll_reply(id) {
-            return result;
-        }
-        assert!(Instant::now() < deadline, "workspace result {id} timed out");
         std::thread::yield_now();
+        assert!(Instant::now() < deadline, "Workspace test timed out");
     }
 }
-fn file(root: &Path, name: &str) -> PathBuf {
-    let directory = root.join("margatroid").join(name).join("dev");
-    std::fs::create_dir_all(&directory).unwrap();
-    directory.join("workspace.yaml")
+fn receive<T>(app: &mut App, rx: &mut oneshot::Receiver<T>) -> T {
+    let mut value = None;
+    until(app, |_| match rx.try_recv() {
+        Ok(v) => {
+            value = Some(v);
+            true
+        }
+        Err(oneshot::error::TryRecvError::Empty) => false,
+        Err(e) => panic!("reply lost: {e}"),
+    });
+    value.unwrap()
 }
-fn write(path: &Path, _name: &str, members: &[&str], project: &str) {
-    let definition = WorkspaceDefinition {
-        project_root: project.into(),
-        members: members
-            .iter()
-            .map(|name| WorkspaceMemberDefinition {
-                name: (*name).into(),
-                driver: format!("drivers/{name}:dev"),
-                home_root: format!("home/{name}").into(),
-            })
-            .collect(),
-    };
-    for member in &definition.members {
-        let locator = if member.driver.starts_with("driver:") {
-            member.driver.clone()
-        } else {
-            format!("driver:{}", member.driver)
-        };
-        let parsed = address::ParsedAddress::parse(&locator).unwrap();
-        let directory = path
-            .ancestors()
-            .nth(4)
-            .unwrap()
-            .join("agent-drivers")
-            .join(parsed.scope)
-            .join(parsed.name)
-            .join(parsed.tag);
-        std::fs::create_dir_all(&directory).unwrap();
-        std::fs::write(
-            directory.join("base.lua"),
-            "function configure()return {timeout_ms=0}end function execute()end",
+fn reply<T>() -> (
+    WorkspaceReply<T>,
+    oneshot::Receiver<Result<T, WorkspaceError>>,
+) {
+    let (tx, rx) = oneshot::channel();
+    (Arc::new(Mutex::new(Some(tx))), rx)
+}
+fn tool_reply() -> (
+    WorkspaceAgentReply<ToolExecuteResponse, ToolError>,
+    oneshot::Receiver<Result<ToolExecuteResponse, ToolError>>,
+) {
+    let (tx, rx) = oneshot::channel();
+    (Arc::new(Mutex::new(Some(tx))), rx)
+}
+fn disk_workspace(root: &Path, name: &str, project: &Path) -> WorkspaceDatabase {
+    let directory = root.join(name);
+    for category in ["normal", "temporary", "archived"] {
+        fs::create_dir_all(directory.join("agents").join(category)).unwrap();
+    }
+    WorkspaceDatabase::create(
+        directory.join("workspace.sqlite"),
+        WorkspaceMetadata {
+            address: format!("/{name}"),
+            alias: name.into(),
+            project_root: project.into(),
+        },
+    )
+    .unwrap()
+}
+fn loaded(app: &mut App, node: &str) -> Entity {
+    until(app, |app| app.world().entity_by_address(node).is_ok());
+    app.world().entity_by_address(node).unwrap()
+}
+fn registered(database: &WorkspaceDatabase, node: &str, parent: &str) -> WorkspaceAgent {
+    let operation = database.try_operation(node).unwrap();
+    let record = database
+        .prepare_agent(
+            &operation,
+            parent.into(),
+            Some(node.into()),
+            Some(node.into()),
+            "/tools/driver/tool.toml".into(),
+            json!({"node_name":node,"path":"src"}),
         )
         .unwrap();
-    }
-    std::fs::write(path, serde_yaml::to_string(&definition).unwrap()).unwrap();
+    fs::create_dir(database.agent_directory(&record).unwrap()).unwrap();
+    fs::write(
+        database.agent_directory(&record).unwrap().join("state"),
+        "preserve",
+    )
+    .unwrap();
+    database.commit_agent(&operation, record).unwrap()
 }
-fn start(app: &mut App, path: &Path, id: &str) -> WorkspaceOperationOutput {
-    app.world().emit_event(StartWorkspace {
-        id: id.into(),
-        reply: request_reply(id),
-        path: path.into(),
+fn install_task(
+    tasks: &ToolTasks,
+    id: &str,
+    gate: watch::Receiver<bool>,
+    calls: Arc<AtomicUsize>,
+    fail: Arc<AtomicBool>,
+) -> ToolTaskHandle {
+    let finish: TaskFinish = Arc::new(move |handle| {
+        calls.fetch_add(1, Ordering::SeqCst);
+        let mut gate = gate.clone();
+        let fail = fail.clone();
+        Box::pin(async move {
+            while !*gate.borrow_and_update() {
+                if gate.changed().await.is_err() {
+                    return Err(ToolError::new(
+                        ToolErrorKind::CleanupFailed,
+                        "test gate closed",
+                    ));
+                }
+            }
+            if fail.load(Ordering::SeqCst) {
+                return Err(ToolError::new(
+                    ToolErrorKind::CleanupFailed,
+                    "injected cleanup failure",
+                ));
+            }
+            handle.finish_children().await?;
+            handle.retry_cleanups().await?;
+            Ok(())
+        })
     });
-    wait(app, id).unwrap()
+    let (tx, _rx) = oneshot::channel();
+    let (handle, _input) = ToolTaskHandle::new(
+        &ToolExecutionLimits::default(),
+        format!("call-{id}"),
+        "driver".into(),
+        tx,
+        tasks.update_context(),
+        None,
+        finish,
+    )
+    .unwrap();
+    tasks.register(id.into(), handle.clone()).unwrap();
+    handle
 }
-fn stop(app: &mut App, workspace: core_plugin::Entity, id: &str) -> WorkspaceOperationOutput {
-    app.world().emit_event(StopWorkspace {
-        id: id.into(),
-        reply: request_reply(id),
-        workspace,
-    });
-    wait(app, id).unwrap()
-}
-fn manual_join(app: &App, workspace: core_plugin::Entity) {
-    let close = app
-        .world()
-        .get_component::<WorkspaceExecutor>(workspace)
-        .unwrap()
-        .close
-        .clone();
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap()
-        .block_on(close.close_and_join())
-        .unwrap();
+fn bind_fake_agent(
+    app: &mut App,
+    workspace: Entity,
+    parent: Entity,
+    task: &ToolTaskHandle,
+    id: &str,
+    node: &str,
+) -> Entity {
+    let entity = app.world_mut().spawn();
+    app.world_mut()
+        .insert_component(entity, Address::new(node).unwrap());
+    app.world_mut().insert_component(
+        entity,
+        Agent::new(workspace, parent, id.into(), "/project".into()),
+    );
+    let sender = app.world().closure_sender(RuntimePlugin::UPDATE);
+    task.bind_child(
+        entity,
+        Arc::new(move || {
+            let sender = sender.clone();
+            Box::pin(async move {
+                let (tx, rx) = oneshot::channel();
+                sender.send(move |world| {
+                    world.despawn(entity);
+                    let _ = tx.send(());
+                });
+                rx.await
+                    .map_err(|e| ToolError::new(ToolErrorKind::CleanupFailed, e.to_string()))
+            })
+        }),
+    )
+    .unwrap();
+    entity
 }
 #[test]
-fn empty_workspace_creates_address_and_real_executor_then_stops() {
+fn startup_loads_database_once_and_skips_invalid_entries() {
     let root = tempfile::tempdir().unwrap();
-    let path = file(root.path(), "empty");
-    write(&path, "Empty display", &[], "project");
-    let mut app = app(WorkspacePlugin::open(root.path())
-        .unwrap()
-        .with_program_root(root.path().join("agent-drivers")));
-    assert_eq!(app.world().entity_count(), 0);
-    assert_eq!(app.world().workspace_definitions().unwrap().list().len(), 1);
-    let output = start(&mut app, &path, "start");
-    assert!(output.members.is_empty());
-    assert_eq!(
-        *app.world().workspace_state(output.workspace).unwrap(),
-        WorkspaceState::Running
-    );
+    let project = tempfile::tempdir().unwrap();
+    let db = disk_workspace(root.path(), "demo", project.path());
+    db.close().unwrap();
+    fs::create_dir(root.path().join("bad")).unwrap();
+    fs::write(
+        root.path().join("bad/workspace.yaml"),
+        "old YAML is not a database",
+    )
+    .unwrap();
+    let mut app = app(root.path());
+    let entity = loaded(&mut app, "/demo");
     assert_eq!(
         app.world()
-            .get_component::<Address>(output.workspace)
+            .get_component::<Workspace>(entity)
             .unwrap()
-            .as_str(),
-        "workspace:margatroid/empty:dev"
+            .state,
+        WorkspaceState::Running
     );
-    let close = app
+    assert!(app
         .world()
-        .get_component::<WorkspaceExecutor>(output.workspace)
+        .get_component::<ToolTasks>(entity)
         .unwrap()
-        .close
-        .clone();
-    stop(&mut app, output.workspace, "stop");
-    assert!(close.is_joined());
-    assert!(!app.world().is_alive(output.workspace));
+        .is_accepting());
+    assert!(app.world().get_resource::<Captured>().unwrap().0.is_empty());
+    let later = disk_workspace(root.path(), "later", project.path());
+    later.close().unwrap();
+    for _ in 0..50 {
+        app.tick();
+        std::thread::yield_now();
+    }
+    assert!(app.world().entity_by_address("/later").is_err());
+    assert!(root.path().join("bad/workspace.yaml").exists());
 }
 #[test]
-fn start_uses_fresh_file_updates_shared_cache_and_preserves_existing_state_paths() {
+fn create_prepares_database_then_starts_entity_and_replies_original_once() {
     let root = tempfile::tempdir().unwrap();
-    let path = file(root.path(), "demo");
-    write(&path, "old", &[], "old-project");
-    let plugin = WorkspacePlugin::open(root.path())
+    let project = tempfile::tempdir().unwrap();
+    let mut app = app(root.path());
+    let observed = Arc::new(Mutex::new(vec![]));
+    let copy = observed.clone();
+    app.world_mut()
+        .insert_resource(WorkspaceUpdateContext::new(move |_, _, kind| {
+            copy.lock().unwrap().push(kind)
+        }));
+    let (reply, mut rx) = reply();
+    let event = CreateWorkspace {
+        address: "/created".into(),
+        alias: "Created".into(),
+        project_root: project.path().into(),
+        reply: reply.clone(),
+    };
+    app.world().emit_event(event.clone());
+    app.world().emit_event(event);
+    let entity = receive(&mut app, &mut rx).unwrap();
+    assert!(reply.lock().unwrap().is_none());
+    let workspace = app.world().get_component::<Workspace>(entity).unwrap();
+    assert_eq!(workspace.alias, "Created");
+    assert!(workspace.database.is_open());
+    assert_eq!(workspace.database.metadata().address, "/created");
+    assert_eq!(
+        workspace.database.path(),
+        root.path().join("created/workspace.sqlite")
+    );
+    assert!(workspace.database.list_agents().unwrap().is_empty());
+    assert_eq!(
+        *observed.lock().unwrap(),
+        vec![WorkspaceUpdateKind::Installed]
+    );
+    assert_eq!(app.world().query_with::<Workspace>().result().len(), 1);
+    for category in ["normal", "temporary", "archived"] {
+        assert!(root.path().join("created/agents").join(category).is_dir());
+    }
+}
+#[test]
+fn duplicate_start_reuses_entity_without_closing_shared_connection() {
+    let root = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let original = disk_workspace(root.path(), "demo", project.path());
+    let mut app = app(root.path());
+    let entity = loaded(&mut app, "/demo");
+    let db = app
+        .world()
+        .get_component::<Workspace>(entity)
         .unwrap()
-        .with_program_root(root.path().join("agent-drivers"));
-    let mut app = app(plugin);
-    let definitions = app.world().workspace_definitions().unwrap().clone();
-    let database = path.parent().unwrap().join("agents/good/state.sqlite");
-    std::fs::create_dir_all(database.parent().unwrap()).unwrap();
-    std::fs::write(&database, b"existing SQLite bytes stay untouched").unwrap();
-    write(&path, "fresh", &["good", "bad"], "new-project");
+        .database
+        .clone();
+    for shared in [true, false] {
+        let connection = if shared {
+            db.clone()
+        } else {
+            WorkspaceDatabase::open(db.path()).unwrap()
+        };
+        let (reply, mut rx) = reply();
+        app.world().emit_event(StartWorkspace {
+            address: "/demo".into(),
+            alias: "demo".into(),
+            project_root: project.path().into(),
+            database: connection.clone(),
+            reply: Some(reply),
+        });
+        assert_eq!(receive(&mut app, &mut rx).unwrap(), entity);
+        assert_eq!(connection.is_open(), shared);
+        assert!(db.is_open());
+    }
+    let (reply, mut rx) = reply();
     app.world().emit_event(StartWorkspace {
-        id: "fresh-start".into(),
-        path: path.clone(),
-        reply: request_reply("fresh-start"),
+        address: "/demo".into(),
+        alias: "wrong".into(),
+        project_root: project.path().into(),
+        database: db.clone(),
+        reply: Some(reply),
     });
-    let failure = wait(&mut app, "fresh-start").unwrap_err();
-    assert_eq!(failure.kind, WorkspaceErrorKind::MemberFailed);
-    assert!(failure.message.contains("bad"));
-    let workspace = app.world().query_with::<Workspace>().result()[0];
+    assert!(receive(&mut app, &mut rx).is_err());
+    assert!(db.is_open());
+    original.close().unwrap();
+}
+#[test]
+fn new_and_existing_start_forward_the_exact_tool_reply_and_arguments() {
+    let root = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let db = disk_workspace(root.path(), "demo", project.path());
+    db.close().unwrap();
+    let mut app = app(root.path());
+    let entity = loaded(&mut app, "/demo");
+    let database = app
+        .world()
+        .get_component::<Workspace>(entity)
+        .unwrap()
+        .database
+        .clone();
+    let record = registered(&database, "coder", "/demo");
+    for existing in [false, true] {
+        let (sender, mut rx) = tool_reply();
+        let args = if existing {
+            record.tool_arguments.clone()
+        } else {
+            json!({"node_name":"new-node","alias":"New","path":"custom"})
+        };
+        let request = if existing {
+            StartWorkspaceAgent::Existing {
+                workspace: entity,
+                node_name: "coder".into(),
+                reply: sender.clone(),
+            }
+        } else {
+            StartWorkspaceAgent::New {
+                workspace: entity,
+                tool_path: "/tools/new/tool.toml".into(),
+                arguments: args.clone(),
+                reply: sender.clone(),
+            }
+        };
+        app.world().emit_event(request);
+        until(&mut app, |app| {
+            !app.world().get_resource::<Captured>().unwrap().0.is_empty()
+        });
+        let request = app
+            .world_mut()
+            .get_resource_mut::<Captured>()
+            .unwrap()
+            .0
+            .remove(0);
+        match request {
+            ToolExecuteRequest::Path {
+                initiator,
+                path,
+                arguments,
+                reply,
+            } => {
+                assert_eq!(initiator, entity);
+                assert_eq!(arguments, args);
+                assert_eq!(
+                    path,
+                    if existing {
+                        record.tool_path.clone()
+                    } else {
+                        PathBuf::from("/tools/new/tool.toml")
+                    }
+                );
+                assert!(Arc::ptr_eq(&reply, &sender));
+                reply
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .unwrap()
+                    .send(Ok(ToolExecuteResponse {
+                        call_id: "task".into(),
+                        alias: "driver".into(),
+                        content: "started".into(),
+                        images: vec![],
+                        failed: false,
+                    }))
+                    .unwrap();
+            }
+            _ => panic!("registered request used"),
+        };
+        assert_eq!(rx.try_recv().unwrap().unwrap().content, "started");
+    }
+    assert_eq!(database.list_agents().unwrap(), vec![record]);
+    assert!(!root.path().join("demo/agents/normal/new-node").exists());
+}
+#[test]
+fn new_rejects_existing_node_and_missing_parent_existing_is_rejected() {
+    let root = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let db = disk_workspace(root.path(), "demo", project.path());
+    registered(&db, "coder", "/demo");
+    registered(&db, "child", "/demo/absent");
+    db.close().unwrap();
+    let mut app = app(root.path());
+    let entity = loaded(&mut app, "/demo");
+    let (sender, mut rx) = tool_reply();
+    app.world().emit_event(StartWorkspaceAgent::New {
+        workspace: entity,
+        tool_path: "/tools/other".into(),
+        arguments: json!({"node_name":"coder"}),
+        reply: sender,
+    });
+    assert!(receive(&mut app, &mut rx).is_err());
+    let (sender, mut rx) = tool_reply();
+    app.world().emit_event(StartWorkspaceAgent::Existing {
+        workspace: entity,
+        node_name: "child".into(),
+        reply: sender,
+    });
+    assert!(receive(&mut app, &mut rx).is_err());
+    assert!(app.world().get_resource::<Captured>().unwrap().0.is_empty());
+}
+#[test]
+fn existing_child_start_uses_recorded_parent_entity() {
+    let root = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let db = disk_workspace(root.path(), "demo", project.path());
+    registered(&db, "child", "/demo/parent");
+    db.close().unwrap();
+    let mut app = app(root.path());
+    let workspace = loaded(&mut app, "/demo");
+    let parent = app.world_mut().spawn();
+    app.world_mut()
+        .insert_component(parent, Address::new("/demo/parent").unwrap());
+    app.world_mut().insert_component(
+        parent,
+        Agent::new(
+            workspace,
+            workspace,
+            "parent-driver".into(),
+            project.path().into(),
+        ),
+    );
+    app.world_mut().insert_component(parent, ToolTasks::new());
+    let (reply, _rx) = tool_reply();
+    app.world().emit_event(StartWorkspaceAgent::Existing {
+        workspace,
+        node_name: "child".into(),
+        reply,
+    });
+    until(&mut app, |app| {
+        !app.world().get_resource::<Captured>().unwrap().0.is_empty()
+    });
+    match &app.world().get_resource::<Captured>().unwrap().0[0] {
+        ToolExecuteRequest::Path { initiator, .. } => assert_eq!(*initiator, parent),
+        _ => panic!("wrong request"),
+    };
+}
+#[test]
+fn archive_waits_actual_parent_task_then_moves_files_and_updates_registry() {
+    let root = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let db = disk_workspace(root.path(), "demo", project.path());
+    let record = registered(&db, "child", "/demo/parent");
+    db.close().unwrap();
+    let mut app = app(root.path());
+    let workspace = loaded(&mut app, "/demo");
+    let db = app
+        .world()
+        .get_component::<Workspace>(workspace)
+        .unwrap()
+        .database
+        .clone();
+    let parent = app.world_mut().spawn();
+    app.world_mut()
+        .insert_component(parent, Address::new("/demo/parent").unwrap());
+    app.world_mut().insert_component(
+        parent,
+        Agent::new(
+            workspace,
+            workspace,
+            "parent-driver".into(),
+            project.path().into(),
+        ),
+    );
+    let tasks = ToolTasks::new();
+    app.world_mut().insert_component(parent, tasks.clone());
+    let (gate, wait) = watch::channel(false);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let fail = Arc::new(AtomicBool::new(false));
+    let task = install_task(&tasks, "correct-task", wait, calls.clone(), fail);
+    let child = bind_fake_agent(
+        &mut app,
+        workspace,
+        parent,
+        &task,
+        "correct-task",
+        "/demo/parent/child",
+    );
+    let (ready, wait) = watch::channel(true);
+    let wrong_calls = Arc::new(AtomicUsize::new(0));
+    let own_tasks = ToolTasks::new();
+    install_task(
+        &own_tasks,
+        "correct-task",
+        wait,
+        wrong_calls.clone(),
+        Arc::new(AtomicBool::new(false)),
+    );
+    app.world_mut().insert_component(child, own_tasks);
+    let (sender, mut rx) = reply();
+    app.world().emit_event(ArchiveAgent {
+        workspace,
+        node_name: "child".into(),
+        reply: sender,
+    });
+    until(&mut app, |_| calls.load(Ordering::SeqCst) > 0);
+    assert!(rx.try_recv().is_err());
+    assert_eq!(
+        db.agent_by_id(&record.id).unwrap().category,
+        AgentCategory::Normal
+    );
+    assert!(app.world().is_alive(child));
+    gate.send_replace(true);
+    receive(&mut app, &mut rx).unwrap();
+    assert!(!app.world().is_alive(child));
+    assert_eq!(wrong_calls.load(Ordering::SeqCst), 0);
+    let archived = db.agent_by_id(&record.id).unwrap();
+    assert_eq!(archived.category, AgentCategory::Archived);
+    assert_eq!(
+        fs::read_to_string(db.agent_directory(&archived).unwrap().join("state")).unwrap(),
+        "preserve"
+    );
+    drop(ready);
+}
+#[test]
+fn archive_parent_mismatch_or_failed_cleanup_never_marks_archived() {
+    let root = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let db = disk_workspace(root.path(), "demo", project.path());
+    let record = registered(&db, "coder", "/demo");
+    db.close().unwrap();
+    let mut app = app(root.path());
+    let workspace = loaded(&mut app, "/demo");
+    let db = app
+        .world()
+        .get_component::<Workspace>(workspace)
+        .unwrap()
+        .database
+        .clone();
+    let tasks = app
+        .world()
+        .get_component::<ToolTasks>(workspace)
+        .unwrap()
+        .clone();
+    let (_gate, wait) = watch::channel(true);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let fail = Arc::new(AtomicBool::new(true));
+    let task = install_task(&tasks, "driver-task", wait, calls.clone(), fail.clone());
+    let entity = bind_fake_agent(
+        &mut app,
+        workspace,
+        workspace,
+        &task,
+        "driver-task",
+        "/demo/coder",
+    );
+    let (sender, mut rx) = reply();
+    app.world().emit_event(ArchiveAgent {
+        workspace,
+        node_name: "coder".into(),
+        reply: sender,
+    });
+    assert!(receive(&mut app, &mut rx).is_err());
+    assert_eq!(
+        db.agent_by_id(&record.id).unwrap().category,
+        AgentCategory::Normal
+    );
+    assert!(app.world().is_alive(entity));
+    fail.store(false, Ordering::SeqCst);
+    let (sender, mut rx) = reply();
+    app.world().emit_event(ArchiveAgent {
+        workspace,
+        node_name: "coder".into(),
+        reply: sender,
+    });
+    receive(&mut app, &mut rx).unwrap();
+    assert_eq!(
+        db.agent_by_id(&record.id).unwrap().category,
+        AgentCategory::Archived
+    );
+}
+#[test]
+fn archive_nonrunning_record_does_not_require_agent_or_tasks() {
+    let root = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let db = disk_workspace(root.path(), "demo", project.path());
+    let record = registered(&db, "coder", "/demo");
+    db.close().unwrap();
+    let mut app = app(root.path());
+    let workspace = loaded(&mut app, "/demo");
+    let db = app
+        .world()
+        .get_component::<Workspace>(workspace)
+        .unwrap()
+        .database
+        .clone();
+    let (sender, mut rx) = reply();
+    app.world().emit_event(ArchiveAgent {
+        workspace,
+        node_name: "coder".into(),
+        reply: sender,
+    });
+    receive(&mut app, &mut rx).unwrap();
+    assert_eq!(
+        db.agent_by_id(&record.id).unwrap().category,
+        AgentCategory::Archived
+    );
+}
+#[test]
+fn deletion_waits_real_task_cleanup_and_preserves_project_files() {
+    let root = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    fs::write(project.path().join("keep"), "project").unwrap();
+    let db = disk_workspace(root.path(), "demo", project.path());
+    db.close().unwrap();
+    let mut app = app(root.path());
+    let workspace = loaded(&mut app, "/demo");
+    let db = app
+        .world()
+        .get_component::<Workspace>(workspace)
+        .unwrap()
+        .database
+        .clone();
+    let tasks = app
+        .world()
+        .get_component::<ToolTasks>(workspace)
+        .unwrap()
+        .clone();
+    let (gate, wait) = watch::channel(false);
+    let calls = Arc::new(AtomicUsize::new(0));
+    install_task(
+        &tasks,
+        "driver",
+        wait,
+        calls.clone(),
+        Arc::new(AtomicBool::new(false)),
+    );
+    let (sender, mut rx) = reply();
+    app.world().emit_event(DeleteWorkspace {
+        workspace,
+        reply: sender,
+    });
+    until(&mut app, |_| calls.load(Ordering::SeqCst) > 0);
+    assert!(rx.try_recv().is_err());
+    assert!(db.is_open());
+    assert!(!db.is_accepting());
+    assert!(!tasks.is_accepting());
+    assert!(root.path().join("demo").exists());
+    let (sender, mut duplicate) = reply();
+    app.world().emit_event(DeleteWorkspace {
+        workspace,
+        reply: sender,
+    });
+    assert_eq!(
+        receive(&mut app, &mut duplicate).unwrap_err().kind,
+        WorkspaceErrorKind::Busy
+    );
+    gate.send_replace(true);
+    receive(&mut app, &mut rx).unwrap();
+    assert!(!app.world().is_alive(workspace));
+    assert!(!db.is_open());
+    assert!(!root.path().join("demo").exists());
+    assert_eq!(
+        fs::read_to_string(project.path().join("keep")).unwrap(),
+        "project"
+    );
+}
+#[test]
+fn deletion_failure_retains_entity_and_database_for_explicit_retry() {
+    let root = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let db = disk_workspace(root.path(), "demo", project.path());
+    db.close().unwrap();
+    let mut app = app(root.path());
+    let workspace = loaded(&mut app, "/demo");
+    let tasks = app
+        .world()
+        .get_component::<ToolTasks>(workspace)
+        .unwrap()
+        .clone();
+    let (_gate, wait) = watch::channel(true);
+    let fail = Arc::new(AtomicBool::new(true));
+    install_task(
+        &tasks,
+        "driver",
+        wait,
+        Arc::new(AtomicUsize::new(0)),
+        fail.clone(),
+    );
+    let (sender, mut rx) = reply();
+    app.world().emit_event(DeleteWorkspace {
+        workspace,
+        reply: sender,
+    });
+    assert_eq!(
+        receive(&mut app, &mut rx).unwrap_err().kind,
+        WorkspaceErrorKind::CloseFailed
+    );
     assert_eq!(
         app.world()
             .get_component::<Workspace>(workspace)
@@ -395,472 +725,254 @@ fn start_uses_fresh_file_updates_shared_cache_and_preserves_existing_state_paths
             .state,
         WorkspaceState::Error
     );
-    assert_eq!(
-        definitions.get(&path).unwrap().project_root,
-        path.parent().unwrap().join("new-project")
-    );
-    let component = app.world().get_component::<Workspace>(workspace).unwrap();
-    assert_eq!(component.name, "demo");
-    assert_eq!(component.agents.len(), 1);
-    let starts = &app.world().get_resource::<FakeAgents>().unwrap().starts;
-    assert_eq!(starts.len(), 2);
-    assert_eq!(starts[0].1.database_path, database);
-    assert_eq!(
-        starts[0].1.settings_path,
-        database.parent().unwrap().join("setting.toml")
-    );
-    assert_eq!(
-        starts[0].1.project_root,
-        path.parent().unwrap().join("new-project")
-    );
-    assert_eq!(
-        std::fs::read(database).unwrap(),
-        b"existing SQLite bytes stay untouched"
-    );
-    stop(&mut app, workspace, "stop");
-}
-#[test]
-fn unreadable_fresh_definition_never_starts_from_display_cache() {
-    let root = tempfile::tempdir().unwrap();
-    let path = file(root.path(), "demo");
-    write(&path, "cached", &["good"], "project");
-    let mut app = app(WorkspacePlugin::open(root.path())
-        .unwrap()
-        .with_program_root(root.path().join("agent-drivers")));
-    std::fs::write(&path, "broken: [").unwrap();
-    app.world().emit_event(StartWorkspace {
-        id: "broken".into(),
-        reply: request_reply("broken"),
-        path: path.clone(),
-    });
-    assert_eq!(
-        wait(&mut app, "broken").unwrap_err().kind,
-        WorkspaceErrorKind::InvalidDefinition
-    );
-    assert!(app.world().query_with::<Workspace>().result().is_empty());
     assert!(app
         .world()
-        .get_resource::<FakeAgents>()
+        .get_component::<Workspace>(workspace)
         .unwrap()
-        .starts
-        .is_empty());
-    assert_eq!(
-        app.world()
-            .workspace_definitions()
-            .unwrap()
-            .get(&path)
-            .unwrap()
-            .project_root,
-        path.parent().unwrap().join("project")
-    );
-}
-#[test]
-fn restart_with_member_tasks_uses_stop_then_start_without_busy_admission() {
-    let root = tempfile::tempdir().unwrap();
-    let path = file(root.path(), "demo");
-    write(&path, "demo", &["one", "two"], "project");
-    let mut app = app(WorkspacePlugin::open(root.path())
-        .unwrap()
-        .with_program_root(root.path().join("agent-drivers")));
-    let original = start(&mut app, &path, "start");
-    let (reply, _result) = tokio::sync::oneshot::channel();
-    let (task, _input) = ToolTaskHandle::new(
-        &ToolExecutionLimits::default(),
-        "call".into(),
-        "mcp_register".into(),
-        reply,
-        app.world()
-            .get_component::<ToolTasks>(original.members[1])
-            .unwrap()
-            .update_context(),
-        None,
-    )
-    .unwrap();
-    app.world()
-        .get_component::<ToolTasks>(original.members[1])
-        .unwrap()
-        .register("persistent".into(), task)
-        .unwrap();
-    let old = app
-        .world()
-        .get_component::<WorkspaceExecutor>(original.workspace)
-        .unwrap()
-        .close
-        .clone();
-    write(&path, "new definition", &[], "next-project");
-    app.world().emit_event(RestartWorkspace {
-        id: "restart".into(),
-        reply: request_reply("restart"),
-        path,
+        .database
+        .is_open());
+    assert!(root.path().join("demo").exists());
+    fail.store(false, Ordering::SeqCst);
+    let (sender, mut rx) = reply();
+    app.world().emit_event(DeleteWorkspace {
+        workspace,
+        reply: sender,
     });
-    let new = wait(&mut app, "restart").unwrap();
-    assert_ne!(new.workspace, original.workspace);
-    assert!(!app.world().is_alive(original.workspace));
-    assert!(old.is_joined());
-    assert!(new.members.is_empty());
-    assert_eq!(app.world().get_resource::<FakeAgents>().unwrap().stops, 2);
-    stop(&mut app, new.workspace, "stop");
+    receive(&mut app, &mut rx).unwrap();
+    assert!(!app.world().is_alive(workspace));
 }
 #[test]
-fn restart_invalid_file_stops_old_runtime_and_reports_new_start_error() {
-    let root = tempfile::tempdir().unwrap();
-    let path = file(root.path(), "demo");
-    write(&path, "old", &["good"], "project");
-    let mut app = app(WorkspacePlugin::open(root.path())
-        .unwrap()
-        .with_program_root(root.path().join("agent-drivers")));
-    let output = start(&mut app, &path, "start");
-    let old = app
-        .world()
-        .get_component::<WorkspaceExecutor>(output.workspace)
-        .unwrap()
-        .close
-        .clone();
-    std::fs::write(&path, "invalid: [").unwrap();
-    app.world().emit_event(RestartWorkspace {
-        id: "restart".into(),
-        reply: request_reply("restart"),
-        path: path.clone(),
-    });
-    assert_eq!(
-        wait(&mut app, "restart").unwrap_err().kind,
-        WorkspaceErrorKind::InvalidDefinition
-    );
-    assert!(!app.world().is_alive(output.workspace));
-    assert!(!app.world().is_alive(output.members[0]));
-    assert!(old.is_joined());
-    assert_eq!(
-        app.world()
-            .workspace_definitions()
-            .unwrap()
-            .get(&path)
-            .unwrap()
-            .project_root,
-        path.parent().unwrap().join("project")
-    );
-    assert_eq!(app.world().get_resource::<FakeAgents>().unwrap().stops, 1);
-}
-#[test]
-fn stop_failure_or_lost_reply_preserves_workspace_and_unjoined_executor() {
-    for lost_reply in [false, true] {
+fn deletion_refuses_project_containment_before_closing_or_destroying() {
+    for project_inside in [false, true] {
         let root = tempfile::tempdir().unwrap();
-        let path = file(root.path(), "demo");
-        write(&path, "demo", &["good"], "project");
-        let mut app = app(WorkspacePlugin::open(root.path())
+        let project = tempfile::tempdir().unwrap();
+        let db = disk_workspace(root.path(), "demo", project.path());
+        db.close().unwrap();
+        let mut app = app(root.path());
+        let workspace = loaded(&mut app, "/demo");
+        let bad = if project_inside {
+            let p = root.path().join("demo/project");
+            fs::create_dir(&p).unwrap();
+            p
+        } else {
+            root.path().to_owned()
+        };
+        app.world_mut()
+            .get_component_mut::<Workspace>(workspace)
             .unwrap()
-            .with_program_root(root.path().join("agent-drivers")));
-        let output = start(&mut app, &path, "start");
-        let state = app.world_mut().get_resource_mut::<FakeAgents>().unwrap();
-        state.fail_stop = !lost_reply;
-        state.close_stop_reply = lost_reply;
-        app.world().emit_event(StopWorkspace {
-            id: "stop".into(),
-            reply: request_reply("stop"),
-            workspace: output.workspace,
+            .project_root = bad;
+        let (sender, mut rx) = reply();
+        app.world().emit_event(DeleteWorkspace {
+            workspace,
+            reply: sender,
         });
         assert_eq!(
-            wait(&mut app, "stop").unwrap_err().kind,
-            WorkspaceErrorKind::CleanupFailed
+            receive(&mut app, &mut rx).unwrap_err().kind,
+            WorkspaceErrorKind::InvalidRequest
         );
-        assert!(app.world().is_alive(output.workspace));
-        assert!(app.world().is_alive(output.members[0]));
-        assert_eq!(
-            *app.world().workspace_state(output.workspace).unwrap(),
-            WorkspaceState::Error
-        );
-        assert!(!app
-            .world()
-            .get_component::<WorkspaceExecutor>(output.workspace)
-            .unwrap()
-            .close
-            .is_joined());
-        manual_join(&app, output.workspace);
+        let ws = app.world().get_component::<Workspace>(workspace).unwrap();
+        assert_eq!(ws.state, WorkspaceState::Running);
+        assert!(ws.database.is_open());
+        assert!(ws.database.is_accepting());
+        assert!(root.path().join("demo/workspace.sqlite").exists());
     }
 }
 #[test]
-fn stop_waits_for_real_workspace_thread_join_before_destroying_host() {
+fn create_refuses_project_overlap_or_existing_directory() {
     let root = tempfile::tempdir().unwrap();
-    let path = file(root.path(), "demo");
-    write(&path, "demo", &[], "project");
-    let mut app = app(WorkspacePlugin::open(root.path())
-        .unwrap()
-        .with_program_root(root.path().join("agent-drivers")));
-    let output = start(&mut app, &path, "start");
-    let executor = app
+    let mut app = app(root.path());
+    for project in [root.path().to_owned(), {
+        let p = root.path().join("nested/project");
+        fs::create_dir_all(&p).unwrap();
+        p
+    }] {
+        let (sender, mut rx) = reply();
+        app.world().emit_event(CreateWorkspace {
+            address: "/nested".into(),
+            alias: "Nested".into(),
+            project_root: project,
+            reply: sender,
+        });
+        assert!(receive(&mut app, &mut rx).is_err());
+    }
+    assert!(app.world().query_with::<Workspace>().result().is_empty());
+}
+
+#[test]
+fn archive_rejects_agent_whose_parent_disagrees_with_registry() {
+    let root = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let db = disk_workspace(root.path(), "demo", project.path());
+    let record = registered(&db, "coder", "/demo");
+    db.close().unwrap();
+    let mut app = app(root.path());
+    let workspace = loaded(&mut app, "/demo");
+    let database = app
         .world()
-        .get_component::<WorkspaceExecutor>(output.workspace)
-        .unwrap();
-    let close = executor.close.clone();
-    let (release, waiter) = tokio::sync::oneshot::channel();
-    executor
-        .entry
-        .submit(move || {
-            Box::pin(async move {
-                let local = std::rc::Rc::new(7);
-                waiter.await.unwrap();
-                assert_eq!(*local, 7);
-            })
-        })
-        .unwrap();
-    app.world().emit_event(StopWorkspace {
-        id: "stop".into(),
-        reply: request_reply("stop"),
-        workspace: output.workspace,
+        .get_component::<Workspace>(workspace)
+        .unwrap()
+        .database
+        .clone();
+    let parent = app.world_mut().spawn();
+    app.world_mut()
+        .insert_component(parent, Address::new("/demo/other").unwrap());
+    app.world_mut().insert_component(
+        parent,
+        Agent::new(
+            workspace,
+            workspace,
+            "parent-driver".into(),
+            project.path().into(),
+        ),
+    );
+    let tasks = ToolTasks::new();
+    app.world_mut().insert_component(parent, tasks.clone());
+    let (_gate, wait) = watch::channel(true);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let task = install_task(
+        &tasks,
+        "driver",
+        wait,
+        calls.clone(),
+        Arc::new(AtomicBool::new(false)),
+    );
+    let child = bind_fake_agent(&mut app, workspace, parent, &task, "driver", "/demo/coder");
+    let (sender, mut rx) = reply();
+    app.world().emit_event(ArchiveAgent {
+        workspace,
+        node_name: "coder".into(),
+        reply: sender,
+    });
+    assert_eq!(
+        receive(&mut app, &mut rx).unwrap_err().kind,
+        WorkspaceErrorKind::ParentMismatch
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert!(app.world().is_alive(child));
+    assert_eq!(
+        database.agent_by_id(&record.id).unwrap().category,
+        AgentCategory::Normal
+    );
+}
+
+#[test]
+fn deletion_waits_admitted_creation_operation_even_when_task_set_is_empty() {
+    let root = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let db = disk_workspace(root.path(), "demo", project.path());
+    db.close().unwrap();
+    let mut app = app(root.path());
+    let workspace = loaded(&mut app, "/demo");
+    let database = app
+        .world()
+        .get_component::<Workspace>(workspace)
+        .unwrap()
+        .database
+        .clone();
+    let operation = database.try_operation("in-flight").unwrap();
+    let (sender, mut rx) = reply();
+    app.world().emit_event(DeleteWorkspace {
+        workspace,
+        reply: sender,
+    });
+    until(&mut app, |app| {
+        app.world()
+            .get_component::<Workspace>(workspace)
+            .unwrap()
+            .state
+            == WorkspaceState::Deleting
     });
     for _ in 0..20 {
         app.tick();
         std::thread::yield_now();
     }
-    assert!(app.world().is_alive(output.workspace));
-    assert!(!close.is_joined());
-    assert!(!app
-        .world()
-        .get_resource::<FakeAgents>()
-        .unwrap()
-        .results
-        .contains_key("stop"));
-    release.send(()).unwrap();
-    wait(&mut app, "stop").unwrap();
-    assert!(close.is_joined());
-    assert!(!app.world().is_alive(output.workspace));
-}
-#[test]
-fn stop_restart_start_order_and_non_running_rejections_are_synchronous() {
-    let root = tempfile::tempdir().unwrap();
-    let path = file(root.path(), "demo");
-    write(&path, "demo", &[], "project");
-    let mut app = app(WorkspacePlugin::open(root.path())
-        .unwrap()
-        .with_program_root(root.path().join("agent-drivers")));
-    let output = start(&mut app, &path, "start");
-    app.world().emit_event(StopWorkspace {
-        id: "stop".into(),
-        reply: request_reply("stop"),
-        workspace: output.workspace,
-    });
-    app.world().emit_event(RestartWorkspace {
-        id: "restart".into(),
-        reply: request_reply("restart"),
-        path: path.clone(),
-    });
-    app.world().emit_event(StartWorkspace {
-        id: "duplicate".into(),
-        reply: request_reply("duplicate"),
-        path: path.clone(),
-    });
-    app.tick();
-    assert_eq!(
-        *app.world().workspace_state(output.workspace).unwrap(),
-        WorkspaceState::Stopping
-    );
-    assert_eq!(
-        wait(&mut app, "restart").unwrap_err().kind,
-        WorkspaceErrorKind::StateRejected
-    );
-    assert_eq!(
-        wait(&mut app, "duplicate").unwrap_err().kind,
-        WorkspaceErrorKind::Duplicate
-    );
-    wait(&mut app, "stop").unwrap();
-}
-#[test]
-fn starting_member_is_stopped_through_actual_agent_cleanup() {
-    let root = tempfile::tempdir().unwrap();
-    let path = file(root.path(), "demo");
-    write(&path, "demo", &["good"], "project");
-    let mut app = app(WorkspacePlugin::open(root.path())
-        .unwrap()
-        .with_program_root(root.path().join("agent-drivers")));
-    let output = start(&mut app, &path, "start");
-    agent_core::WorldAgentExt::agent_transition(
-        app.world_mut(),
-        output.members[0],
-        AgentState::Starting,
-        None,
-    )
-    .unwrap();
-    app.world().emit_event(StopWorkspace {
-        id: "stop".into(),
-        reply: request_reply("stop"),
-        workspace: output.workspace,
-    });
-    wait(&mut app, "stop").unwrap();
-    assert!(!app.world().is_alive(output.workspace));
-    assert_eq!(app.world().get_resource::<FakeAgents>().unwrap().stops, 1);
+    assert!(rx.try_recv().is_err());
+    assert!(database.is_open());
+    assert!(root.path().join("demo").is_dir());
+    drop(operation);
+    receive(&mut app, &mut rx).unwrap();
+    assert!(!database.is_open());
+    assert!(!root.path().join("demo").exists());
 }
 
-#[test]
-fn open_validates_all_definitions_before_build_and_start_rejects_external_paths() {
-    let root = tempfile::tempdir().unwrap();
-    let good = file(root.path(), "good");
-    write(&good, "good", &[], "project");
-    let bad = file(root.path(), "bad");
-    std::fs::write(&bad, "invalid: [").unwrap();
-    assert!(WorkspacePlugin::open(root.path()).is_err());
-    std::fs::remove_file(&bad).unwrap();
-    let mut app = app(WorkspacePlugin::open(root.path())
-        .unwrap()
-        .with_program_root(root.path().join("agent-drivers")));
-    let external = tempfile::tempdir().unwrap();
-    let outside = file(external.path(), "outside");
-    write(&outside, "outside", &[], "p");
-    app.world().emit_event(StartWorkspace {
-        id: "outside".into(),
-        reply: request_reply("outside"),
-        path: outside,
-    });
-    assert_eq!(
-        wait(&mut app, "outside").unwrap_err().kind,
-        WorkspaceErrorKind::InvalidRequest
-    );
-    assert!(app.world().query_with::<Workspace>().result().is_empty());
-}
 #[cfg(unix)]
 #[test]
-fn symlinked_state_path_is_refused_without_replacing_external_data() {
+fn directory_replacement_during_cleanup_is_rejected_before_database_close() {
     let root = tempfile::tempdir().unwrap();
-    let path = file(root.path(), "demo");
-    write(&path, "demo", &["good"], "project");
-    let mut app = app(WorkspacePlugin::open(root.path())
-        .unwrap()
-        .with_program_root(root.path().join("agent-drivers")));
-    let external = root.path().join("external.sqlite");
-    std::fs::write(&external, b"do not change").unwrap();
-    let state = path.parent().unwrap().join("agents/good/state.sqlite");
-    std::fs::create_dir_all(state.parent().unwrap()).unwrap();
-    std::os::unix::fs::symlink(&external, &state).unwrap();
-    app.world().emit_event(StartWorkspace {
-        id: "unsafe".into(),
-        reply: request_reply("unsafe"),
-        path,
-    });
-    assert_eq!(
-        wait(&mut app, "unsafe").unwrap_err().kind,
-        WorkspaceErrorKind::InvalidDefinition
-    );
-    assert_eq!(std::fs::read(external).unwrap(), b"do not change");
-    assert!(app
+    let project = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    fs::write(outside.path().join("keep"), "external").unwrap();
+    let db = disk_workspace(root.path(), "demo", project.path());
+    db.close().unwrap();
+    let mut app = app(root.path());
+    let workspace = loaded(&mut app, "/demo");
+    let database = app
         .world()
-        .get_resource::<FakeAgents>()
+        .get_component::<Workspace>(workspace)
         .unwrap()
-        .starts
-        .is_empty());
+        .database
+        .clone();
+    let tasks = app
+        .world()
+        .get_component::<ToolTasks>(workspace)
+        .unwrap()
+        .clone();
+    let (gate, wait) = watch::channel(false);
+    let calls = Arc::new(AtomicUsize::new(0));
+    install_task(
+        &tasks,
+        "driver",
+        wait,
+        calls.clone(),
+        Arc::new(AtomicBool::new(false)),
+    );
+    let (sender, mut rx) = reply();
+    app.world().emit_event(DeleteWorkspace {
+        workspace,
+        reply: sender,
+    });
+    until(&mut app, |_| calls.load(Ordering::SeqCst) > 0);
+    fs::rename(root.path().join("demo"), root.path().join("held")).unwrap();
+    std::os::unix::fs::symlink(outside.path(), root.path().join("demo")).unwrap();
+    gate.send_replace(true);
+    let error = receive(&mut app, &mut rx).unwrap_err();
+    assert_eq!(error.kind, WorkspaceErrorKind::DeleteFailed);
+    assert!(!error.entity_removed);
+    assert!(app.world().is_alive(workspace));
+    assert!(database.is_open());
+    assert_eq!(
+        fs::read_to_string(outside.path().join("keep")).unwrap(),
+        "external"
+    );
+    assert!(root.path().join("held/workspace.sqlite").exists());
 }
 
 #[test]
-fn workspace_start_reloads_all_sources_and_rejects_unrelated_invalid_definition() {
+fn work_completion_marker_is_consumed_after_workspace_start_installation() {
     let root = tempfile::tempdir().unwrap();
-    let selected = file(root.path(), "selected");
-    let other = file(root.path(), "other");
-    write(&selected, "old-selected", &[], "project");
-    write(&other, "old-other", &[], "project");
-    let mut app = app(WorkspacePlugin::open(root.path())
+    let project = tempfile::tempdir().unwrap();
+    let db = disk_workspace(root.path(), "demo", project.path());
+    db.close().unwrap();
+    let mut app = app(root.path());
+    let pending = app
+        .world()
+        .get_resource::<WorkspacePendingWork>()
         .unwrap()
-        .with_program_root(root.path().join("agent-drivers")));
-    write(&selected, "fresh-selected", &[], "project");
-    write(&other, "fresh-other", &[], "fresh-project");
-    let output = start(&mut app, &selected, "full-reload");
-    assert_eq!(
-        app.world()
-            .workspace_definitions()
-            .unwrap()
-            .get(&other)
-            .unwrap()
-            .project_root,
-        other.parent().unwrap().join("fresh-project")
-    );
-    stop(&mut app, output.workspace, "stop");
-    std::fs::write(&other, "broken: [").unwrap();
-    app.world().emit_event(StartWorkspace {
-        id: "invalid-other".into(),
-        reply: request_reply("invalid-other"),
-        path: selected.clone(),
+        .clone();
+    assert!(!pending.is_idle());
+    until(&mut app, |_| pending.is_idle());
+    assert!(pending.load_completed());
+    assert!(app.world().entity_by_address("/demo").is_ok());
+    let (sender, mut receiver) = reply();
+    app.world().emit_event(CreateWorkspace {
+        address: "/created".into(),
+        alias: "Created".into(),
+        project_root: project.path().into(),
+        reply: sender,
     });
-    assert_eq!(
-        wait(&mut app, "invalid-other").unwrap_err().kind,
-        WorkspaceErrorKind::InvalidDefinition
-    );
-    assert!(app.world().query_with::<Workspace>().result().is_empty());
-    assert_eq!(
-        app.world()
-            .workspace_definitions()
-            .unwrap()
-            .get(&other)
-            .unwrap()
-            .project_root,
-        other.parent().unwrap().join("fresh-project")
-    );
-}
-
-type OperationResult = Result<WorkspaceOperationOutput, WorkspaceError>;
-thread_local! {static REPLIES:std::cell::RefCell<BTreeMap<String,tokio::sync::oneshot::Receiver<OperationResult>>>=Default::default();}
-fn request_reply(id: &str) -> WorkspaceOperationReply {
-    let (sender, receiver) = tokio::sync::oneshot::channel();
-    REPLIES.with(|rows| rows.borrow_mut().insert(id.to_owned(), receiver));
-    std::sync::Arc::new(std::sync::Mutex::new(Some(sender)))
-}
-fn poll_reply(id: &str) -> Option<OperationResult> {
-    REPLIES.with(|rows| {
-        rows.borrow_mut()
-            .get_mut(id)
-            .and_then(|receiver| receiver.try_recv().ok())
-    })
-}
-
-#[test]
-fn removed_definition_remains_on_running_component_and_only_stop_succeeds() {
-    let root = tempfile::tempdir().unwrap();
-    let path = file(root.path(), "removed");
-    write(&path, "retained", &[], "project");
-    let mut app = app(WorkspacePlugin::open(root.path())
-        .unwrap()
-        .with_program_root(root.path().join("agent-drivers")));
-    let running = start(&mut app, &path, "start-retained");
-    let definitions = app.world().workspace_definitions().unwrap().clone();
-    assert_eq!(
-        app.world()
-            .get_component::<Workspace>(running.workspace)
-            .unwrap()
-            .definition
-            .as_ref()
-            .unwrap()
-            .project_root,
-        path.parent().unwrap().join("project")
-    );
-    assert_eq!(path.canonicalize().unwrap(), path);
-    std::fs::remove_file(&path).unwrap();
-    definitions.reload().unwrap();
-    assert!(definitions.get(&path).is_none());
-    app.world().emit_event(RestartWorkspace {
-        id: "missing-restart".into(),
-        path: path.clone(),
-        reply: request_reply("missing-restart"),
-    });
-    assert!(wait(&mut app, "missing-restart").is_err());
-    assert!(!app.world().is_alive(running.workspace));
-}
-
-fn test_binding() -> tool_core::TaskSyncBinding {
-    tool_core::TaskSyncBinding::new(
-        client_core::Clients::default(),
-        std::sync::Arc::from([]),
-        |snapshot| {
-            serde_json::to_string(&snapshot)
-                .map(|text| std::sync::Arc::new(client_core::ClientFrame::Text(text)))
-                .map_err(|_| client_core::ClientPrepareError::EncodeFailed)
-        },
-    )
-}
-fn test_tasks() -> tool_core::ToolTasks {
-    let mut app = core_plugin::App::new();
-    let owner = app.world_mut().spawn();
-    tool_core::ToolTasks::new(
-        owner,
-        "agent:margatroid-test-dev/unit:dev".into(),
-        test_binding(),
-    )
-}
-
-fn test_agent_context() -> agent_core::AgentUpdateContext {
-    agent_core::AgentUpdateContext::new(|_, _, _| Vec::new(), |_, _| {})
+    app.tick();
+    assert!(!pending.is_idle());
+    let entity = receive(&mut app, &mut receiver).unwrap();
+    until(&mut app, |_| pending.is_idle());
+    assert_eq!(app.world().entity_by_address("/created").unwrap(), entity);
 }

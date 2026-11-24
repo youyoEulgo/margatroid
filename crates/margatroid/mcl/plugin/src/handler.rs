@@ -202,8 +202,8 @@ pub(crate) fn handle_queue(world: &mut World, target: Entity) {
             settled: false,
         };
         let instance = world
-            .get_component::<agent_core::AgentSession>(target)
-            .map(|session| session.0.clone());
+            .get_component::<agent_core::Agent>(target)
+            .map(|agent| agent.instance().to_owned());
         let context = CommandContext {
             request,
             operation,
@@ -813,7 +813,7 @@ async fn execute_effect(
                     config.set(parameters, &routes);
                 } else {
                     let binding = world
-                        .get_resource::<inference_core::ModelSyncBinding>()
+                        .get_resource::<inference_core::ModelObserverFactory>()
                         .ok_or_else(|| error(MclErrorKind::EffectFailed, "model binding missing"))?
                         .for_owner(request.target);
                     let config = inference_core::AgentInferenceConfig::new(parameters, binding);
@@ -879,6 +879,41 @@ async fn execute_effect(
             let cancel = context.cancel.clone();
             in_world(&context.world, move |world| {
                 check_action(world, &request, &cancel)?;
+                if let Some(name) = alias.as_deref() {
+                    world
+                        .sandbox_path(request.target, name)
+                        .map_err(|failed| error(MclErrorKind::AliasMissing, failed.to_string()))?;
+                }
+                if !world.contains_component::<sandbox_resource_core::Sandboxes>(request.target)
+                    || !world.contains_component::<sandbox_resource_core::SelectedSandbox>(
+                        request.target,
+                    )
+                {
+                    let (entries_changed, selection_changed) = world
+                        .get_resource::<sandbox_resource_core::SandboxObserverFactory>()
+                        .ok_or_else(|| {
+                            error(
+                                MclErrorKind::EffectFailed,
+                                "sandbox observer factory missing",
+                            )
+                        })?
+                        .for_owner(request.target);
+                    if !world.contains_component::<sandbox_resource_core::Sandboxes>(request.target)
+                    {
+                        world.insert_component(
+                            request.target,
+                            sandbox_resource_core::Sandboxes::new(entries_changed),
+                        );
+                    }
+                    if !world.contains_component::<sandbox_resource_core::SelectedSandbox>(
+                        request.target,
+                    ) {
+                        world.insert_component(
+                            request.target,
+                            sandbox_resource_core::SelectedSandbox::new(None, selection_changed),
+                        );
+                    }
+                }
                 world
                     .sandbox_select(request.target, alias)
                     .map_err(|failed| error(MclErrorKind::AliasMissing, failed.to_string()))?;
@@ -911,11 +946,11 @@ async fn execute_effect(
                     })?;
                 } else {
                     let slot = world
-                        .get_component::<lua_runtime_core::AgentWaitSlot>(request.target)
+                        .get_component::<agent_core::Agent>(request.target)
                         .ok_or_else(|| {
                             error(MclErrorKind::TargetMissing, "Agent wait slot missing")
                         })?;
-                    slot.0
+                    slot.wake_slot()
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
                         .wake()
@@ -1191,7 +1226,7 @@ async fn execute_tools(
                 continue;
             }
             let (sender, receiver) = oneshot::channel();
-            world.send_event(ToolExecuteRequest {
+            world.send_event(ToolExecuteRequest::Registered {
                 id: format!("tool:{task_prefix}:{index}"),
                 agent: request.target,
                 turn: expected_turn.clone(),

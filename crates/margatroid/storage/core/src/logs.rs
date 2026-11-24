@@ -5,15 +5,13 @@ fn transaction<T>(
     write: bool,
     operation: impl FnOnce(&Connection) -> Result<T, StorageError>,
 ) -> Result<T, StorageError> {
-    let connection = storage
+    let guard = storage
         .database
         .shared
         .connection
         .lock()
         .map_err(|_| err(K::Closed, "database lock poisoned"))?;
-    if storage.database.shared.retired.load(Ordering::Acquire) {
-        return Err(err(K::CleanupFailed, "database connection retired"));
-    }
+    let connection = open_connection(&storage.database.shared, &guard)?;
     connection
         .execute_batch(if write {
             "BEGIN IMMEDIATE"
@@ -21,18 +19,18 @@ fn transaction<T>(
             "BEGIN DEFERRED"
         })
         .map_err(if write { write_err } else { read_err })?;
-    let outcome = operation(&connection).and_then(|value| {
+    let outcome = operation(connection).and_then(|value| {
         Ok((
             value,
             if write {
-                Some(pages::record_watermarks(&connection)?)
+                Some(pages::record_watermarks(connection)?)
             } else {
                 None
             },
         ))
     });
     let (value, committed) =
-        finish_transaction(&connection, &storage.database.shared.retired, outcome)?;
+        finish_transaction(connection, &storage.database.shared.retired, outcome)?;
     if let Some(committed) = committed {
         publish_record_changes(&storage.database.shared, committed);
     }
@@ -69,8 +67,8 @@ pub fn append_agent_log(
     storage: &AgentStorage,
     mut record: AgentLogRecord,
 ) -> Result<StoredAgentLog, StorageError> {
-    validate(&record)?;
     transaction(storage, true, |db| {
+        validate(&record)?;
         let time = match record.created_at_ms {
             Some(time) => time,
             None => SystemTime::now()

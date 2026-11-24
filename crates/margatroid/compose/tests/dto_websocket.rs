@@ -1,5 +1,5 @@
 use address::Address;
-use agent_core::{Agent, AgentState, RestartAgent, StartAgent, WorldAgentExt};
+use agent_core::{Agent, WorldAgentExt};
 use app_runtime_plugin::RuntimePlugin;
 use async_runtime_plugin::AsyncRuntimePlugin;
 use axum_plugin::{AxumHandle, AxumPlugin};
@@ -13,11 +13,9 @@ use futures_util::{SinkExt, StreamExt};
 use inference_core::{
     ActiveInference, InferenceHandle, InferenceRequest, InferenceResponse, InferenceStopReason,
 };
-use lua_runtime_core::{DriverLuaVm, DriverLuaVmInstance, DriverWakeSlot};
 use mcl_core::MclQueue;
 use mcl_plugin::MclPlugin;
 use serde_json::{Value, json};
-use std::collections::BTreeSet;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -28,7 +26,7 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, tungstenite::Message};
 use tokio_util::sync::CancellationToken;
 use tool_core::{ToolExecutionLimits, ToolTaskHandle, ToolTasks};
 use workspace_core::{
-    StartWorkspace, WorkspaceDefinitions, WorkspaceOperationOutput, WorkspaceState,
+    CreateWorkspace, StartWorkspaceAgent, WorkspaceDatabase, WorkspaceMetadata, WorkspaceState,
 };
 
 type Socket = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
@@ -39,28 +37,10 @@ struct Harness {
     root: tempfile::TempDir,
     workspace: Entity,
     agent: Entity,
-    starts: Arc<Mutex<Vec<StartAgent>>>,
-    restarts: Arc<Mutex<Vec<RestartAgent>>>,
-    workspace_starts: Arc<Mutex<Vec<StartWorkspace>>>,
+    workspace_creates: Arc<Mutex<Vec<CreateWorkspace>>>,
+    agent_starts:
+        Arc<Mutex<Vec<StartWorkspaceAgent<tool_core::ToolExecuteResponse, tool_core::ToolError>>>>,
     inference: Arc<Mutex<Vec<InferenceRequest>>>,
-}
-
-fn vm(world: &mut World, owner: Entity, id: &str) {
-    let (ready, _receiver) = oneshot::channel();
-    let (_sender, ended) = oneshot::channel();
-    world.insert_component(
-        owner,
-        DriverLuaVm {
-            instance: DriverLuaVmInstance {
-                owner,
-                start_id: id.into(),
-            },
-            wake: DriverWakeSlot::shared(),
-            ready: Arc::new(Mutex::new(Some(ready))),
-            ended: Some(ended),
-            cancel: CancellationToken::new(),
-        },
-    );
 }
 
 impl Harness {
@@ -81,6 +61,19 @@ impl Harness {
             Arc<std::sync::atomic::AtomicUsize>,
         )>,
         policy: config_core::IngressPolicy,
+    ) -> Self {
+        Self::build(counters, policy, false)
+    }
+    fn with_real_workspace() -> Self {
+        Self::build(None, config_core::IngressPolicy::Localhost, true)
+    }
+    fn build(
+        counters: Option<(
+            Arc<std::sync::atomic::AtomicUsize>,
+            Arc<std::sync::atomic::AtomicUsize>,
+        )>,
+        policy: config_core::IngressPolicy,
+        real_workspace: bool,
     ) -> Self {
         let root = tempfile::tempdir().unwrap();
         let initial_root = root.path().join("agent-drivers");
@@ -106,73 +99,57 @@ impl Harness {
                 .unwrap(),
         );
         let definitions_root = root.path().join("workspaces");
-        std::fs::create_dir_all(definitions_root.join("margatroid/demo/dev")).unwrap();
-        std::fs::write(definitions_root.join("margatroid/demo/dev/workspace.yaml"), format!(
-            "project_root: {}\nmembers:\n  - name: coder\n    driver: driver:margatroid/new:dev\n    home_root: {}\n",
-            root.path().display(), root.path().join("new-home").display()
-        )).unwrap();
-        app.world_mut()
-            .insert_resource(WorkspaceDefinitions::open(&definitions_root).unwrap());
-        let workspace = app.world_mut().spawn();
-        app.world_mut().insert_component(
-            workspace,
-            address::Address::new("workspace:test/unit:dev").unwrap(),
-        );
-        let workspace_binding = dto_plugin::workspace_sync_binding(
-            app.world()
-                .get_resource::<client_core::Clients>()
-                .unwrap()
-                .clone(),
-        );
-        app.world_mut()
-            .insert_resource(workspace_binding.updates.clone());
-        app.world_mut().insert_resource(workspace_binding.clone());
-        app.world_mut().insert_component(
-            workspace,
-            workspace_core::Workspace::new(
-                "demo".into(),
-                definitions_root.join("margatroid/demo/dev/workspace.yaml"),
-                root.path().into(),
-                WorkspaceState::Running,
-                BTreeSet::new(),
-                None,
-                workspace_binding.updates.clone(),
-            ),
-        );
-        app.world_mut().insert_component(
-            workspace,
-            Address::new("workspace:margatroid/demo:dev").unwrap(),
-        );
-        let agent = app.world_mut().spawn();
-        agent_core::AgentTaskBinding::reserve(
-            app.world_mut(),
-            agent,
-            agent_core::AgentCreator {
-                address: "workspace:margatroid/demo:dev".into(),
-                task_id: "driver-first".into(),
+        let managed = definitions_root.join("demo");
+        for kind in ["normal", "temporary", "archived"] {
+            std::fs::create_dir_all(managed.join("agents").join(kind)).unwrap();
+        }
+        let database = WorkspaceDatabase::create(
+            managed.join("workspace.sqlite"),
+            WorkspaceMetadata {
+                address: "/demo".into(),
+                alias: "demo".into(),
+                project_root: root.path().into(),
             },
-        );
-        let agent_updates = dto_plugin::agent_sync_context(
+        )
+        .unwrap();
+        app.world_mut()
+            .insert_resource(workspace_core::WorkspaceConfig {
+                root: definitions_root,
+            });
+        let bindings = dto_plugin::sync_bindings(
             app.world()
                 .get_resource::<client_core::Clients>()
                 .unwrap()
                 .clone(),
         );
-        app.world_mut().insert_resource(agent_updates.clone());
+        app.world_mut().insert_resource(bindings.workspace_binding);
+        app.world_mut().insert_resource(bindings.workspace);
+        app.world_mut().insert_resource(bindings.agent);
+        app.world_mut().insert_resource(bindings.models);
+        app.world_mut().insert_resource(bindings.sandboxes);
+        app.world_mut()
+            .insert_resource(dto_plugin::TaskSyncInstaller(bindings.tasks));
+        let workspace = app.world_mut().spawn();
+        app.world_mut()
+            .insert_component(workspace, Address::new("/demo").unwrap());
+        app.world_mut().insert_component(
+            workspace,
+            workspace_core::Workspace::new("demo".into(), root.path().into(), database),
+        );
+        app.world_mut()
+            .insert_component(workspace, ToolTasks::new());
+        let agent = app.world_mut().spawn();
         app.world_mut().insert_component(
             agent,
-            agent_core::Agent::new(
-                "coder".into(),
+            Agent::new(
                 workspace,
-                AgentState::Running,
-                None,
-                agent_updates.clone(),
+                workspace,
+                "driver-first".into(),
+                root.path().into(),
             ),
         );
-        app.world_mut().insert_component(
-            agent,
-            Address::new("agent:margatroid-demo-dev/coder:dev").unwrap(),
-        );
+        app.world_mut()
+            .insert_component(agent, Address::new("/demo/coder").unwrap());
         app.world_mut().insert_component(
             agent,
             open_storage(
@@ -182,75 +159,22 @@ impl Harness {
             )
             .unwrap(),
         );
-        app.world_mut().insert_component(
-            agent,
-            agent_core::AgentResources {
-                parameters: agent_core::AgentStartParameters {
-                    initial_settings_path: root.path().join("initial.toml"),
-                    ui_path: root.path().join("absent-ui"),
-                    project_root: root.path().into(),
-                    home_root: root.path().into(),
-                    database_path: root.path().join("state.sqlite"),
-                    settings_path: root.path().join("setting.toml"),
-                },
-            },
-        );
         app.world_mut().insert_component(agent, MclQueue::default());
         app.world_mut()
             .insert_component(agent, ActiveInference::default());
-        let task_binding = dto_plugin::task_sync_binding(
-            app.world()
-                .get_resource::<client_core::Clients>()
-                .unwrap()
-                .clone(),
-        );
-        let task_address = app
-            .world()
-            .get_component::<Address>(agent)
-            .unwrap()
-            .as_str()
-            .to_owned();
-        app.world_mut()
-            .insert_component(agent, ToolTasks::new(agent, task_address, task_binding));
-        vm(app.world_mut(), agent, "driver-first");
-        workspace_core::update_workspace(
-            app.world_mut(),
-            workspace,
-            workspace_core::WorkspaceChange::AddMember(agent),
-        )
-        .unwrap();
-        let starts = Arc::new(Mutex::new(Vec::new()));
-        let recorded = starts.clone();
-        app.add_system(RuntimePlugin::UPDATE, move |world: &mut World| {
-            for request in world
-                .event_reader::<StartAgent>()
-                .into_iter()
-                .cloned()
-                .collect::<Vec<_>>()
-            {
-                recorded.lock().unwrap().push(request);
-            }
-        });
-        let restarts = Arc::new(Mutex::new(Vec::new()));
-        let recorded = restarts.clone();
-        app.add_system(RuntimePlugin::UPDATE, move |world: &mut World| {
-            for request in world
-                .event_reader::<RestartAgent>()
-                .into_iter()
-                .cloned()
-                .collect::<Vec<_>>()
-            {
-                recorded.lock().unwrap().push(request);
-            }
-        });
-        let workspace_starts = Arc::new(Mutex::new(Vec::new()));
-        let recorded = workspace_starts.clone();
+        app.world_mut().insert_component(agent, ToolTasks::new());
+        app.world_mut().agent_ready(agent).unwrap();
+        let workspace_creates = Arc::new(Mutex::new(Vec::new()));
+        let recorded = workspace_creates.clone();
         app.add_system(RuntimePlugin::UPDATE, move |world: &mut World| {
             recorded
                 .lock()
                 .unwrap()
-                .extend(world.event_reader::<StartWorkspace>().into_iter().cloned());
+                .extend(world.event_reader::<CreateWorkspace>().into_iter().cloned());
         });
+        let agent_starts = Arc::new(Mutex::new(Vec::new()));
+        let recorded = agent_starts.clone();
+        app.add_system(RuntimePlugin::UPDATE,move|world:&mut World|{recorded.lock().unwrap().extend(world.event_reader::<StartWorkspaceAgent<tool_core::ToolExecuteResponse,tool_core::ToolError>>().into_iter().cloned());});
         let inference = Arc::new(Mutex::new(Vec::new()));
         let recorded = inference.clone();
         app.add_system(RuntimePlugin::UPDATE, move |world: &mut World| {
@@ -261,7 +185,22 @@ impl Harness {
                     .cloned(),
             );
         });
+        if real_workspace {
+            app.add_plugin(agent_plugin::AgentPlugin::new(
+                app.world()
+                    .get_resource::<agent_core::AgentUpdateContext>()
+                    .unwrap()
+                    .clone(),
+            ));
+            let root = app
+                .world_mut()
+                .remove_resource::<workspace_core::WorkspaceConfig>()
+                .unwrap()
+                .root;
+            app.add_plugin(workspace_plugin::WorkspacePlugin { root });
+        }
         app.add_plugin(DtoPlugin::new());
+        notify_sources(app.world_mut(), agent, None);
         app.add_plugin(ui_plugin::UiPlugin::new());
         if let Some((frames, events)) = counters {
             app.add_system(RuntimePlugin::UPDATE, move |_world: &mut World| {
@@ -283,6 +222,19 @@ impl Harness {
             assert!(Instant::now() < deadline);
             std::thread::yield_now();
         };
+        if real_workspace {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !app
+                .world()
+                .get_resource::<workspace_core::WorkspacePendingWork>()
+                .unwrap()
+                .is_idle()
+            {
+                app.tick();
+                assert!(Instant::now() < deadline);
+                std::thread::yield_now();
+            }
+        }
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -294,9 +246,8 @@ impl Harness {
             root,
             workspace,
             agent,
-            starts,
-            restarts,
-            workspace_starts,
+            workspace_creates,
+            agent_starts,
             inference,
         }
     }
@@ -403,16 +354,6 @@ impl Harness {
         })
     }
     fn request(&self, socket: &mut Socket, kind: &str, id: &str, message: Value) {
-        let message = if matches!(
-            kind,
-            "workspace.start" | "workspace.stop" | "workspace.restart"
-        ) && message.get("path").is_some()
-        {
-            let path = std::path::Path::new(message["path"].as_str().unwrap());
-            json!({"address":workspace_core::workspace_address(path.ancestors().nth(4).unwrap(),path).unwrap()})
-        } else {
-            message
-        };
         self.send(socket, json!({"type": kind, "id": id, "message": message}));
     }
     fn command(&self, socket: &mut Socket, id: &str, command: &str, arguments: Value) {
@@ -420,35 +361,11 @@ impl Harness {
             socket,
             "mcl.execute",
             id,
-            json!({"address": "agent:margatroid-demo-dev/coder:dev", "command": command, "arguments": arguments}),
+            json!({"address": "/demo/coder", "command": command, "arguments": arguments}),
         );
     }
     fn target(&self) -> Value {
-        json!({"address": "agent:margatroid-demo-dev/coder:dev"})
-    }
-    fn definition(&self) -> std::path::PathBuf {
-        self.root
-            .path()
-            .join("workspaces/margatroid/demo/dev/workspace.yaml")
-    }
-    fn add_definition(&self, directory: &str, _name: &str) -> std::path::PathBuf {
-        let parent = self
-            .root
-            .path()
-            .join("workspaces/margatroid")
-            .join(directory)
-            .join("dev");
-        std::fs::create_dir_all(&parent).unwrap();
-        let path = parent.join("workspace.yaml");
-        std::fs::write(
-            &path,
-            format!(
-                "project_root: {}\nmembers: []\n",
-                self.root.path().display()
-            ),
-        )
-        .unwrap();
-        path
+        json!({"address": "/demo/coder"})
     }
     fn wait(&mut self, condition: impl Fn(&Self) -> bool) {
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -493,7 +410,7 @@ fn websocket_registration_mcl_reply_and_audit_use_original_network_identity() {
         registered["client"]["address"]
             .as_str()
             .unwrap()
-            .starts_with("client:webui/browser:")
+            .starts_with("/clients/webui/browser/")
     );
     assert!(registered["client"].get("name").is_none());
     let (client, _) = harness
@@ -539,139 +456,6 @@ fn websocket_registration_mcl_reply_and_audit_use_original_network_identity() {
 }
 
 #[test]
-fn removed_agent_lifecycle_messages_never_dispatch_domain_events() {
-    let mut harness = Harness::new();
-    for operation in ["start", "stop", "restart"] {
-        let mut socket = harness.connect();
-        harness.register(&mut socket, "webui", operation);
-        harness.request(&mut socket,&format!("agent.{operation}"),"removed",json!({"address":"agent:margatroid-demo-dev/coder:dev","workspace":"workspace:margatroid/demo:dev","name":"coder"}));
-        harness.runtime.block_on(async {
-            tokio::time::timeout(Duration::from_secs(5), async {
-                loop {
-                    match socket.next().await {
-                        Some(Ok(Message::Close(Some(frame)))) => {
-                            assert_eq!(u16::from(frame.code), 1007);
-                            break;
-                        }
-                        Some(Ok(Message::Text(text))) => {
-                            let value: Value = serde_json::from_str(&text).unwrap();
-                            assert_ne!(value["type"], format!("agent.{operation}.result"));
-                        }
-                        Some(Ok(_)) => {}
-                        other => panic!("expected invalid-protocol close: {other:?}"),
-                    }
-                }
-            })
-            .await
-            .unwrap();
-        });
-    }
-    assert!(harness.starts.lock().unwrap().is_empty());
-    assert!(harness.restarts.lock().unwrap().is_empty());
-    assert_eq!(
-        harness
-            .app
-            .world()
-            .get_component::<Agent>(harness.agent)
-            .unwrap()
-            .state(),
-        AgentState::Running
-    );
-}
-
-#[test]
-fn workspace_queries_show_scanned_definitions_and_stop_uses_definition_path() {
-    let mut harness = Harness::new();
-    let cached = harness.add_definition("inactive", "inactive");
-    let mut socket = harness.connect();
-    harness.register(&mut socket, "webui", "browser");
-    harness
-        .app
-        .world()
-        .get_resource::<workspace_core::WorkspaceDefinitions>()
-        .unwrap()
-        .reload()
-        .unwrap();
-    harness.request(&mut socket, "workspace.req", "definitions", json!({}));
-    let definitions = harness.next(&mut socket, |value| value["id"] == "definitions");
-    assert_eq!(definitions["type"], "workspace.res");
-    assert_eq!(definitions["success"], true);
-    let scanned = definitions["workspaces"].as_array().unwrap();
-    let inactive = scanned
-        .iter()
-        .find(|entry| entry["path"] == cached.to_string_lossy().as_ref())
-        .unwrap();
-    assert!(inactive["definition"].get("name").is_none());
-    assert_eq!(inactive["status"], "inactive");
-    assert_eq!(inactive["address"], "workspace:margatroid/inactive:dev");
-    assert!(inactive.get("member_failures").is_none());
-    assert!(harness.workspace_starts.lock().unwrap().is_empty());
-    harness.request(
-        &mut socket,
-        "workspace.start",
-        "start-path",
-        json!({"path": cached}),
-    );
-    harness.wait(|harness| !harness.workspace_starts.lock().unwrap().is_empty());
-    let event = harness.workspace_starts.lock().unwrap()[0].clone();
-    assert_eq!(event.path, cached);
-    event
-        .reply
-        .lock()
-        .unwrap()
-        .take()
-        .unwrap()
-        .send(Ok(WorkspaceOperationOutput {
-            workspace: harness.workspace,
-            members: vec![harness.agent],
-            member_errors: vec![],
-        }))
-        .unwrap();
-    assert_eq!(
-        harness.next(&mut socket, |value| value["id"] == "start-path"),
-        json!({"type":"workspace.start.result","id":"start-path","success":true})
-    );
-    harness.request(
-        &mut socket,
-        "workspace.stop",
-        "stop",
-        json!({"path":harness.definition()}),
-    );
-    let deadline = Instant::now() + Duration::from_secs(5);
-    let stop = loop {
-        harness.app.tick();
-        if let Some(event) = harness
-            .app
-            .world()
-            .event_reader::<workspace_core::StopWorkspace>()
-            .into_iter()
-            .next()
-        {
-            break event.clone();
-        }
-        assert!(Instant::now() < deadline);
-    };
-    harness.app.world_mut().despawn(harness.workspace);
-    stop.reply
-        .lock()
-        .unwrap()
-        .take()
-        .unwrap()
-        .send(Ok(WorkspaceOperationOutput {
-            workspace: stop.workspace,
-            members: vec![],
-            member_errors: vec![],
-        }))
-        .unwrap();
-
-    let reply = harness.next(&mut socket, |value| value["id"] == "stop");
-    assert_eq!(
-        reply,
-        json!({"type":"workspace.stop.result","id":"stop","success":true})
-    );
-}
-
-#[test]
 fn persisted_history_is_independent_from_classified_state_and_preserves_real_sequences() {
     let mut harness = Harness::new();
     harness.append("first", 1234);
@@ -708,10 +492,10 @@ fn persisted_history_is_independent_from_classified_state_and_preserves_real_seq
     harness
         .app
         .world_mut()
-        .agent_transition(harness.agent, AgentState::Starting, None)
+        .agent_begin_close(harness.agent)
         .unwrap();
     let state = harness.next(&mut socket, |value| {
-        value["type"] == "agent.sync" && value["agents"][0]["status"] == "starting"
+        value["type"] == "agent.sync" && value["agents"][0]["status"] == "closing"
     });
     assert!(state.get("histories").is_none());
     connection.execute("DROP TABLE agent_messages", []).unwrap();
@@ -746,12 +530,12 @@ fn classified_sync_deduplicates_targets_and_never_leaks_to_other_clients() {
     harness
         .app
         .world_mut()
-        .agent_transition(harness.agent, AgentState::Running, Some("changed".into()))
+        .agent_set_turn(harness.agent, Some("changed".into()))
         .unwrap();
     let turn = harness.next(&mut browser, |value| {
         value["type"] == "agent.turn.sync" && value["turn"] == "changed"
     });
-    assert_eq!(turn["address"], "agent:margatroid-demo-dev/coder:dev");
+    assert_eq!(turn["address"], "/demo/coder");
     assert!(turn.get("instance").is_none());
     assert!(
         harness
@@ -799,6 +583,7 @@ fn abort_control_runs_next_frame_freezes_inference_and_only_cancels_unreturned_t
             .unwrap()
             .update_context(),
         Some(turn.clone()),
+        fake_finish(&harness),
     )
     .unwrap();
     task.return_result(Ok(tool_core::ToolExecuteResponse {
@@ -826,6 +611,7 @@ fn abort_control_runs_next_frame_freezes_inference_and_only_cancels_unreturned_t
             .unwrap()
             .update_context(),
         Some(turn.clone()),
+        fake_finish(&harness),
     )
     .unwrap();
     let tasks = harness
@@ -860,6 +646,7 @@ fn abort_control_runs_next_frame_freezes_inference_and_only_cancels_unreturned_t
                 marked.store(true, std::sync::atomic::Ordering::Release);
             }),
             task: Default::default(),
+            source_alive: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         };
         inference.attach_task(handle).unwrap();
         inference
@@ -868,7 +655,7 @@ fn abort_control_runs_next_frame_freezes_inference_and_only_cancels_unreturned_t
         &mut socket,
         "agent.turn.abort",
         "abort",
-        json!({"address": "agent:margatroid-demo-dev/coder:dev", "turn": turn}),
+        json!({"address": "/demo/coder", "turn": turn}),
     );
     harness.ingress_barrier(&mut socket);
     harness.app.tick();
@@ -906,7 +693,7 @@ fn abort_control_runs_next_frame_freezes_inference_and_only_cancels_unreturned_t
     harness
         .app
         .world_mut()
-        .agent_transition(harness.agent, AgentState::Running, None)
+        .agent_set_turn(harness.agent, None)
         .unwrap();
     let turn = harness
         .app
@@ -917,11 +704,10 @@ fn abort_control_runs_next_frame_freezes_inference_and_only_cancels_unreturned_t
         &mut socket,
         "agent.turn.abort",
         "stale",
-        json!({"address": "agent:margatroid-demo-dev/coder:dev", "turn": format!("{turn}-stale")}),
+        json!({"address": "/demo/coder", "turn": format!("{turn}-stale")}),
     );
     harness.ingress_barrier(&mut socket);
     harness.app.tick();
-    vm(harness.app.world_mut(), harness.agent, "driver-new");
     let reply = harness.next(&mut socket, |value| value["id"] == "stale");
     assert_eq!(reply["success"], false);
     assert_eq!(reply["error"]["code"], "StateRejected");
@@ -934,76 +720,6 @@ fn abort_control_runs_next_frame_freezes_inference_and_only_cancels_unreturned_t
             .turn()
             .is_some()
     );
-}
-
-#[test]
-fn same_network_id_on_two_connections_and_disconnected_late_results_stay_isolated() {
-    let mut harness = Harness::new();
-    let mut first = harness.connect();
-    let registered = harness.register(&mut first, "webui", "first");
-    let first_id = harness.registered_connection(&registered);
-    let mut second = harness.connect();
-    harness.register(&mut second, "webui", "second");
-    let first_path = harness.add_definition("first", "first");
-    let second_path = harness.add_definition("second", "second");
-    for (socket, path) in [(&mut first, &first_path), (&mut second, &second_path)] {
-        harness.request(socket, "workspace.start", "same-id", json!({"path": path}));
-    }
-    harness.wait(|harness| harness.workspace_starts.lock().unwrap().len() == 2);
-    let requests = harness.workspace_starts.lock().unwrap().clone();
-    assert_ne!(requests[0].id, requests[1].id);
-    assert!(requests.iter().all(|request| request.id != "same-id"));
-    let response = requests
-        .iter()
-        .find(|request| request.path == first_path)
-        .unwrap()
-        .reply
-        .lock()
-        .unwrap()
-        .take()
-        .unwrap();
-    let _ = response.send(Ok(WorkspaceOperationOutput {
-        workspace: harness.workspace,
-        members: vec![],
-        member_errors: vec![],
-    }));
-    assert_eq!(
-        harness.next(&mut first, |value| value["type"]
-            == "workspace.start.result")["id"],
-        "same-id"
-    );
-    assert!(
-        harness
-            .collect(&mut second, 5)
-            .iter()
-            .all(|value| value["type"] != "workspace.start.result")
-    );
-    harness.runtime.block_on(second.close(None)).unwrap();
-    drop(second);
-    harness.wait(|harness| harness.app.world().query_with::<Client>().result().len() == 1);
-    let response = requests
-        .iter()
-        .find(|request| request.path == second_path)
-        .unwrap()
-        .reply
-        .lock()
-        .unwrap()
-        .take()
-        .unwrap();
-    let _ = response.send(Ok(WorkspaceOperationOutput {
-        workspace: harness.workspace,
-        members: vec![],
-        member_errors: vec![],
-    }));
-    let mut replacement = harness.connect();
-    harness.register(&mut replacement, "webui", "second");
-    assert!(
-        harness
-            .collect(&mut replacement, 8)
-            .iter()
-            .all(|value| value["type"] != "workspace.start.result")
-    );
-    assert!(harness.app.world().client_by_connection(first_id).is_some());
 }
 
 #[test]
@@ -1082,7 +798,6 @@ fn original_mcl_reply_keeps_request_identity_and_invalid_input_never_echoes_secr
         json!([[{"type": "user", "content": "question"}]]),
     );
     harness.wait(|harness| !harness.inference.lock().unwrap().is_empty());
-    vm(harness.app.world_mut(), harness.agent, "new-instance");
     let request = harness.inference.lock().unwrap()[0].clone();
     request
         .reply
@@ -1136,14 +851,7 @@ fn agent_projection_reads_current_tools_sandboxes_and_public_model_fields() {
     use sandbox_resource_core::{Sandboxes, SelectedSandbox};
     use tool_resource_core::{ToolEntry, Tools};
     let mut harness = Harness::new();
-    let mut tools = Tools::new(
-        harness
-            .app
-            .world()
-            .get_resource::<tool_resource_core::ToolResourceSyncBinding>()
-            .unwrap()
-            .for_owner(harness.agent),
-    );
+    let mut tools = Tools::new();
     tools
         .insert(
             "bash".into(),
@@ -1174,9 +882,10 @@ fn agent_projection_reads_current_tools_sandboxes_and_public_model_fields() {
         harness
             .app
             .world()
-            .get_resource::<sandbox_resource_core::SandboxSyncBinding>()
+            .get_resource::<sandbox_resource_core::SandboxObserverFactory>()
             .unwrap()
-            .for_owner(harness.agent),
+            .for_owner(harness.agent)
+            .0,
     );
     sandboxes.insert(
         "read_only".into(),
@@ -1193,13 +902,14 @@ fn agent_projection_reads_current_tools_sandboxes_and_public_model_fields() {
     let selection_probe = harness
         .app
         .world()
-        .get_resource::<sandbox_resource_core::SandboxSelectionSyncBinding>()
+        .get_resource::<sandbox_resource_core::SandboxObserverFactory>()
         .unwrap()
-        .for_owner(harness.agent);
+        .for_owner(harness.agent)
+        .1;
     let model_probe = harness
         .app
         .world()
-        .get_resource::<inference_core::ModelSyncBinding>()
+        .get_resource::<inference_core::ModelObserverFactory>()
         .unwrap()
         .for_owner(harness.agent);
     harness.app.world_mut().insert_component(
@@ -1237,8 +947,7 @@ fn agent_projection_reads_current_tools_sandboxes_and_public_model_fields() {
                 },
             )]),
         ));
-    let waits =
-        agent_core::notify_agent_runtime(harness.app.world_mut(), harness.agent, false).unwrap();
+    let waits = notify_changed(harness.app.world_mut(), harness.agent);
     assert!(waits.is_empty());
     let mut socket = harness.connect();
     harness.register(&mut socket, "webui", "resource-panel");
@@ -1340,8 +1049,7 @@ fn agent_projection_reads_current_tools_sandboxes_and_public_model_fields() {
         .app
         .world_mut()
         .remove_component::<inference_core::AgentInferenceConfig>(harness.agent);
-    let waits =
-        agent_core::notify_agent_runtime(harness.app.world_mut(), harness.agent, false).unwrap();
+    let waits = notify_changed(harness.app.world_mut(), harness.agent);
     assert!(waits.is_empty());
     let cleared = harness.next(&mut socket, |value| {
         value["type"] == "agent.sync" && value["agents"][0]["sandboxes"] == json!([])
@@ -1483,6 +1191,7 @@ fn task_queries_and_complete_sync_do_not_consume_script_output_or_replaced_marke
             .unwrap()
             .update_context(),
         None,
+        fake_finish(&harness),
     )
     .unwrap();
     task.replace(json!("first")).unwrap();
@@ -1576,53 +1285,6 @@ fn native_service_shutdown_closes_registered_and_unregistered_connections() {
 }
 
 #[test]
-fn original_oneshot_reaches_websocket_without_another_world_frame() {
-    let mut harness = Harness::new();
-    let mut socket = harness.connect();
-    harness.register(&mut socket, "webui", "browser");
-    let path = harness.add_definition("direct", "direct");
-    harness.request(
-        &mut socket,
-        "workspace.start",
-        "direct-reply",
-        json!({"path":path}),
-    );
-    harness.wait(|h| !h.workspace_starts.lock().unwrap().is_empty());
-    let request = harness.workspace_starts.lock().unwrap()[0].clone();
-    request
-        .reply
-        .lock()
-        .unwrap()
-        .take()
-        .unwrap()
-        .send(Ok(WorkspaceOperationOutput {
-            workspace: harness.workspace,
-            members: vec![],
-            member_errors: vec![],
-        }))
-        .unwrap();
-    let result = harness.runtime.block_on(async {
-        tokio::time::timeout(Duration::from_secs(2), async {
-            loop {
-                let Message::Text(text) = socket.next().await.unwrap().unwrap() else {
-                    continue;
-                };
-                let value: Value = serde_json::from_str(&text).unwrap();
-                if value["id"] == "direct-reply" {
-                    break value;
-                }
-            }
-        })
-        .await
-        .unwrap()
-    });
-    assert_eq!(
-        result,
-        json!({"type":"workspace.start.result","id":"direct-reply","success":true})
-    );
-}
-
-#[test]
 fn driver_ui_query_and_sync_follow_actual_source_and_recover_from_resource_errors() {
     let mut harness = Harness::new();
     let mut socket = harness.connect();
@@ -1630,21 +1292,12 @@ fn driver_ui_query_and_sync_follow_actual_source_and_recover_from_resource_error
     let source = harness.root.path().join("loaded-driver");
     std::fs::create_dir_all(source.join("ui")).unwrap();
     std::fs::write(source.join("ui/index.html"), "first").unwrap();
-    harness.app.world_mut().insert_component(
+    notify_sources(
+        harness.app.world_mut(),
         harness.agent,
-        agent_core::AgentResources {
-            parameters: agent_core::AgentStartParameters {
-                initial_settings_path: source.join("setting.toml"),
-                ui_path: source.join("ui"),
-                settings_path: source.join("setting.toml"),
-                database_path: source.join("state.sqlite"),
-                project_root: source.clone(),
-                home_root: source.clone(),
-            },
-        },
+        Some(source.join("ui")),
     );
-    let waits =
-        agent_core::notify_agent_runtime(harness.app.world_mut(), harness.agent, false).unwrap();
+    let waits = notify_changed(harness.app.world_mut(), harness.agent);
     harness.runtime.block_on(async {
         for wait in waits {
             wait.await.unwrap();
@@ -1654,7 +1307,7 @@ fn driver_ui_query_and_sync_follow_actual_source_and_recover_from_resource_error
         v["type"] == "agent.ui.sync" && v["ui"]["entry"] == "index.html"
     });
     assert_eq!(initial["ui"]["files"][0]["data"], "Zmlyc3Q=");
-    assert_eq!(initial["address"], "agent:margatroid-demo-dev/coder:dev");
+    assert_eq!(initial["address"], "/demo/coder");
     harness.request(&mut socket, "agent.ui.req", "ui-read", harness.target());
     let response = harness.next(&mut socket, |v| v["id"] == "ui-read");
     assert_eq!(response["ui"], initial["ui"]);
@@ -1693,15 +1346,12 @@ fn driver_ui_query_and_sync_follow_actual_source_and_recover_from_resource_error
     let replacement = harness.root.path().join("replacement-driver");
     std::fs::create_dir_all(replacement.join("ui")).unwrap();
     std::fs::write(replacement.join("ui/index.html"), "second").unwrap();
-    harness
-        .app
-        .world_mut()
-        .get_component_mut::<agent_core::AgentResources>(harness.agent)
-        .unwrap()
-        .parameters
-        .ui_path = replacement.join("ui");
-    let waits =
-        agent_core::notify_agent_runtime(harness.app.world_mut(), harness.agent, false).unwrap();
+    notify_sources(
+        harness.app.world_mut(),
+        harness.agent,
+        Some(replacement.join("ui")),
+    );
+    let waits = notify_changed(harness.app.world_mut(), harness.agent);
     harness.runtime.block_on(async {
         for wait in waits {
             wait.await.unwrap();
@@ -1753,21 +1403,12 @@ fn driver_ui_change_advances_an_idle_event_driven_world_without_polling_queries(
     std::fs::create_dir_all(source.join("ui")).unwrap();
     let entry = source.join("ui/index.html");
     std::fs::write(&entry, "before").unwrap();
-    harness.app.world_mut().insert_component(
+    notify_sources(
+        harness.app.world_mut(),
         harness.agent,
-        agent_core::AgentResources {
-            parameters: agent_core::AgentStartParameters {
-                initial_settings_path: source.join("setting.toml"),
-                ui_path: source.join("ui"),
-                settings_path: source.join("setting.toml"),
-                database_path: source.join("state.sqlite"),
-                project_root: source.clone(),
-                home_root: source.clone(),
-            },
-        },
+        Some(source.join("ui")),
     );
-    let waits =
-        agent_core::notify_agent_runtime(harness.app.world_mut(), harness.agent, false).unwrap();
+    let waits = notify_changed(harness.app.world_mut(), harness.agent);
     harness.runtime.block_on(async {
         for wait in waits {
             wait.await.unwrap();
@@ -1931,6 +1572,7 @@ fn task_output_return_and_cleanup_reach_websocket_without_any_world_update_frame
         reply,
         tasks.update_context(),
         None,
+        fake_finish(&harness),
     )
     .unwrap();
     let stop = Arc::new(AtomicBool::new(false));
@@ -1998,145 +1640,60 @@ fn task_output_return_and_cleanup_reach_websocket_without_any_world_update_frame
     harness.wait(|_| server.is_stopped());
 }
 
-fn test_probe<T>() -> client_core::UpdateProbe<T> {
-    client_core::UpdateProbe::new(|_| {})
+fn test_probe<T: Send + 'static>() -> Arc<dyn Fn(T) + Send + Sync> {
+    Arc::new(|_| {})
+}
+fn fake_finish(h: &Harness) -> tool_core::TaskFinish {
+    let tasks = h
+        .app
+        .world()
+        .get_component::<ToolTasks>(h.agent)
+        .unwrap()
+        .clone();
+    Arc::new(move |handle| {
+        let tasks = tasks.clone();
+        Box::pin(async move {
+            handle.cancel();
+            handle.finish_children().await?;
+            handle.retry_cleanups().await?;
+            let id = tasks
+                .list()
+                .into_iter()
+                .find(|(_, current)| current.same_task(&handle))
+                .map(|(id, _)| id)
+                .unwrap_or_default();
+            tasks.complete_cleanup(&id, &handle, None);
+            Ok(())
+        })
+    })
 }
 
-#[test]
-fn workspace_definition_disk_changes_reach_websocket_without_world_frames() {
-    use app_runtime_plugin::{AppRunExt, RuntimeHandle};
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    let frames = Arc::new(AtomicUsize::new(0));
-    let events = Arc::new(AtomicUsize::new(0));
-    let mut harness = Harness::with_counters(Some((frames.clone(), events)));
-    let mut socket = harness.connect();
-    harness.register(&mut socket, "webui", "definition-monitor");
-    harness.collect(&mut socket, 10);
-    let directory = harness.root.path().join("workspaces/margatroid/added/dev");
-    let definition = directory.join("workspace.yaml");
-    let stop = Arc::new(AtomicBool::new(false));
-    let stopping = stop.clone();
-    let runtime = harness
-        .app
-        .world()
-        .get_resource::<RuntimeHandle>()
+fn notify_changed(world: &mut World, owner: Entity) -> Vec<agent_core::AgentObservationWait> {
+    let context = world
+        .get_resource::<agent_core::AgentUpdateContext>()
         .unwrap()
         .clone();
-    let counted = frames.clone();
-    let io_runtime = harness.runtime;
-    let worker = std::thread::spawn(move || {
-        struct Stop(Arc<AtomicBool>, RuntimeHandle);
-        impl Drop for Stop {
-            fn drop(&mut self) {
-                self.0.store(true, Ordering::Release);
-                self.1.wake();
-            }
-        }
-        let _stop = Stop(stopping, runtime);
-        io_runtime.block_on(async move {
-            async fn wait(socket: &mut Socket, predicate: impl Fn(&Value) -> bool) {
-                tokio::time::timeout(Duration::from_secs(5), async {
-                    loop {
-                        let Some(Ok(Message::Text(text))) = socket.next().await else {
-                            continue;
-                        };
-                        let value: Value = serde_json::from_str(&text).unwrap();
-                        if predicate(&value) {
-                            break;
-                        }
-                    }
-                })
-                .await
-                .unwrap();
-            }
-            tokio::time::sleep(Duration::from_millis(200)).await;
-            let before = counted.load(Ordering::Acquire);
-            std::fs::create_dir_all(&directory).unwrap();
-            std::fs::write(&definition, "project_root: .\nmembers: []\n").unwrap();
-            wait(&mut socket, |v| {
-                v["type"] == "workspace.sync"
-                    && v["workspaces"].as_array().is_some_and(|rows| {
-                        rows.iter()
-                            .any(|r| r["address"] == "workspace:margatroid/added:dev")
-                    })
-            })
-            .await;
-            std::fs::write(&definition, "").unwrap();
-            wait(&mut socket, |v| {
-                v["type"] == "workspace.sync"
-                    && v["workspaces"].as_array().is_some_and(|rows| {
-                        rows.iter().any(|r| {
-                            r["address"] == "workspace:margatroid/added:dev"
-                                && r["error"].is_object()
-                        })
-                    })
-            })
-            .await;
-            std::fs::write(&definition, "project_root: .\nmembers: []\n").unwrap();
-            wait(&mut socket, |v| {
-                v["type"] == "workspace.sync"
-                    && v["workspaces"].as_array().is_some_and(|rows| {
-                        rows.iter().any(|r| {
-                            r["address"] == "workspace:margatroid/added:dev" && r["error"].is_null()
-                        })
-                    })
-            })
-            .await;
-            let renamed = directory
-                .parent()
-                .unwrap()
-                .parent()
-                .unwrap()
-                .join("renamed/dev");
-            assert_eq!(
-                directory.parent().unwrap().parent().unwrap(),
-                renamed.parent().unwrap().parent().unwrap()
-            );
-            std::fs::create_dir_all(renamed.parent().unwrap()).unwrap();
-            std::fs::rename(&directory, &renamed).unwrap();
-            wait(&mut socket, |value| {
-                value["type"] == "workspace.sync"
-                    && value["workspaces"].as_array().is_some_and(|rows| {
-                        rows.iter()
-                            .any(|row| row["address"] == "workspace:margatroid/renamed:dev")
-                            && !rows
-                                .iter()
-                                .any(|row| row["address"] == "workspace:margatroid/added:dev")
-                    })
-            })
-            .await;
-            let definition = renamed.join("workspace.yaml");
-            assert!(definition.starts_with(&renamed));
-            std::fs::remove_file(&definition).unwrap();
-            wait(&mut socket, |v| {
-                v["type"] == "workspace.sync"
-                    && v["workspaces"].as_array().is_some_and(|rows| {
-                        rows.iter()
-                            .all(|r| r["address"] != "workspace:margatroid/renamed:dev")
-                    })
-            })
-            .await;
-            assert_eq!(
-                before,
-                counted.load(Ordering::Acquire),
-                "disk updates advanced World frames"
-            );
-        });
-    });
-    harness.app.run_until(|| stop.load(Ordering::Acquire));
-    worker.join().unwrap();
-    let server = harness
-        .app
-        .world()
-        .get_resource::<AxumHandle>()
+    context.notify(world, owner, agent_core::AgentUpdateKind::Changed)
+}
+fn notify_sources(world: &mut World, owner: Entity, ui_path: Option<std::path::PathBuf>) {
+    let context = world
+        .get_resource::<agent_core::AgentUpdateContext>()
         .unwrap()
         .clone();
-    server.request_shutdown();
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while !server.is_stopped() {
-        harness.app.tick();
-        assert!(Instant::now() < deadline);
-        std::thread::sleep(Duration::from_millis(1));
+    let waits = context.notify(
+        world,
+        owner,
+        agent_core::AgentUpdateKind::SourcesInstalled { ui_path },
+    );
+    if !waits.is_empty() {
+        world
+            .get_resource::<async_runtime_plugin::AsyncRuntimeHandle>()
+            .unwrap()
+            .spawn(async move {
+                for wait in waits {
+                    wait.await.unwrap();
+                }
+            });
     }
 }
 
@@ -2148,14 +1705,17 @@ fn turn_and_resource_mutations_publish_without_another_world_tick() {
     let mut socket = harness.connect();
     harness.register(&mut socket, "webui", "sync-probes");
     harness.collect(&mut socket, 5);
-    let tools = Tools::new(
+    let mut tools = Tools::new();
+    let callback = dto_plugin::resource_sync_bindings(
         harness
             .app
             .world()
-            .get_resource::<tool_resource_core::ToolResourceSyncBinding>()
+            .get_resource::<agent_core::AgentUpdateContext>()
             .unwrap()
-            .for_owner(harness.agent),
-    );
+            .clone(),
+    )
+    .for_owner(harness.agent);
+    tools.observe(move |value| callback(value));
     harness
         .app
         .world_mut()
@@ -2164,9 +1724,10 @@ fn turn_and_resource_mutations_publish_without_another_world_tick() {
         harness
             .app
             .world()
-            .get_resource::<sandbox_resource_core::SandboxSyncBinding>()
+            .get_resource::<sandbox_resource_core::SandboxObserverFactory>()
             .unwrap()
-            .for_owner(harness.agent),
+            .for_owner(harness.agent)
+            .0,
     );
     harness
         .app
@@ -2177,9 +1738,10 @@ fn turn_and_resource_mutations_publish_without_another_world_tick() {
         harness
             .app
             .world()
-            .get_resource::<sandbox_resource_core::SandboxSelectionSyncBinding>()
+            .get_resource::<sandbox_resource_core::SandboxObserverFactory>()
             .unwrap()
-            .for_owner(harness.agent),
+            .for_owner(harness.agent)
+            .1,
     );
     harness
         .app
@@ -2266,6 +1828,7 @@ fn aborting_user_turn_preserves_free_inference_and_free_pending_tool() {
         cancel: CancellationToken::new(),
         stop_stream: Arc::new(|| panic!("free stream must not be frozen by turn abort")),
         task: Default::default(),
+        source_alive: Arc::new(std::sync::atomic::AtomicBool::new(true)),
     };
     handle
         .attach_task(harness.runtime.spawn(async move {
@@ -2292,6 +1855,7 @@ fn aborting_user_turn_preserves_free_inference_and_free_pending_tool() {
         reply,
         tasks.update_context(),
         None,
+        fake_finish(&harness),
     )
     .unwrap();
     tasks.register("free-task".into(), tool.clone()).unwrap();
@@ -2299,7 +1863,7 @@ fn aborting_user_turn_preserves_free_inference_and_free_pending_tool() {
         &mut socket,
         "agent.turn.abort",
         "abort-free",
-        json!({"address":"agent:margatroid-demo-dev/coder:dev","turn":turn}),
+        json!({"address":"/demo/coder","turn":turn}),
     );
     let reply = harness.next(&mut socket, |value| value["id"] == "abort-free");
     assert_eq!(reply["success"], true);
@@ -2387,7 +1951,7 @@ impl Harness {
         }
     }
 }
-const FILE_ROOT: &str = "/workspace%3Amargatroid%2Fdemo%3Adev";
+const FILE_ROOT: &str = "/%2Fdemo";
 #[cfg(unix)]
 #[test]
 fn workspace_file_get_head_and_updates_use_actual_working_directory_without_agent_or_registration()
@@ -2426,17 +1990,6 @@ fn workspace_file_get_head_and_updates_use_actual_working_directory_without_agen
     let wrong = h.root.path().join("new-definition-root");
     std::fs::create_dir(&wrong).unwrap();
     std::fs::write(wrong.join("mikuji.png"), b"wrong-definition").unwrap();
-    std::fs::write(
-        h.definition(),
-        format!("project_root: {}\nmembers: []\n", wrong.display()),
-    )
-    .unwrap();
-    h.app
-        .world()
-        .get_resource::<WorkspaceDefinitions>()
-        .unwrap()
-        .reload()
-        .unwrap();
     std::fs::write(h.root.path().join("mikuji.png"), b"changed-actual-root").unwrap();
     assert_eq!(
         h.file_http("GET", &format!("{FILE_ROOT}/mikuji.png"), "")
@@ -2535,15 +2088,7 @@ fn workspace_file_identity_lifecycle_and_ingress_are_checked_per_request() {
             .status,
         400
     );
-    assert_eq!(
-        h.file_http(
-            "GET",
-            "/workspace%3Amargatroid%2Fabsent%3Adev/sample.txt",
-            ""
-        )
-        .status,
-        404
-    );
+    assert_eq!(h.file_http("GET", "/%2Fabsent/sample.txt", "").status, 404);
     assert_eq!(
         h.file_http(
             "GET",
@@ -2562,29 +2107,23 @@ fn workspace_file_identity_lifecycle_and_ingress_are_checked_per_request() {
         .status,
         403
     );
-    for state in [
-        WorkspaceState::Starting,
-        WorkspaceState::Running,
-        WorkspaceState::Error,
-    ] {
-        workspace_core::update_workspace(
-            h.app.world_mut(),
-            h.workspace,
-            workspace_core::WorkspaceChange::State(state),
-        )
-        .unwrap();
+    for state in [WorkspaceState::Running, WorkspaceState::Error] {
+        h.app
+            .world_mut()
+            .get_component_mut::<workspace_core::Workspace>(h.workspace)
+            .unwrap()
+            .set_state(state);
         assert_eq!(
             h.file_http("GET", &format!("{FILE_ROOT}/sample.txt"), "")
                 .status,
             200
         );
     }
-    workspace_core::update_workspace(
-        h.app.world_mut(),
-        h.workspace,
-        workspace_core::WorkspaceChange::State(WorkspaceState::Stopping),
-    )
-    .unwrap();
+    h.app
+        .world_mut()
+        .get_component_mut::<workspace_core::Workspace>(h.workspace)
+        .unwrap()
+        .set_state(WorkspaceState::Deleting);
     assert_eq!(
         h.file_http("GET", &format!("{FILE_ROOT}/sample.txt"), "")
             .status,
@@ -2636,24 +2175,23 @@ fn workspace_files_use_complete_addresses_when_display_names_are_equal() {
     let entity = h.app.world_mut().spawn();
     h.app
         .world_mut()
-        .insert_component(entity, Address::new("workspace:other/demo:dev").unwrap());
-    let updates = h
-        .app
-        .world()
-        .get_component::<workspace_core::Workspace>(h.workspace)
-        .unwrap()
-        .updates();
+        .insert_component(entity, Address::new("/other").unwrap());
+    let managed = second.path().join("managed");
+    for kind in ["normal", "temporary", "archived"] {
+        std::fs::create_dir_all(managed.join("agents").join(kind)).unwrap();
+    }
+    let database = WorkspaceDatabase::create(
+        managed.join("workspace.sqlite"),
+        WorkspaceMetadata {
+            address: "/other".into(),
+            alias: "demo".into(),
+            project_root: second.path().into(),
+        },
+    )
+    .unwrap();
     h.app.world_mut().insert_component(
         entity,
-        workspace_core::Workspace::new(
-            "demo".into(),
-            second.path().join("workspace.yaml"),
-            second.path().into(),
-            WorkspaceState::Running,
-            BTreeSet::new(),
-            None,
-            updates,
-        ),
+        workspace_core::Workspace::new("demo".into(), second.path().into(), database),
     );
     assert_eq!(
         h.file_http("GET", &format!("{FILE_ROOT}/same.png"), "")
@@ -2661,8 +2199,7 @@ fn workspace_files_use_complete_addresses_when_display_names_are_equal() {
         b"first-workspace"
     );
     assert_eq!(
-        h.file_http("GET", "/workspace%3Aother%2Fdemo%3Adev/same.png", "")
-            .body,
+        h.file_http("GET", "/%2Fother/same.png", "").body,
         b"second-workspace"
     );
     let origin = format!("Origin: http://{}\r\n", h.server);
@@ -2724,88 +2261,723 @@ fn generated_error_history_is_queryable_without_a_second_full_and_independent_er
     );
 }
 
+fn workspace_database(h: &Harness) -> WorkspaceDatabase {
+    h.app
+        .world()
+        .get_component::<workspace_core::Workspace>(h.workspace)
+        .unwrap()
+        .database
+        .clone()
+}
+fn register_record(h: &Harness, node: &str) -> workspace_core::WorkspaceAgent {
+    let db = workspace_database(h);
+    let operation = db.try_operation(node).unwrap();
+    let candidate = db
+        .prepare_agent(
+            &operation,
+            "/demo".into(),
+            Some(node.into()),
+            Some("worker".into()),
+            h.root.path().join("driver/tool.toml"),
+            json!({"node_name":node,"path":"."}),
+        )
+        .unwrap();
+    std::fs::create_dir_all(db.agent_directory(&candidate).unwrap()).unwrap();
+    db.commit_agent(&operation, candidate).unwrap()
+}
+fn tool_reply(
+    request: &StartWorkspaceAgent<tool_core::ToolExecuteResponse, tool_core::ToolError>,
+) -> workspace_core::WorkspaceAgentReply<tool_core::ToolExecuteResponse, tool_core::ToolError> {
+    match request {
+        StartWorkspaceAgent::Existing { reply, .. } | StartWorkspaceAgent::New { reply, .. } => {
+            reply.clone()
+        }
+    }
+}
+fn complete_driver(
+    request: &StartWorkspaceAgent<tool_core::ToolExecuteResponse, tool_core::ToolError>,
+) {
+    tool_reply(request)
+        .lock()
+        .unwrap()
+        .take()
+        .unwrap()
+        .send(Ok(tool_core::ToolExecuteResponse {
+            call_id: "driver-task".into(),
+            alias: "driver".into(),
+            content: "started".into(),
+            images: vec![],
+            failed: false,
+        }))
+        .unwrap();
+}
 #[test]
-fn workspace_resource_crud_uses_addresses_and_publishes_without_reload() {
-    let mut harness = Harness::new();
-    let mut socket = harness.connect();
-    harness.register(&mut socket, "webui", "crud");
-    let address = "workspace:margatroid/new-project:dev";
-    let new_address = "workspace:margatroid/renamed:dev";
-    let definition = json!({"project_root":harness.root.path(),"agents":[]});
-    harness.request(
+fn startup_variants_preserve_driver_arguments_and_original_reply_without_world_frames() {
+    let mut h = Harness::new();
+    let mut socket = h.connect();
+    h.register(&mut socket, "webui", "startup");
+    let path = h.root.path().join("driver/tool.toml");
+    let arguments = json!({"node_name":"new","alias":"worker","path":"src","custom":{"value":3}});
+    h.request(
+        &mut socket,
+        "agent.start",
+        "new",
+        json!({"mode":"new","workspace":"/demo","tool_path":path,"arguments":arguments}),
+    );
+    h.wait(|h| h.agent_starts.lock().unwrap().len() == 1);
+    let request = h.agent_starts.lock().unwrap()[0].clone();
+    match &request {
+        StartWorkspaceAgent::New {
+            workspace,
+            tool_path,
+            arguments: actual,
+            ..
+        } => {
+            assert_eq!(*workspace, h.workspace);
+            assert_eq!(tool_path, &path);
+            assert_eq!(actual, &arguments);
+        }
+        _ => panic!("wrong startup variant"),
+    }
+    complete_driver(&request);
+    let response = h.runtime.block_on(async {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(Ok(Message::Text(text))) = socket.next().await {
+                    let value: Value = serde_json::from_str(&text).unwrap();
+                    if value["id"] == "new" {
+                        break value;
+                    }
+                }
+            }
+        })
+        .await
+        .unwrap()
+    });
+    assert_eq!(
+        response,
+        json!({"type":"agent.start.result","id":"new","success":true})
+    );
+    h.request(
+        &mut socket,
+        "agent.start",
+        "existing",
+        json!({"mode":"existing","workspace":"/demo","node_name":"coder"}),
+    );
+    h.wait(|h| h.agent_starts.lock().unwrap().len() == 2);
+    let request = h.agent_starts.lock().unwrap()[1].clone();
+    assert!(
+        matches!(&request,StartWorkspaceAgent::Existing{workspace,node_name,..}if *workspace==h.workspace && node_name=="coder")
+    );
+    complete_driver(&request);
+    assert_eq!(
+        h.next(&mut socket, |v| v["id"] == "existing")["success"],
+        true
+    );
+}
+#[test]
+fn same_request_id_on_two_connections_and_late_disconnected_reply_are_isolated() {
+    let mut h = Harness::new();
+    let mut first = h.connect();
+    h.register(&mut first, "webui", "first");
+    let mut second = h.connect();
+    h.register(&mut second, "webui", "second");
+    for (socket, node) in [(&mut first, "first"), (&mut second, "second")] {
+        h.request(
+            socket,
+            "agent.start",
+            "same",
+            json!({"mode":"existing","workspace":"/demo","node_name":node}),
+        );
+    }
+    h.wait(|h| h.agent_starts.lock().unwrap().len() == 2);
+    let requests = h.agent_starts.lock().unwrap().clone();
+    let by_node = |node: &str| {
+        requests
+            .iter()
+            .find(|r| matches!(r,StartWorkspaceAgent::Existing{node_name,..}if node_name==node))
+            .unwrap()
+    };
+    complete_driver(by_node("first"));
+    assert_eq!(h.next(&mut first, |v| v["id"] == "same")["success"], true);
+    assert!(
+        h.collect(&mut second, 3)
+            .iter()
+            .all(|v| v["type"] != "agent.start.result")
+    );
+    h.runtime.block_on(second.close(None)).unwrap();
+    drop(second);
+    h.wait(|h| h.app.world().query_with::<Client>().result().len() == 1);
+    let sender = tool_reply(by_node("second"))
+        .lock()
+        .unwrap()
+        .take()
+        .unwrap();
+    let _ = sender.send(Err(tool_core::ToolError::new(
+        tool_core::ToolErrorKind::ExecutionFailed,
+        "late",
+    )));
+    assert!(
+        h.collect(&mut first, 5)
+            .iter()
+            .all(|v| v["type"] != "agent.start.result")
+    );
+}
+#[test]
+fn removed_workspace_and_unknown_messages_close_without_dispatching_creation() {
+    let mut h = Harness::new();
+    for kind in [
+        "workspace.start",
+        "workspace.stop",
+        "workspace.restart",
+        "workspace.update",
+        "workspace.rename",
+        "agent.restart",
+        "unknown.command",
+    ] {
+        let mut socket = h.connect();
+        h.register(&mut socket, "webui", kind);
+        h.request(&mut socket, kind, "invalid", json!({}));
+        h.runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(3), async {
+                loop {
+                    match socket.next().await {
+                        Some(Ok(Message::Close(Some(frame)))) => {
+                            assert_eq!(u16::from(frame.code), 1007);
+                            break;
+                        }
+                        Some(Ok(_)) => {}
+                        other => panic!("expected protocol close {other:?}"),
+                    }
+                }
+            })
+            .await
+            .unwrap();
+        });
+    }
+    assert!(h.workspace_creates.lock().unwrap().is_empty());
+    assert!(h.agent_starts.lock().unwrap().is_empty());
+}
+#[test]
+fn workspace_create_delete_use_real_database_and_complete_before_original_reply() {
+    let mut h = Harness::with_real_workspace();
+    let mut socket = h.connect();
+    h.register(&mut socket, "webui", "workspace-crud");
+    let project = tempfile::tempdir().unwrap();
+    h.request(
         &mut socket,
         "workspace.create",
         "create",
-        json!({"address":address,"definition":definition}),
+        json!({"address":"/fresh","alias":"fresh","project_root":project.path()}),
     );
-    let created = harness.next(&mut socket, |value| value["id"] == "create");
+    let created = h.next(&mut socket, |v| v["id"] == "create");
     assert_eq!(created["success"], true, "{created}");
-    harness.request(&mut socket, "workspace.req", "created-list", json!({}));
-    let list = harness.next(&mut socket, |v| v["id"] == "created-list");
-    assert!(
-        list["workspaces"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|row| row["address"] == address && row["status"] == "inactive")
-    );
-    let mut updated = definition;
-    updated["project_root"] = json!(harness.root.path().join("updated-project"));
-    harness.request(
-        &mut socket,
-        "workspace.update",
-        "update",
-        json!({"address":address,"definition":updated}),
-    );
-    assert_eq!(
-        harness.next(&mut socket, |v| v["id"] == "update")["success"],
-        true
-    );
-    harness.request(
-        &mut socket,
-        "workspace.rename",
-        "rename",
-        json!({"address":address,"new_address":new_address}),
-    );
-    assert_eq!(
-        harness.next(&mut socket, |v| v["id"] == "rename")["success"],
-        true
-    );
-    harness.request(&mut socket, "workspace.req", "renamed-list", json!({}));
-    let list = harness.next(&mut socket, |v| v["id"] == "renamed-list");
-    assert!(list["workspaces"].as_array().unwrap().iter().any(|row| {
-        row["address"] == new_address
-            && row["definition"]["project_root"]
-                == harness
-                    .root
-                    .path()
-                    .join("updated-project")
-                    .to_string_lossy()
-                    .as_ref()
-    }));
-    assert!(
-        !list["workspaces"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|row| row["address"] == address)
-    );
-    harness.request(
+    let managed = h.root.path().join("workspaces/fresh");
+    assert!(managed.join("workspace.sqlite").is_file());
+    h.request(&mut socket, "workspace.req", "list", json!({}));
+    let response = h.next(&mut socket, |v| v["id"] == "list");
+    let row = response["workspaces"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["address"] == "/fresh")
+        .unwrap();
+    assert_eq!(row["agents"], json!([]));
+    assert!(row.get("definition").is_none());
+    h.request(
         &mut socket,
         "workspace.delete",
         "delete",
-        json!({"address":new_address}),
+        json!({"address":"/fresh"}),
     );
     assert_eq!(
-        harness.next(&mut socket, |v| v["id"] == "delete")["success"],
+        h.next(&mut socket, |v| v["id"] == "delete")["success"],
         true
     );
+    assert!(!managed.exists());
+    assert!(h.root.path().is_dir());
+}
+#[test]
+fn database_commit_watch_updates_idle_websocket_without_world_frames_and_ignores_prepare() {
+    let mut h = Harness::new();
+    let mut socket = h.connect();
+    h.register(&mut socket, "webui", "database-watch");
+    h.collect(&mut socket, 5);
+    let db = workspace_database(&h);
+    let operation = db.try_operation("registered").unwrap();
+    let prepared = db
+        .prepare_agent(
+            &operation,
+            "/demo".into(),
+            Some("registered".into()),
+            None,
+            h.root.path().join("driver/tool.toml"),
+            json!({"node_name":"registered"}),
+        )
+        .unwrap();
+    let before = db.subscribe_changes().borrow().clone().unwrap();
+    assert!(before.agents.is_empty());
     assert!(
-        !harness
-            .root
-            .path()
-            .join("workspaces/margatroid/renamed/dev")
-            .exists()
+        h.collect(&mut socket, 3)
+            .iter()
+            .all(|v| v["type"] != "workspace.sync")
     );
-    assert!(harness.root.path().exists());
+    std::fs::create_dir_all(db.agent_directory(&prepared).unwrap()).unwrap();
+    db.commit_agent(&operation, prepared).unwrap();
+    drop(operation);
+    let sync = h.runtime.block_on(async {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if let Some(Ok(Message::Text(text))) = socket.next().await {
+                    let value: Value = serde_json::from_str(&text).unwrap();
+                    if value["type"] == "workspace.sync"
+                        && value["workspaces"][0]["agents"][0]["node_name"] == "registered"
+                    {
+                        break value;
+                    }
+                }
+            }
+        })
+        .await
+        .unwrap()
+    });
+    assert_eq!(sync["workspaces"][0]["agents"][0]["category"], "normal");
+    assert!(sync["workspaces"][0]["agents"][0].get("task_id").is_none());
+    assert!(
+        h.collect(&mut socket, 5)
+            .iter()
+            .all(|v| v["type"] != "workspace.sync")
+    );
+}
+#[test]
+fn archive_unstarted_registration_moves_directory_and_publishes_committed_category() {
+    let mut h = Harness::with_real_workspace();
+    let record = register_record(&h, "archivable");
+    let db = workspace_database(&h);
+    let original = db.agent_directory(&record).unwrap();
+    std::fs::write(original.join("sentinel"), "preserved").unwrap();
+    let mut socket = h.connect();
+    h.register(&mut socket, "webui", "archive");
+    h.request(
+        &mut socket,
+        "agent.archive",
+        "archive",
+        json!({"workspace":"/demo","node_name":"archivable"}),
+    );
+    let response = h.next(&mut socket, |v| v["id"] == "archive");
+    assert_eq!(response["success"], true, "{response}");
+    assert!(!original.exists());
+    h.request(&mut socket, "workspace.req", "archived", json!({}));
+    let response = h.next(&mut socket, |v| v["id"] == "archived");
+    let rows = response["workspaces"].as_array().unwrap();
+    let row = &rows.iter().find(|r| r["address"] == "/demo").unwrap()["agents"][0];
+    assert_eq!(row["category"], "archived");
+    assert!(row["node_name"].is_null());
+    assert_eq!(row["previous_node_name"], "archivable");
+    let snapshot = db.subscribe_changes().borrow().clone().unwrap();
+    assert_eq!(
+        std::fs::read_to_string(
+            db.agent_directory(&snapshot.agents[0])
+                .unwrap()
+                .join("sentinel")
+        )
+        .unwrap(),
+        "preserved"
+    );
+}
+
+#[test]
+fn registered_and_new_starts_dispatch_actual_path_requests_and_duplicate_new_is_rejected() {
+    let mut h = Harness::with_real_workspace();
+    let record = register_record(&h, "known");
+    let mut socket = h.connect();
+    h.register(&mut socket, "webui", "actual-start");
+    h.request(
+        &mut socket,
+        "agent.start",
+        "existing",
+        json!({"mode":"existing","workspace":"/demo","node_name":"known"}),
+    );
+    h.wait(|h| {
+        !h.app
+            .world()
+            .event_reader::<tool_core::ToolExecuteRequest>()
+            .is_empty()
+    });
+    let request = h
+        .app
+        .world()
+        .event_reader::<tool_core::ToolExecuteRequest>()
+        .into_iter()
+        .next()
+        .unwrap()
+        .clone();
+    let tool_core::ToolExecuteRequest::Path {
+        initiator,
+        path,
+        arguments,
+        reply,
+    } = request
+    else {
+        panic!("expected Path");
+    };
+    assert_eq!(initiator, h.workspace);
+    assert_eq!(path, record.tool_path);
+    assert_eq!(arguments, record.tool_arguments);
+    reply
+        .lock()
+        .unwrap()
+        .take()
+        .unwrap()
+        .send(Ok(tool_core::ToolExecuteResponse {
+            call_id: "known-task".into(),
+            alias: "driver".into(),
+            content: "ready".into(),
+            failed: false,
+            images: vec![],
+        }))
+        .unwrap();
+    assert_eq!(
+        h.next(&mut socket, |v| v["id"] == "existing")["success"],
+        true
+    );
+    h.request(&mut socket,"agent.start","duplicate",json!({"mode":"new","workspace":"/demo","tool_path":record.tool_path,"arguments":{"node_name":"known"}}));
+    let duplicate = h.next(&mut socket, |v| v["id"] == "duplicate");
+    assert_eq!(duplicate["success"], false);
+    assert_eq!(
+        workspace_database(&h).agent_by_node("known").unwrap().id,
+        record.id
+    );
+    h.request(&mut socket,"agent.start","new",json!({"mode":"new","workspace":"/demo","tool_path":record.tool_path,"arguments":{"node_name":"fresh","alias":"Fresh","path":"src"}}));
+    h.wait(|h| {
+        !h.app
+            .world()
+            .event_reader::<tool_core::ToolExecuteRequest>()
+            .is_empty()
+    });
+    let request = h
+        .app
+        .world()
+        .event_reader::<tool_core::ToolExecuteRequest>()
+        .into_iter()
+        .next()
+        .unwrap()
+        .clone();
+    let tool_core::ToolExecuteRequest::Path {
+        arguments, reply, ..
+    } = request
+    else {
+        panic!("expected Path");
+    };
+    assert_eq!(
+        arguments,
+        json!({"node_name":"fresh","alias":"Fresh","path":"src"})
+    );
+    assert!(
+        workspace_database(&h).agent_by_node("fresh").is_err(),
+        "starting Driver must not pre-register Agent"
+    );
+    reply
+        .lock()
+        .unwrap()
+        .take()
+        .unwrap()
+        .send(Ok(tool_core::ToolExecuteResponse {
+            call_id: "new-task".into(),
+            alias: "driver".into(),
+            content: "returned".into(),
+            failed: false,
+            images: vec![],
+        }))
+        .unwrap();
+    assert_eq!(h.next(&mut socket, |v| v["id"] == "new")["success"], true);
+}
+
+#[test]
+fn stop_resolves_created_agents_parent_task_id_and_waits_for_real_cleanup() {
+    use app_runtime_plugin::WorldEventExt;
+    let mut h = Harness::with_real_workspace();
+    let tasks = h
+        .app
+        .world()
+        .get_component::<ToolTasks>(h.workspace)
+        .unwrap()
+        .clone();
+    let cleanup = tasks.clone();
+    let finish: tool_core::TaskFinish = Arc::new(move |handle| {
+        let tasks = cleanup.clone();
+        Box::pin(async move {
+            handle.cancel();
+            handle.finish_children().await?;
+            handle.retry_cleanups().await?;
+            assert!(tasks.complete_cleanup("creator-task", &handle, None));
+            Ok(())
+        })
+    });
+    let (reply, _) = oneshot::channel();
+    let (task, _) = ToolTaskHandle::new(
+        &ToolExecutionLimits::default(),
+        "unrelated-call-id".into(),
+        "driver".into(),
+        reply,
+        tasks.update_context(),
+        None,
+        finish,
+    )
+    .unwrap();
+    tasks.register("creator-task".into(), task.clone()).unwrap();
+    let storage_dir = h.root.path().join("child-storage");
+    std::fs::create_dir_all(&storage_dir).unwrap();
+    let storage = open_storage(
+        &storage_dir.join("state.sqlite"),
+        &storage_dir.join("setting.toml"),
+        "enabled=true",
+    )
+    .unwrap();
+    let (reply, mut response) = oneshot::channel();
+    h.app.world().send_event(agent_core::StartAgent {
+        workspace: h.workspace,
+        parent: h.workspace,
+        task_id: "creator-task".into(),
+        address: "/demo/child".into(),
+        project_root: h.root.path().into(),
+        ui_path: h.root.path().join("missing-child-ui"),
+        persistence: storage.clone(),
+        reply: Arc::new(Mutex::new(Some(reply))),
+    });
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let handle = loop {
+        h.app.tick();
+        match response.try_recv() {
+            Ok(result) => break result.unwrap(),
+            Err(oneshot::error::TryRecvError::Empty) => {}
+            Err(error) => panic!("{error}"),
+        };
+        assert!(Instant::now() < deadline);
+        std::thread::yield_now();
+    };
+    assert_eq!(
+        h.app
+            .world()
+            .get_component::<Agent>(handle.entity())
+            .unwrap()
+            .task_id(),
+        "creator-task"
+    );
+    let mut socket = h.connect();
+    h.register(&mut socket, "webui", "stop-task");
+    h.request(
+        &mut socket,
+        "agent.stop",
+        "stop-child",
+        json!({"address":"/demo/child"}),
+    );
+    let stopped = h.next(&mut socket, |v| v["id"] == "stop-child");
+    assert_eq!(stopped["success"], true, "{stopped}");
+    assert!(!h.app.world().is_alive(handle.entity()));
+    assert!(tasks.list().is_empty());
+    assert!(task.is_cleanup_complete());
+    assert!(!storage.is_open());
+    assert!(storage_dir.is_dir());
+}
+
+fn resource_query_fixture(h: &mut Harness) {
+    h.app
+        .world_mut()
+        .insert_resource(address::ResourceRoots::new(h.root.path()));
+    for (folder, entry) in [
+        ("tools/team/coder/dev", "tool.toml"),
+        ("tools/team/coder/v2", "tool.toml"),
+        ("tools/team/coders/dev", "tool.toml"),
+        ("tools/other/coder/dev", "tool.toml"),
+        ("agent-drivers/team/driver/dev", "base.lua"),
+        ("agent-drivers/team/driver/dev", "tool.toml"),
+        ("prompts/team/context/dev", "prompt.toml"),
+        ("sandboxes/team/safe/dev", "policy.json"),
+    ] {
+        let directory = h.root.path().join(folder);
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(directory.join(entry), "resource fixture, no execution").unwrap();
+    }
+}
+#[test]
+fn resource_queries_filter_exactly_and_return_real_entries_without_activating_tasks() {
+    let mut h = Harness::new();
+    resource_query_fixture(&mut h);
+    let mut socket = h.connect();
+    h.register(&mut socket, "webui", "resources");
+    let agents = h.app.world().query_with::<Agent>().result();
+    h.request(
+        &mut socket,
+        "resource.req",
+        "filtered",
+        json!({"type":"tool","scope":"team","name":"coder"}),
+    );
+    let response = h.next(&mut socket, |v| v["id"] == "filtered");
+    assert_eq!(response["type"], "resource.res");
+    assert_eq!(response["success"], true);
+    let rows = response["resources"].as_array().unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0]["address"], "tool:team/coder:dev");
+    assert_eq!(rows[1]["tag"], "v2");
+    assert_eq!(rows[0]["path"], rows[0]["tool_path"]);
+    assert!(std::path::Path::new(rows[0]["path"].as_str().unwrap()).is_absolute());
+    h.request(
+        &mut socket,
+        "resource.req",
+        "driver",
+        json!({"type":"driver","scope":"team"}),
+    );
+    let driver = h.next(&mut socket, |v| v["id"] == "driver");
+    assert!(
+        driver["resources"][0]["path"]
+            .as_str()
+            .unwrap()
+            .ends_with("base.lua")
+    );
+    assert!(
+        driver["resources"][0]["tool_path"]
+            .as_str()
+            .unwrap()
+            .ends_with("tool.toml")
+    );
+    h.request(
+        &mut socket,
+        "resource.req",
+        "empty",
+        json!({"name":"missing"}),
+    );
+    assert_eq!(
+        h.next(&mut socket, |v| v["id"] == "empty")["resources"],
+        json!([])
+    );
+    std::fs::write(
+        h.root.path().join("tools/team/coder/v2/tool.toml"),
+        "still opaque",
+    )
+    .unwrap();
+    let removed = h.root.path().join("tools/team/coder/dev/tool.toml");
+    assert!(removed.starts_with(h.root.path()));
+    std::fs::remove_file(removed).unwrap();
+    h.request(
+        &mut socket,
+        "resource.req",
+        "fresh",
+        json!({"type":"tool","scope":"team","name":"coder"}),
+    );
+    assert_eq!(
+        h.next(&mut socket, |v| v["id"] == "fresh")["resources"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(h.app.world().query_with::<Agent>().result(), agents);
+    assert!(
+        h.app
+            .world()
+            .get_component::<ToolTasks>(h.agent)
+            .unwrap()
+            .list()
+            .is_empty()
+    );
+}
+#[test]
+fn resource_scan_replies_on_original_oneshot_without_extra_world_frames() {
+    let mut h = Harness::new();
+    resource_query_fixture(&mut h);
+    let mut socket = h.connect();
+    h.register(&mut socket, "webui", "resources-no-frame");
+    h.request(
+        &mut socket,
+        "resource.req",
+        "scan-no-frame",
+        json!({"type":"prompt","scope":"team"}),
+    );
+    h.ingress_barrier(&mut socket);
+    h.app.tick();
+    h.app.tick();
+    let value = h.runtime.block_on(async {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(Ok(Message::Text(text))) = socket.next().await {
+                    let value: Value = serde_json::from_str(&text).unwrap();
+                    if value["id"] == "scan-no-frame" {
+                        break value;
+                    }
+                }
+            }
+        })
+        .await
+        .unwrap()
+    });
+    assert_eq!(value["success"], true);
+    assert_eq!(value["resources"][0]["address"], "prompt:team/context:dev");
+    assert!(value["resources"][0]["tool_path"].is_null());
+}
+#[test]
+fn resource_query_requires_registration_and_read_failure_is_not_an_empty_success() {
+    let mut h = Harness::new();
+    resource_query_fixture(&mut h);
+    let mut socket = h.connect();
+    h.request(
+        &mut socket,
+        "resource.req",
+        "unregistered-resources",
+        json!({}),
+    );
+    let rejected = h.next(&mut socket, |v| v["id"] == "unregistered-resources");
+    assert_eq!(rejected["success"], false);
+    assert_eq!(rejected["error"]["code"], "Unregistered");
+    assert!(rejected.get("resources").is_none());
+    h.register(&mut socket, "webui", "resources-error");
+    let bad = h.root.path().join("bad-resource-root");
+    std::fs::write(&bad, "not a directory").unwrap();
+    h.app
+        .world_mut()
+        .get_resource_mut::<address::ResourceRoots>()
+        .unwrap()
+        .tool = bad;
+    h.request(
+        &mut socket,
+        "resource.req",
+        "read-error",
+        json!({"type":"tool"}),
+    );
+    let failed = h.next(&mut socket, |v| v["id"] == "read-error");
+    assert_eq!(failed["success"], false);
+    assert_eq!(failed["error"]["code"], "ResourceReadFailed");
+    assert!(failed.get("resources").is_none());
+}
+
+#[cfg(unix)]
+#[test]
+fn resource_res_preserves_internal_alias_paths_and_component_sort_order() {
+    use std::os::unix::fs::symlink;
+    let mut h = Harness::new();
+    resource_query_fixture(&mut h);
+    let folder = h.root.path().join("tools/prefix/a/dev");
+    std::fs::create_dir_all(&folder).unwrap();
+    let real = folder.join("actual-manifest.data");
+    std::fs::write(&real, "opaque").unwrap();
+    symlink(&real, folder.join("tool.toml")).unwrap();
+    let other = h.root.path().join("tools/prefix/a-/dev");
+    std::fs::create_dir_all(&other).unwrap();
+    std::fs::write(other.join("tool.toml"), "opaque").unwrap();
+    let mut socket = h.connect();
+    h.register(&mut socket, "webui", "resources-alias");
+    h.request(
+        &mut socket,
+        "resource.req",
+        "alias-paths",
+        json!({"type":"tool","scope":"prefix"}),
+    );
+    let reply = h.next(&mut socket, |v| v["id"] == "alias-paths");
+    assert_eq!(reply["success"], true, "{reply}");
+    assert_eq!(reply["resources"][0]["name"], "a");
+    assert_eq!(reply["resources"][1]["name"], "a-");
+    assert_eq!(
+        reply["resources"][0]["path"],
+        real.canonicalize().unwrap().to_str().unwrap()
+    );
 }

@@ -73,11 +73,7 @@ fn domain_cores_are_independent_and_plugins_only_depend_on_cores() {
                         continue;
                     }
                     if layer == "core" {
-                        assert!(
-                            name == "client_core" && target == root.join("client/core"),
-                            "{domain}/core has an unapproved domain dependency: {name}"
-                        );
-                        continue;
+                        panic!("{domain}/core has a same-layer domain dependency: {name}");
                     }
                     assert!(
                         target.ends_with("core")

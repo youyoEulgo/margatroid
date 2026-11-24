@@ -50,6 +50,7 @@ async fn task_lifetime_is_configured_once_and_does_not_complete_before_cleanup()
         tokio::sync::oneshot::channel().0,
         test_tasks().update_context(),
         None,
+        test_finish(),
     )
     .unwrap();
     assert!(
@@ -78,6 +79,7 @@ async fn unlimited_task_has_no_lifetime_timer_and_can_finish() {
         tokio::sync::oneshot::channel().0,
         test_tasks().update_context(),
         None,
+        test_finish(),
     )
     .unwrap();
     task.configure_lifetime(0).unwrap();
@@ -98,19 +100,9 @@ async fn unlimited_task_has_no_lifetime_timer_and_can_finish() {
     assert!(task.is_cleanup_complete());
 }
 
-fn test_binding() -> tool_core::TaskSyncBinding {
-    tool_core::TaskSyncBinding::new(
-        client_core::Clients::default(),
-        std::sync::Arc::from([]),
-        |snapshot| {
-            serde_json::to_string(&snapshot)
-                .map(|text| std::sync::Arc::new(client_core::ClientFrame::Text(text)))
-                .map_err(|_| client_core::ClientPrepareError::EncodeFailed)
-        },
-    )
-}
 fn test_tasks() -> tool_core::ToolTasks {
-    let mut app = core_plugin::App::new();
-    let owner = app.world_mut().spawn();
-    tool_core::ToolTasks::new(owner, "agent:test/unit:dev".into(), test_binding())
+    tool_core::ToolTasks::new()
+}
+fn test_finish() -> tool_core::TaskFinish {
+    std::sync::Arc::new(|handle| Box::pin(async move { handle.wait_finished().await }))
 }

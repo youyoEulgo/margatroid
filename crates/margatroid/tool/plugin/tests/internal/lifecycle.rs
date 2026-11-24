@@ -1,5 +1,6 @@
 #[path = "../support/storage.rs"]
 mod storage_fixture;
+use crate::test_support;
 
 use std::sync::{Arc, Mutex};
 
@@ -20,9 +21,9 @@ fn admission_rechecks_current_turn_and_never_registers_rejected_requests() {
         (AgentState::Running, None, "turn"),
         (AgentState::Running, Some(""), ""),
         (AgentState::Running, Some("new-turn"), "old-turn"),
-        (AgentState::Error, Some("turn"), "turn"),
+        (AgentState::Closing, Some("turn"), "turn"),
         (AgentState::Starting, Some("turn"), "turn"),
-        (AgentState::Stopping, Some("turn"), "turn"),
+        (AgentState::Closing, Some("turn"), "turn"),
     ] {
         let mut world = World::new();
         let entity = world.spawn();
@@ -30,7 +31,7 @@ fn admission_rechecks_current_turn_and_never_registers_rejected_requests() {
         world.insert_component(entity, tasks.clone());
         world.insert_component(
             entity,
-            agent_core::Agent::new(
+            test_support::agent(
                 "agent".into(),
                 entity,
                 state,
@@ -41,7 +42,7 @@ fn admission_rechecks_current_turn_and_never_registers_rejected_requests() {
         let (reply, mut result) = oneshot::channel();
         handler::handle_tool_execute(
             &mut world,
-            ToolExecuteRequest {
+            ToolExecuteRequest::Registered {
                 id: "task".into(),
                 agent: entity,
                 turn: Some(requested.into()),
@@ -67,7 +68,7 @@ fn missing_agent_returns_an_aborted_correlated_result() {
     let (reply, mut result) = oneshot::channel();
     handler::handle_tool_execute(
         &mut world,
-        ToolExecuteRequest {
+        ToolExecuteRequest::Registered {
             id: "task".into(),
             agent: entity,
             turn: Some("turn".into()),
@@ -104,7 +105,7 @@ fn installation_accepts_only_schedules_after_abort_processing() {
                 app.add_schedule(schedule.to_owned());
             }
             app.add_closure_system(schedule);
-            app.add_plugin(ToolPlugin::new(test_binding()).with_schedule(schedule));
+            app.add_plugin(ToolPlugin::new().with_schedule(schedule));
         });
         assert_eq!(
             installed.is_ok(),
@@ -116,7 +117,6 @@ fn installation_accepts_only_schedules_after_abort_processing() {
 
 #[test]
 fn dynamic_admission_checks_schema_without_rechecking_recorded_owner() {
-    use std::collections::BTreeSet;
     use tool_core::{ToolErrorKind, ToolExecutionLimits, ToolTaskHandle};
     use tool_resource_core::{ToolEntry, Tools};
     use workspace_core::WorkspaceState;
@@ -132,12 +132,12 @@ fn dynamic_admission_checks_schema_without_rechecking_recorded_owner() {
             .add_plugin(AsyncRuntimePlugin)
             .add_plugin(ClosurePlugin)
             .add_closure_system(RuntimePlugin::UPDATE)
-            .add_plugin(ToolPlugin::new(test_binding()));
+            .add_plugin(ToolPlugin::new());
         let agent = app.world_mut().spawn();
         storage_fixture::mount(app.world_mut(), agent, root.path());
         app.world_mut().insert_component(
             agent,
-            agent_core::Agent::new(
+            test_support::agent(
                 "agent".into(),
                 agent,
                 AgentState::Running,
@@ -147,14 +147,11 @@ fn dynamic_admission_checks_schema_without_rechecking_recorded_owner() {
         );
         app.world_mut().insert_component(
             agent,
-            workspace_core::Workspace::new(
+            test_support::workspace(
                 "workspace".into(),
                 root.path().join("workspace.yaml"),
                 root.path().to_owned(),
                 WorkspaceState::Running,
-                BTreeSet::new(),
-                None,
-                test_workspace_context(),
             ),
         );
         let tasks = test_tasks();
@@ -167,13 +164,14 @@ fn dynamic_admission_checks_schema_without_rechecking_recorded_owner() {
                 reply,
                 tasks.update_context(),
                 None,
+                test_support::finish(),
             )
             .unwrap();
             owner.cancel();
             tasks.register("owner".into(), owner).unwrap();
         }
         app.world_mut().insert_component(agent, tasks.clone());
-        let mut tools = Tools::new(test_probe());
+        let mut tools = Tools::new();
         tools
             .insert(
                 "dynamic".into(),
@@ -191,7 +189,7 @@ fn dynamic_admission_checks_schema_without_rechecking_recorded_owner() {
         let (reply, mut result) = oneshot::channel();
         handler::handle_tool_execute(
             app.world_mut(),
-            ToolExecuteRequest {
+            ToolExecuteRequest::Registered {
                 id: "dependent".into(),
                 agent,
                 turn: Some("turn".into()),
@@ -221,31 +219,12 @@ fn dynamic_admission_checks_schema_without_rechecking_recorded_owner() {
     }
 }
 
-fn test_binding() -> tool_core::TaskSyncBinding {
-    tool_core::TaskSyncBinding::new(
-        client_core::Clients::default(),
-        std::sync::Arc::from([]),
-        |snapshot| {
-            serde_json::to_string(&snapshot)
-                .map(|text| std::sync::Arc::new(client_core::ClientFrame::Text(text)))
-                .map_err(|_| client_core::ClientPrepareError::EncodeFailed)
-        },
-    )
-}
 fn test_tasks() -> tool_core::ToolTasks {
     let mut app = core_plugin::App::new();
-    let owner = app.world_mut().spawn();
-    tool_core::ToolTasks::new(owner, "agent:test/unit:dev".into(), test_binding())
+    let _owner = app.world_mut().spawn();
+    tool_core::ToolTasks::new()
 }
 
 fn test_agent_context() -> agent_core::AgentUpdateContext {
     agent_core::AgentUpdateContext::new(|_, _, _| Vec::new(), |_, _| {})
-}
-
-fn test_workspace_context() -> workspace_core::WorkspaceUpdateContext {
-    workspace_core::WorkspaceUpdateContext::new(|_, _| {})
-}
-
-fn test_probe<T>() -> client_core::UpdateProbe<T> {
-    client_core::UpdateProbe::new(|_| {})
 }

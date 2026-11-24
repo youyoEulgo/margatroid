@@ -42,13 +42,12 @@ impl Plugin for AgentPlugin {
             "AgentPlugin requires schedule, RuntimePlugin and AsyncRuntimePlugin"
         );
         let _ = app.world().closure_sender(&self.schedule);
+        app.world_mut().insert_resource(self.sync.clone());
         app.world_mut().insert_resource(AgentInstalled {
             sync: self.sync,
             schedule: self.schedule.clone(),
         });
         app.add_system(&self.schedule, system::stop_agent_system)
-            .add_system(&self.schedule, system::restart_agent_system)
-            .add_system(&self.schedule, system::start_agent_system)
-            .add_system(&self.schedule, system::agent_exception_system);
+            .add_system(&self.schedule, system::start_agent_system);
     }
 }

@@ -2,36 +2,30 @@ use crate::probes::{state_source, update};
 use client_core::{ClientFrame, ClientPrepareError, Clients, SyncContext, SyncKey};
 use core_plugin::{Entity, World};
 use margatroid_protocol::*;
-use notify::{EventKind, RecursiveMode, Watcher};
 use std::{
     collections::BTreeMap,
-    path::PathBuf,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
-    time::Duration,
 };
-use workspace_core::{
-    Workspace, WorkspaceDefinitionSnapshot, WorkspaceDefinitions, WorkspaceUpdateContext,
-};
-
-#[derive(Clone)]
-struct LiveWorkspace {
-    definition: Option<workspace_core::WorkspaceDefinition>,
-    status: String,
-    address: Option<String>,
-    error: Option<ProtocolErrorDto>,
-}
-struct Catalog {
-    definitions: BTreeMap<PathBuf, workspace_core::WorkspaceDefinition>,
-    running: BTreeMap<PathBuf, LiveWorkspace>,
-    definition_error: Option<String>,
-}
+use workspace_core::{Workspace, WorkspaceUpdateContext, WorkspaceUpdateKind};
 struct WorkspaceViews {
-    catalog: Mutex<Catalog>,
+    rows: Mutex<BTreeMap<Entity, WorkspaceInfoDto>>,
     view: Arc<Mutex<(u64, Vec<WorkspaceInfoDto>)>>,
     sync: SyncContext<Vec<WorkspaceInfoDto>>,
+    sources: Mutex<BTreeMap<Entity, WorkspaceWatch>>,
+}
+struct WorkspaceWatch {
+    database: workspace_core::WorkspaceDatabase,
+    active: Arc<AtomicBool>,
+    cancel: tokio_util::sync::CancellationToken,
+}
+impl Drop for WorkspaceWatch {
+    fn drop(&mut self) {
+        self.active.store(false, Ordering::Release);
+        self.cancel.cancel();
+    }
 }
 impl Drop for WorkspaceViews {
     fn drop(&mut self) {
@@ -40,56 +34,10 @@ impl Drop for WorkspaceViews {
 }
 impl WorkspaceViews {
     fn publish(&self) {
-        let catalog = self.catalog.lock().unwrap();
-        let mut definitions = catalog.definitions.clone();
-        for (path, running) in &catalog.running {
-            if let Some(definition) = &running.definition {
-                definitions
-                    .entry(path.clone())
-                    .or_insert_with(|| definition.clone());
-            }
-        }
-        let rows = definitions
-            .into_iter()
-            .map(|(path, definition)| {
-                let live = catalog.running.get(&path);
-                let error = live.and_then(|v| v.error.clone()).or_else(|| {
-                    catalog
-                        .definition_error
-                        .as_ref()
-                        .map(|message| ProtocolErrorDto::new("InvalidDefinition", message))
-                });
-                WorkspaceInfoDto {
-                    path: path.to_string_lossy().into_owned(),
-                    definition: definition_dto(definition),
-                    status: live
-                        .map(|v| v.status.clone())
-                        .unwrap_or_else(|| "inactive".into()),
-                    address: live.and_then(|v| v.address.clone()).or_else(|| {
-                        path.ancestors()
-                            .nth(4)
-                            .and_then(|root| workspace_core::workspace_address(root, &path).ok())
-                    }),
-                    error,
-                }
-            })
-            .collect();
-        update(&self.view, &self.sync, rows);
-        drop(catalog);
-    }
-}
-fn definition_dto(value: workspace_core::WorkspaceDefinition) -> WorkspaceDefinitionDto {
-    WorkspaceDefinitionDto {
-        project_root: value.project_root.to_string_lossy().into_owned(),
-        agents: value
-            .members
-            .into_iter()
-            .map(|member| WorkspaceAgentDefinitionDto {
-                name: member.name,
-                driver: member.driver,
-                home_root: member.home_root.to_string_lossy().into_owned(),
-            })
-            .collect(),
+        let rows = self.rows.lock().unwrap_or_else(|e| e.into_inner());
+        let mut values: Vec<_> = rows.values().cloned().collect();
+        values.sort_by(|a, b| a.address.cmp(&b.address));
+        update(&self.view, &self.sync, values);
     }
 }
 #[derive(Clone)]
@@ -100,10 +48,9 @@ pub struct WorkspaceSyncBinding {
 impl core_plugin::Resource for WorkspaceSyncBinding {}
 pub fn workspace_sync_binding(clients: Clients) -> WorkspaceSyncBinding {
     let view = Arc::new(Mutex::new((0, Vec::<WorkspaceInfoDto>::new())));
-    let targets = crate::sync_selectors();
     let sync = state_source(
         clients,
-        targets,
+        crate::sync_selectors(),
         SyncKey {
             topic: "workspace.sync".into(),
             object: "all".into(),
@@ -111,206 +58,110 @@ pub fn workspace_sync_binding(clients: Clients) -> WorkspaceSyncBinding {
         &view,
         |workspaces| {
             encode_server_message(&ServerMessage::WorkspaceSync { workspaces })
-                .map(|text| Arc::new(ClientFrame::Text(text)))
+                .map(|s| Arc::new(ClientFrame::Text(s)))
                 .map_err(|_| ClientPrepareError::TooLarge)
         },
     );
     let views = Arc::new(WorkspaceViews {
-        catalog: Mutex::new(Catalog {
-            definitions: BTreeMap::new(),
-            running: BTreeMap::new(),
-            definition_error: None,
-        }),
+        rows: Mutex::default(),
         view,
         sync,
+        sources: Mutex::default(),
     });
-    let state = views.clone();
-    let updates = WorkspaceUpdateContext::new(move |world: &mut World, _owner: Entity| {
-        let running = world
-            .query_with::<Workspace>()
-            .result()
+    let source = views.clone();
+    let updates = WorkspaceUpdateContext::new(move |world, owner, kind| {
+        if matches!(
+            kind,
+            WorkspaceUpdateKind::Closing | WorkspaceUpdateKind::Removed
+        ) {
+            source
+                .sources
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&owner);
+        }
+        if kind == WorkspaceUpdateKind::Removed {
+            source
+                .rows
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&owner);
+            source.publish();
+            return;
+        }
+        if let Some(row) = crate::projection::workspaces(world)
             .into_iter()
-            .filter_map(|owner| {
-                let item = world.get_component::<Workspace>(owner)?;
-                Some((
-                    item.definition_path.clone(),
-                    LiveWorkspace {
-                        definition: item.definition.clone(),
-                        status: format!("{:?}", item.state).to_lowercase(),
-                        address: crate::projection::address(world, owner),
-                        error: item.error.as_ref().map(|error| {
-                            ProtocolErrorDto::new(
-                                format!("{:?}", error.kind),
-                                error.message.clone(),
-                            )
-                        }),
-                    },
-                ))
-            })
-            .collect();
-        state.catalog.lock().unwrap().running = running;
-        state.publish();
+            .find(|row| crate::projection::address(world, owner).as_ref() == Some(&row.address))
+        {
+            source
+                .rows
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(owner, row);
+            source.publish();
+        }
+        if kind != WorkspaceUpdateKind::Installed {
+            return;
+        }
+        let Some(database) = world
+            .get_component::<Workspace>(owner)
+            .map(|w| w.database.clone())
+        else {
+            return;
+        };
+        {
+            let watches = source.sources.lock().unwrap_or_else(|e| e.into_inner());
+            if watches
+                .get(&owner)
+                .is_some_and(|w| w.database.same_connection(&database))
+            {
+                return;
+            }
+        }
+        let Some(state) = world.get_resource::<crate::types::DtoState>().cloned() else {
+            return;
+        };
+        let mut changes = database.subscribe_changes();
+        let active = Arc::new(AtomicBool::new(true));
+        let cancel = tokio_util::sync::CancellationToken::new();
+        source
+            .sources
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(
+                owner,
+                WorkspaceWatch {
+                    database,
+                    active: active.clone(),
+                    cancel: cancel.clone(),
+                },
+            );
+        let weak = Arc::downgrade(&source);
+        let guard = state.lifetime.track();
+        let lifetime = state.lifetime;
+        world.get_resource::<async_runtime_plugin::AsyncRuntimeHandle>().unwrap().spawn(async move{
+   let _guard=guard;
+   loop {
+    let value=changes.borrow_and_update().clone();
+    if !active.load(Ordering::Acquire){break;}
+    let Some(snapshot)=value else{break;};
+    if let Some(views)=weak.upgrade(){
+     if active.load(Ordering::Acquire){let mut rows=views.rows.lock().unwrap_or_else(|e|e.into_inner());if let Some(row)=rows.get_mut(&owner){row.agents=snapshot.agents.into_iter().map(crate::projection::workspace_agent).collect();}drop(rows);views.publish();}
+    }else{break;}
+    tokio::select!{_=cancel.cancelled()=>break,_=lifetime.cancelled()=>break,result=changes.changed()=>if result.is_err(){break;}}
+   }
+  });
     });
     WorkspaceSyncBinding { updates, views }
 }
 pub(crate) fn install_workspace_monitor(world: &mut World) {
-    use async_runtime_plugin::WorldAsyncExt;
-    let definitions = world
-        .get_resource::<WorkspaceDefinitions>()
-        .cloned()
-        .unwrap_or_default();
-    let binding = world
-        .get_resource::<WorkspaceSyncBinding>()
-        .expect("WorkspaceSyncBinding required")
-        .clone();
-    let initial = definitions.list().into_iter().collect();
-    binding.views.catalog.lock().unwrap().definitions = initial;
-    if let Some(owner) = world.query_with::<Workspace>().result().first().copied() {
-        binding.updates.notify(world, owner);
-    } else {
-        binding.views.publish();
-    }
-    let weak = Arc::downgrade(&binding.views);
-    definitions.observe(Arc::new(
-        move |result: Result<WorkspaceDefinitionSnapshot, workspace_core::WorkspaceError>| {
-            let Some(views) = weak.upgrade() else {
-                return;
-            };
-            let mut catalog = views.catalog.lock().unwrap();
-            match result {
-                Ok(snapshot) => {
-                    catalog.definitions = (*snapshot.entries).clone();
-                    catalog.definition_error = None;
-                }
-                Err(error) => catalog.definition_error = Some(error.to_string()),
-            };
-            drop(catalog);
-            views.publish();
-        },
-    ));
-    let Some(source) = definitions.source().map(PathBuf::from) else {
+    let Some(binding) = world.get_resource::<WorkspaceSyncBinding>().cloned() else {
         return;
     };
-    let lifetime = world
-        .get_resource::<crate::types::DtoState>()
-        .unwrap()
-        .lifetime
-        .clone();
-    let guard = lifetime.track();
-    world.send_async_closure(
-        app_runtime_plugin::RuntimePlugin::UPDATE,
-        move || async move {
-            let _guard = guard;
-            if let Err(error) = watch_definitions(source, definitions, lifetime).await {
-                tracing::warn!(reason=%error,"Workspace definition monitor stopped");
-            }
-            Ok::<_, crate::types::DtoAsyncError>(())
-        },
-    );
-}
-async fn watch_definitions(
-    source: PathBuf,
-    definitions: WorkspaceDefinitions,
-    lifetime: axum_plugin::AxumLifetime,
-) -> Result<(), String> {
-    let dirty = Arc::new(AtomicBool::new(false));
-    let notify = Arc::new(tokio::sync::Notify::new());
-    let changes = dirty.clone();
-    let wake = notify.clone();
-    let target = source.clone();
-    let watch_root = source
-        .parent()
-        .ok_or("definition source has no parent")?
-        .to_path_buf();
-    let mut watcher = notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
-        let relevant = event.map_or(true, |event| definition_event(&target, &event));
-        if relevant {
-            changes.store(true, Ordering::Release);
-            wake.notify_one();
-        }
-    })
-    .map_err(|e| e.to_string())?;
-    watcher
-        .watch(&watch_root, RecursiveMode::Recursive)
-        .map_err(|e| e.to_string())?;
-    // Read after watcher installation to close the registration/read race.
-    dirty.store(true, Ordering::Release);
-    loop {
-        while !dirty.swap(false, Ordering::AcqRel) {
-            tokio::select! {_=lifetime.cancelled()=>return Ok(()),_=notify.notified()=>()}
-        }
-        loop {
-            tokio::select! {_=lifetime.cancelled()=>return Ok(()),_=tokio::time::sleep(Duration::from_millis(100))=>()}
-            if !dirty.swap(false, Ordering::AcqRel) {
-                break;
-            }
-        }
-        if lifetime.is_cancelled() {
-            return Ok(());
-        }
-        let read = definitions.clone();
-        let outcome = tokio::task::spawn_blocking(move || read.reload())
-            .await
-            .map_err(|e| e.to_string())?;
-        if let Err(error) = outcome {
-            tracing::warn!(reason=%error,"Workspace definition reload failed");
-        }
+    for owner in world.query_with::<Workspace>().result() {
+        binding
+            .updates
+            .notify(world, owner, WorkspaceUpdateKind::Installed);
     }
-}
-
-fn definition_event(source: &std::path::Path, event: &notify::Event) -> bool {
-    if matches!(event.kind, EventKind::Access(_)) {
-        return false;
-    }
-    event.paths.iter().any(|path| {
-        if path == source {
-            return true;
-        }
-        let Ok(relative) = path.strip_prefix(source) else {
-            return false;
-        };
-        let depth = relative.components().count();
-        (depth == 4
-            && path
-                .file_name()
-                .is_some_and(|name| name == "workspace.yaml"))
-            || ((1..=3).contains(&depth)
-                && matches!(
-                    event.kind,
-                    EventKind::Create(_)
-                        | EventKind::Remove(_)
-                        | EventKind::Modify(notify::event::ModifyKind::Name(_))
-                ))
-    })
-}
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn definition_monitor_ignores_agent_database_and_output_file_changes() {
-        let root = PathBuf::from("/tmp/config/workspaces");
-        for path in [
-            root.join("margatroid/demo/dev/agents/coder/state.sqlite"),
-            root.join("margatroid/demo/dev/agents/coder/.tmp"),
-            root.join(
-                "margatroid/demo/dev/agents/coder/state.sqlite.blocks/session/timeline.sqlite",
-            ),
-        ] {
-            let event = notify::Event::new(EventKind::Modify(notify::event::ModifyKind::Name(
-                notify::event::RenameMode::To,
-            )))
-            .add_path(path);
-            assert!(!definition_event(&root, &event));
-        }
-        for path in [
-            root.join("margatroid/demo/dev/workspace.yaml"),
-            root.join("margatroid"),
-            root.join("margatroid/demo"),
-            root.join("margatroid/demo/dev"),
-        ] {
-            let event = notify::Event::new(EventKind::Create(notify::event::CreateKind::Any))
-                .add_path(path);
-            assert!(definition_event(&root, &event));
-        }
-    }
+    binding.views.publish();
 }

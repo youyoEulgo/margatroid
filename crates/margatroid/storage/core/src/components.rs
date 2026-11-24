@@ -14,6 +14,25 @@ pub struct AgentStorage {
 impl Component for AgentStorage {}
 
 impl AgentStorage {
+    pub fn is_open(&self) -> bool {
+        self.database
+            .shared
+            .connection
+            .lock()
+            .is_ok_and(|connection| {
+                !self
+                    .database
+                    .shared
+                    .retired
+                    .load(std::sync::atomic::Ordering::Acquire)
+                    && connection.is_some()
+            })
+    }
+
+    pub fn settings_path(&self) -> &std::path::Path {
+        &self.settings_path
+    }
+
     pub fn data_dir(&self) -> &std::path::Path {
         self.settings_path
             .parent()

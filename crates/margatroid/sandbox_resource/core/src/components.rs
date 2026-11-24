@@ -3,21 +3,21 @@ use std::path::{Path, PathBuf};
 
 use core_plugin::Component;
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct Sandboxes {
     entries: BTreeMap<String, PathBuf>,
-    updates: client_core::UpdateProbe<Vec<(String, PathBuf)>>,
+    updates: crate::SandboxChanged,
 }
 
 impl Sandboxes {
-    pub fn new(updates: client_core::UpdateProbe<Vec<(String, PathBuf)>>) -> Self {
+    pub fn new(updates: crate::SandboxChanged) -> Self {
         Self {
             entries: BTreeMap::new(),
             updates,
         }
     }
     pub fn publish_current(&self) {
-        self.updates.publish(
+        (self.updates)(
             self.entries
                 .iter()
                 .map(|(alias, path)| (alias.clone(), path.clone()))
@@ -53,10 +53,10 @@ impl Sandboxes {
 
 impl Component for Sandboxes {}
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct SelectedSandbox {
     data: SelectedSandboxData,
-    updates: client_core::UpdateProbe<Option<String>>,
+    updates: crate::SandboxSelectionChanged,
 }
 
 impl Component for SelectedSandbox {}
@@ -72,7 +72,7 @@ impl std::ops::Deref for SelectedSandbox {
     }
 }
 impl SelectedSandbox {
-    pub fn new(alias: Option<String>, updates: client_core::UpdateProbe<Option<String>>) -> Self {
+    pub fn new(alias: Option<String>, updates: crate::SandboxSelectionChanged) -> Self {
         Self {
             data: SelectedSandboxData { alias },
             updates,
@@ -81,11 +81,11 @@ impl SelectedSandbox {
     pub fn set(&mut self, alias: Option<String>) {
         if self.data.alias != alias {
             self.data.alias = alias;
-            self.updates.publish(self.data.alias.clone());
+            (self.updates)(self.data.alias.clone());
         }
     }
     pub fn publish_current(&self) {
-        self.updates.publish(self.data.alias.clone());
+        (self.updates)(self.data.alias.clone());
     }
 }
 impl PartialEq for Sandboxes {
@@ -100,3 +100,18 @@ impl PartialEq for SelectedSandbox {
     }
 }
 impl Eq for SelectedSandbox {}
+
+impl std::fmt::Debug for Sandboxes {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Sandboxes")
+            .field("entries", &self.entries)
+            .finish_non_exhaustive()
+    }
+}
+impl std::fmt::Debug for SelectedSandbox {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SelectedSandbox")
+            .field("data", &self.data)
+            .finish_non_exhaustive()
+    }
+}

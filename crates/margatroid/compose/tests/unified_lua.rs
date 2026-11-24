@@ -1,697 +1,338 @@
+#![allow(dead_code)]
+use address::{Address, WorldAddressExt};
+use agent_core::{Agent, StopAgent};
+use app_runtime_plugin::WorldEventExt;
 use compose::{ApplicationOptions, build_app};
-use core_plugin::{App, Entity};
-use mcl_core::{MclCommand, MclInstruction, MclValue};
+use core_plugin::{App, Entity, World};
+use serde_json::{Value, json};
 use std::{
-    path::Path,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
+use storage_core::{AgentStorage, StorageOperation, StorageValue};
 use tokio::sync::oneshot;
-use tokio_util::sync::CancellationToken;
-use workspace_core::{StartWorkspace, StopWorkspace};
+use tool_core::{ToolExecuteRequest, ToolExecuteResponse, ToolTaskHandle, ToolTasks};
+use workspace_core::{CreateWorkspace, Workspace};
 
-const PROGRAM: &str = r#"
-function configure()return {timeout_ms=0}end
-function execute(_,context)
- local child=context.arguments and context.arguments.child
- if not child then assert(context.agent_info==nil) end
- local owner=child and context.agent_info.address or context.workspace.address
- assert(not pcall(function()return margatroid.agent:create({owner=owner,name='rejected-owner',config_path=context.resource_dir..'/setting.toml',ui_path=context.resource_dir..'/ui'})end))
- local agent=margatroid.agent:create({name=child and 'child' or context.name,config_path=context.resource_dir..'/setting.toml',ui_path=context.resource_dir..'/ui'})
- local data_dir=margatroid.agent:data_dir(agent.address)
- assert(type(data_dir)=='string' and data_dir:sub(1,1)=='/')
- assert(data_dir:sub(-#(child and '/agents/child' or '/agents/parent'))==(child and '/agents/child' or '/agents/parent'))
- assert(context.data_dir==nil and context.temp_dir==nil)
- assert(not pcall(function() return margatroid.agent:data_dir() end))
- assert(not pcall(function() return margatroid.agent:data_dir('agent:missing/none:dev') end))
- local function command(text,args)
-  local result=margatroid.mcl:execute(agent.address,text,args)
-  if type(result)=='table' and result.Error then error(result.Error.message) end
+pub const DRIVER: &str = r#"
+function configure() return {timeout_ms=0} end
+function execute(args,context)
+ assert(context.temp_dir==nil and context.data_dir==nil)
+ assert(not pcall(function()margatroid.agent:create({owner='forged',node_name='invalid'})end))
+ local agent=margatroid.agent:create({node_name=args.node_name,alias=args.alias,project_root=context.project_root,config_path=args.config_path or context.resource_dir..'/setting.toml',ui_path=args.ui_path or context.resource_dir..'/ui'})
+ local function command(text,values)
+  local result=margatroid.mcl:execute(agent.address,text,values)
+  if result.Error then error(result.Error.message)end
   return result
  end
+ assert(type(margatroid.agent:data_dir(agent.address))=='string')
+ assert(not pcall(function()margatroid.agent:data_dir()end))
  local empty=command('CREATE BLOCK saved (messages)')
- assert(type(empty)=='table' and empty.Error==nil and next(empty)==nil)
  assert(margatroid.data:encode('json',empty)=='{}')
- local failure=margatroid.mcl:execute(agent.address,'INVALID_MCL_INSTRUCTION')
- assert(type(failure)=='table' and failure.Error.type=='error')
- assert(type(failure.Error.message)=='string' and type(failure.Error.request_id)=='string')
- local again=command('CREATE BLOCK saved (messages)')
- assert(type(again)=='table' and margatroid.data:encode('json',again)=='{}')
+ local bad=margatroid.mcl:execute(agent.address,'INVALID_MCL_INSTRUCTION')
+ assert(type(bad.Error.message)=='string')
  command('CREATE TEMP BLOCK transient (messages)')
- command('INJECT ? TO saved.messages',{{{type='user',content=child and 'child-data' or 'parent-data'}}})
+ local previous=command('GET transient.messages').Array.Message
+ assert(#previous==0,'temporary messages reused across actual Agent instances')
  command('INJECT ? TO transient.messages',{{{type='user',content='temporary'}}})
- local model=command('EFFECT model_set ?',{{model='offline'}}).Config
- assert(model.context_window_tokens==128000)
  command('EFFECT ready')
- if not child then
-  margatroid.tools:register({agent=agent.address,tools={{alias='automatic_registration',description='lifetime of automatic task',input_schema={type='object'},lifetime={task_id=context.task_id}}}})
+ if args.append then command('INJECT ? TO saved.messages',{{{type='user',content=args.append}}}) end
+ if args.model then
+  local model=command('EFFECT model_set ?',{{model='offline'}}).Config
+  assert(model.context_window_tokens==128000)
  end
- if child then margatroid.task:return_result(agent.address);margatroid.task:receive();return end
- command('IMPORT TOOL tool:probe/shared:dev AS shared')
- command('EFFECT start_turn')
- local result=command('EFFECT tool_call ?',{{{id='child-create',tool_name='shared',arguments='{"child":true}'}}})
- command('CONFIG SET ? ?',{'child_address',result.Array.Message[1].content})
- command('EFFECT finish_turn')
- pcall(function()margatroid:wait(agent.address)end)
- -- The Agent going away does not own this execution. Keep running until Workspace cancellation.
- margatroid.task:return_result('agent-closed')
+ margatroid.task:return_result(agent.address)
  margatroid.task:receive()
 end
 "#;
-fn write(root: &Path, name: &str, text: &str) {
+
+pub fn write(root: &Path, name: impl AsRef<Path>, text: &str) {
     let path = root.join(name);
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     std::fs::write(path, text).unwrap();
 }
-fn drive<T>(app: &mut App, rx: &mut oneshot::Receiver<T>) -> T {
+pub fn runner() -> PathBuf {
+    if let Some(path) = std::env::var_os("MARGATROID_TEST_RUNNER") {
+        return PathBuf::from(path);
+    }
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .nth(3)
+        .unwrap()
+        .join("target/debug/margatroid");
+    assert!(
+        path.is_file(),
+        "build the real test runner first: cargo build -p margatroid, or set MARGATROID_TEST_RUNNER"
+    );
+    path
+}
+pub fn drive<T>(app: &mut App, rx: &mut oneshot::Receiver<T>) -> T {
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
         app.tick();
-        if let Ok(value) = rx.try_recv() {
-            return value;
-        }
-        assert!(Instant::now() < deadline, "operation did not settle");
+        match rx.try_recv() {
+            Ok(value) => return value,
+            Err(oneshot::error::TryRecvError::Empty) => {}
+            Err(e) => panic!("reply closed: {e}"),
+        };
+        assert!(Instant::now() < deadline, "operation timed out");
         std::thread::sleep(Duration::from_millis(1));
     }
 }
-fn until(app: &mut App, predicate: impl Fn(&core_plugin::World) -> bool) {
+pub fn until(app: &mut App, predicate: impl Fn(&World) -> bool) {
     let deadline = Instant::now() + Duration::from_secs(15);
     while !predicate(app.world()) {
         app.tick();
-        assert!(Instant::now() < deadline, "lifecycle did not settle");
+        assert!(Instant::now() < deadline, "lifecycle timed out");
         std::thread::sleep(Duration::from_millis(1));
     }
 }
-fn command(app: &mut App, source: Entity, target: Entity, text: &str) -> MclValue {
-    let (tx, mut rx) = oneshot::channel();
-    app.world().emit_event(MclCommand {
-        id: format!("test:{text}"),
-        source,
-        source_address: app
-            .world()
-            .get_component::<address::Address>(source)
-            .unwrap()
-            .as_str()
-            .into(),
-        source_instance: None,
-        target,
-        instruction: MclInstruction {
-            text: text.into(),
-            arguments: vec![],
-        },
-        cancel: CancellationToken::new(),
-        reply: Arc::new(Mutex::new(Some(tx))),
-    });
-    drive(app, &mut rx).unwrap()
+pub struct Harness {
+    pub app: App,
+    pub root: tempfile::TempDir,
+    pub workspace: Entity,
 }
-fn messages(
-    app: &App,
-    agent: Entity,
-    block: &str,
-    instance: Option<String>,
-) -> Result<storage_core::StorageValue, storage_core::StorageError> {
-    storage_core::execute_storage(
-        app.world()
-            .get_component::<storage_core::AgentStorage>(agent)
-            .unwrap(),
-        storage_core::StorageOperation::ReadMessages {
-            selectors: vec![storage_core::MessageSelector {
-                block: block.into(),
-                field: "messages".into(),
-                instance,
-                selection: storage_core::MessageSelection::All,
-            }],
-        },
-    )
-}
-fn identical_lua_programs_create_independent_agents_and_stop_without_owning_the_vm() {
-    let root = tempfile::tempdir().unwrap();
-    write(root.path(), "config.toml", "[server]\nbind='127.0.0.1:0'\n");
-    write(
-        root.path(),
-        "models.toml",
-        "[[models]]\nid='offline'\nmodel='unused'\nprovider='openai'\napi_type='chat_completions'\nbase_url='http://127.0.0.1:1/v1'\napi_key='unused'\ncontext_window='128k'\n",
-    );
-    for directory in ["tools", "prompts", "sandboxes", "skills"] {
-        std::fs::create_dir_all(root.path().join(directory)).unwrap();
+impl Harness {
+    pub fn open() -> Self {
+        Self::with_runner(runner())
     }
-    write(
-        root.path(),
-        "agent-drivers/probe/shared/dev/base.lua",
-        PROGRAM,
-    );
-    write(
-        root.path(),
-        "agent-drivers/probe/shared/dev/setting.toml",
-        "label='parent-template'\n",
-    );
-    write(
-        root.path(),
-        "agent-drivers/probe/shared/dev/ui/index.html",
-        "<main>parent-ui</main>",
-    );
-    write(root.path(), "tools/probe/shared/dev/main.lua", PROGRAM);
-    write(
-        root.path(),
-        "tools/probe/shared/dev/tool.toml",
-        "schema_version=1\ndescription='shared Lua environment'\n",
-    );
-    write(
-        root.path(),
-        "tools/probe/shared/dev/input.schema.json",
-        "{\"type\":\"object\"}",
-    );
-    write(
-        root.path(),
-        "tools/probe/shared/dev/setting.toml",
-        "label='child-template'\n",
-    );
-    write(
-        root.path(),
-        "tools/probe/shared/dev/ui/index.html",
-        "<main>child-ui</main>",
-    );
-    let definition = root
-        .path()
-        .join("workspaces/margatroid/test/dev/workspace.yaml");
-    write(
-        root.path(),
-        "workspaces/margatroid/test/dev/workspace.yaml",
-        &format!(
-            "project_root: {}\nmembers:\n- name: parent\n  driver: driver:probe/shared:dev\n  home_root: {}\n",
-            root.path().display(),
-            root.path().display()
-        ),
-    );
-    let mut app = build_app(ApplicationOptions {
-        data_root: root.path().into(),
-        runner_path: std::env::var_os("MARGATROID_LIFETIME_TEST_BINARY")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| std::env::current_exe().unwrap()),
-    })
-    .unwrap();
-    let (tx, mut rx) = oneshot::channel();
-    app.world().emit_event(StartWorkspace {
-        id: "start".into(),
-        path: definition.clone(),
-        reply: Arc::new(Mutex::new(Some(tx))),
-    });
-    let started = drive(&mut app, &mut rx).unwrap();
-    assert!(
-        started.member_errors.is_empty(),
-        "{:?}",
-        started.member_errors
-    );
-    until(&mut app, |world| {
-        world.query_with::<agent_core::Agent>().result().len() == 2
-    });
-    let agents = app.world().query_with::<agent_core::Agent>().result();
-    let parent = *agents
-        .iter()
-        .find(|e| {
-            app.world()
-                .get_component::<agent_core::Agent>(**e)
-                .unwrap()
-                .name()
-                == "parent"
-        })
-        .unwrap();
-    let child = *agents
-        .iter()
-        .find(|e| {
-            app.world()
-                .get_component::<agent_core::Agent>(**e)
-                .unwrap()
-                .name()
-                == "child"
-        })
-        .unwrap();
-    assert_eq!(
-        app.world()
-            .get_component::<address::Address>(parent)
-            .unwrap()
-            .as_str(),
-        "agent:margatroid-test-dev/parent:dev"
-    );
-    assert_eq!(
-        app.world()
-            .get_component::<address::Address>(child)
-            .unwrap()
-            .as_str(),
-        "agent:margatroid-test-dev/child:dev"
-    );
-    let binding = app
-        .world()
-        .get_component::<agent_core::AgentTaskBinding>(child)
-        .unwrap();
-    assert_eq!(
-        binding.creator().address,
-        "agent:margatroid-test-dev/parent:dev"
-    );
-    assert!(!binding.creator().task_id.starts_with("task-instance:"));
-    let execution = app
-        .world()
-        .query_with::<lua_runtime_core::WorkspaceLuaTask>()
-        .result()[0];
-    assert!(
-        app.world()
-            .get_component::<lua_runtime_core::DriverLuaVm>(parent)
-            .is_none()
-    );
-    assert!(
-        app.world()
-            .get_component::<lua_runtime_core::DriverLuaVm>(child)
-            .is_none()
-    );
-    assert!(
-        matches!(messages(&app,parent,"saved",None).unwrap(),storage_core::StorageValue::Messages(rows)if rows[0]["content"]=="parent-data")
-    );
-    assert!(
-        matches!(messages(&app,child,"saved",None).unwrap(),storage_core::StorageValue::Messages(rows)if rows[0]["content"]=="child-data")
-    );
-    assert!(
-        messages(
-            &app,
-            child,
-            "transient",
-            Some(
-                app.world()
-                    .get_component::<agent_core::AgentSession>(parent)
-                    .unwrap()
-                    .0
-                    .clone()
-            )
-        )
-        .is_err()
-    );
-    let parent_creator = app
-        .world()
-        .get_component::<agent_core::AgentTaskBinding>(parent)
-        .unwrap()
-        .creator();
-    assert_eq!(parent_creator.address, "workspace:margatroid/test:dev");
-    assert_eq!(
-        parent_creator.task_id,
-        app.world()
-            .get_component::<lua_runtime_core::DriverLuaVm>(execution)
-            .unwrap()
-            .instance
-            .start_id
-    );
-    assert!(
-        app.world()
-            .get_component::<tool_core::ToolTasks>(parent)
-            .unwrap()
-            .get(
-                &app.world()
-                    .get_component::<agent_core::AgentTaskBinding>(child)
-                    .unwrap()
-                    .creator()
-                    .task_id
-            )
-            .is_ok()
-    );
-    let parent_home = root
-        .path()
-        .join("workspaces/margatroid/test/dev/agents/parent");
-    let child_home = root
-        .path()
-        .join("workspaces/margatroid/test/dev/agents/child");
-    assert!(parent_home.join("state.sqlite").is_file());
-    assert!(child_home.join("state.sqlite").is_file());
-    assert!(!parent_home.join("ui").exists());
-    assert!(!child_home.join("ui").exists());
-    let parent_ui = app
-        .world()
-        .get_component::<agent_core::AgentResources>(parent)
-        .unwrap()
-        .parameters
-        .ui_path
-        .clone();
-    let child_ui = app
-        .world()
-        .get_component::<agent_core::AgentResources>(child)
-        .unwrap()
-        .parameters
-        .ui_path
-        .clone();
-    assert_eq!(
-        parent_ui,
-        root.path().join("agent-drivers/probe/shared/dev/ui")
-    );
-    assert_eq!(child_ui, root.path().join("tools/probe/shared/dev/ui"));
-    write(
-        root.path(),
-        "agent-drivers/probe/shared/dev/ui/index.html",
-        "changed-source",
-    );
-    assert_eq!(
-        agent_driver_core::read_driver_ui(&parent_ui, Default::default())
-            .unwrap()
-            .unwrap()
-            .files[0]
-            .data,
-        b"changed-source"
-    );
-    let client = app.world_mut().spawn();
-    app.world_mut().insert_component(
-        client,
-        address::Address::new("client:test/control:dev").unwrap(),
-    );
-    assert!(matches!(
-        command(&mut app, client, parent, "EFFECT agent_stop"),
-        MclValue::Error(_)
-    ));
-    let services = app
-        .world()
-        .get_resource::<lua_runtime_core::LuaServices>()
-        .unwrap()
-        .clone();
-    let vm = app
-        .world()
-        .get_component::<lua_runtime_core::DriverLuaVm>(execution)
-        .unwrap();
-    let identity = lua_runtime_core::LuaExecutionIdentity {
-        source: execution,
-        workspace: started.workspace,
-        address: app
-            .world()
-            .get_component::<address::Address>(execution)
-            .unwrap()
-            .as_str()
-            .into(),
-        instance: vm.instance.start_id.clone(),
-        cancel: vm.cancel.clone(),
-    };
-    let target = app
-        .world()
-        .get_component::<address::Address>(parent)
-        .unwrap()
-        .as_str()
-        .to_owned();
-    let (tx, mut rx) = oneshot::channel();
-    async_runtime_plugin::WorldAsyncExt::send_async_closure(
-        app.world(),
-        app_runtime_plugin::RuntimePlugin::UPDATE,
-        move || async move {
-            let _ = tx.send(
-                services
-                    .call(identity, "agent_stop".into(), serde_json::json!(target))
-                    .await,
-            );
-            Ok::<(), async_runtime_plugin::AsyncTaskError>(())
-        },
-    );
-    assert_eq!(drive(&mut app, &mut rx).unwrap(), serde_json::json!({}));
-    until(&mut app, |world| {
-        !world.is_alive(parent) && !world.is_alive(child)
-    });
-    assert!(
-        app.world()
-            .get_component::<lua_runtime_core::DriverLuaVm>(execution)
-            .is_some()
-    );
-    assert!(
-        parent_home.join("state.sqlite").is_file() && child_home.join("state.sqlite").is_file()
-    );
-    let (tx, mut rx) = oneshot::channel();
-    app.world().emit_event(StopWorkspace {
-        id: "stop".into(),
-        workspace: started.workspace,
-        reply: Arc::new(Mutex::new(Some(tx))),
-    });
-    drive(&mut app, &mut rx).unwrap();
-    assert!(
-        app.world()
-            .query_with::<lua_runtime_core::DriverLuaVm>()
-            .result()
-            .is_empty()
-    );
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-    runtime.block_on(compose::shutdown_app(&mut app)).unwrap();
-}
-
-fn creator_tasks_own_agents_until_explicit_stop_or_actual_task_cleanup() {
-    for mode in [
-        "normal",
-        "error",
-        "finish",
-        "explicit",
-        "parent-stop",
-        "create-cancel",
-    ] {
+    pub fn with_runner(runner_path: PathBuf) -> Self {
         let root = tempfile::tempdir().unwrap();
         write(root.path(), "config.toml", "[server]\nbind='127.0.0.1:0'\n");
         write(
             root.path(),
             "models.toml",
-            "[[models]]\nid='offline'\nmodel='unused'\nprovider='openai'\napi_type='chat_completions'\nbase_url='http://127.0.0.1:1/v1'\napi_key='unused'\n",
+            "[[models]]\nid='offline'\nmodel='unused'\nprovider='openai'\napi_type='chat_completions'\nbase_url='http://127.0.0.1:1/v1'\napi_key='unused'\ncontext_window='128k'\n",
         );
-        for dir in ["tools", "prompts", "sandboxes", "skills"] {
-            std::fs::create_dir_all(root.path().join(dir)).unwrap();
+        for directory in [
+            "project",
+            "workspaces",
+            "tools",
+            "prompts",
+            "sandboxes",
+            "skills",
+        ] {
+            std::fs::create_dir_all(root.path().join(directory)).unwrap();
         }
-        write(
-            root.path(),
-            "agent-drivers/probe/owner/dev/base.lua",
-            r#"
-function configure()return {timeout_ms=0}end
-function execute(_,ctx)
- local agent=margatroid.agent:create({name=ctx.name,config_path=ctx.resource_dir..'/setting.toml',ui_path=ctx.resource_dir..'/ui'})
- assert(not margatroid.mcl:execute(agent.address,'IMPORT TOOL tool:probe/child:dev AS spawn_child').Error)
- assert(not margatroid.mcl:execute(agent.address,'EFFECT ready').Error)
- margatroid.task:return_result(agent.address)
- margatroid.task:receive()
-end
-"#,
-        );
-        write(
-            root.path(),
-            "agent-drivers/probe/owner/dev/setting.toml",
-            "",
-        );
-        write(
-            root.path(),
-            "tools/probe/child/dev/tool.toml",
-            "schema_version=1\ndescription='create task-owned agents'\n",
-        );
-        write(root.path(), "tools/probe/child/dev/input.schema.json", "{}");
-        write(root.path(), "tools/probe/child/dev/setting.toml", "");
-        write(
-            root.path(),
-            "tools/probe/child/dev/main.lua",
-            r#"
-function configure()return {timeout_ms=0}end
-function execute(_,ctx)
- local agents={}
- for i=1,2 do
-  agents[i]=margatroid.agent:create({name='child'..i,config_path=ctx.resource_dir..'/setting.toml',ui_path=ctx.resource_dir..'/ui'})
-  assert(not margatroid.mcl:execute(agents[i].address,'EFFECT ready').Error)
- end
- margatroid.task:return_result({task_id=ctx.task_id})
- local action=margatroid.task:receive()
- if action=='explicit' then
-  for _,agent in ipairs(agents) do margatroid.agent:stop(agent.address) end
-  margatroid.task:receive()
- elseif action=='error' then error('task-owner-failure') end
-end
-"#,
-        );
-        let definition = root
-            .path()
-            .join("workspaces/margatroid/test/dev/workspace.yaml");
-        write(
-            root.path(),
-            "workspaces/margatroid/test/dev/workspace.yaml",
-            &format!(
-                "project_root: {}\nmembers:\n- name: parent\n  driver: driver:probe/owner:dev\n  home_root: {}\n",
-                root.path().display(),
-                root.path().display()
-            ),
-        );
         let mut app = build_app(ApplicationOptions {
             data_root: root.path().into(),
-            runner_path: std::env::var_os("MARGATROID_LIFETIME_TEST_BINARY")
-                .map(std::path::PathBuf::from)
-                .unwrap_or_else(|| std::env::current_exe().unwrap()),
+            runner_path,
         })
         .unwrap();
         let (tx, mut rx) = oneshot::channel();
-        app.world().emit_event(StartWorkspace {
-            id: "start".into(),
-            path: definition,
+        app.world().send_event(CreateWorkspace {
+            address: "/demo".into(),
+            alias: "Demo".into(),
+            project_root: root.path().join("project"),
             reply: Arc::new(Mutex::new(Some(tx))),
         });
-        if mode == "create-cancel" {
-            until(&mut app, |world| {
-                !world.query_with::<agent_core::Agent>().result().is_empty()
-            });
-            let source = app
-                .world()
-                .query_with::<lua_runtime_core::WorkspaceLuaTask>()
-                .result()[0];
-            let handle = app
-                .world()
-                .get_component::<tool_core::LuaExecutionTask>(source)
-                .unwrap()
-                .handle
-                .clone();
-            app.world()
-                .get_component::<lua_runtime_core::DriverLuaVm>(source)
-                .unwrap()
-                .cancel
-                .cancel();
-            let _ = drive(&mut app, &mut rx);
-            until(&mut app, |world| {
-                handle.is_cleanup_complete()
-                    && world.query_with::<agent_core::Agent>().result().is_empty()
-            });
-            let rt = tokio::runtime::Runtime::new().unwrap();
-            rt.block_on(compose::shutdown_app(&mut app)).unwrap();
-            continue;
-        }
         let workspace = drive(&mut app, &mut rx).unwrap();
-        let parent = app.world().query_with::<agent_core::Agent>().result()[0];
-        let source = app.world_mut().spawn();
-        app.world_mut().insert_component(
-            source,
-            address::Address::new("client:test/lifetime:dev").unwrap(),
-        );
-        let (tx, mut rx) = oneshot::channel();
-        app.world().emit_event(MclCommand {
-            id: "spawn-task".into(),
-            source,
-            source_address: "client:test/lifetime:dev".into(),
-            source_instance: None,
-            target: parent,
-            instruction: MclInstruction {
-                text: "EFFECT tool_call ?".into(),
-                arguments: vec![
-                    serde_json::json!([{"id":"spawn","tool_name":"spawn_child","arguments":"{}"}]),
-                ],
-            },
-            cancel: CancellationToken::new(),
-            reply: Arc::new(Mutex::new(Some(tx))),
-        });
-        let result = drive(&mut app, &mut rx).unwrap();
-        assert!(!matches!(result, MclValue::Error(_)), "{result:?}");
-        let tasks = app
-            .world()
-            .get_component::<tool_core::ToolTasks>(parent)
-            .unwrap()
-            .clone();
-        let (task_id, task) = tasks
-            .list()
-            .into_iter()
-            .find(|(_, handle)| handle.has_returned())
-            .unwrap();
-        let children = app
-            .world()
-            .query_with::<agent_core::Agent>()
-            .result()
-            .into_iter()
-            .filter(|entity| *entity != parent)
-            .collect::<Vec<_>>();
-        assert_eq!(children.len(), 2);
-        assert!(!task.is_cleanup_complete());
-        let mut stop_reply = None;
-        if mode == "parent-stop" {
-            let (tx, rx) = oneshot::channel();
-            app.world().emit_event(agent_core::StopAgent {
-                id: "parent-stop".into(),
-                agent: parent,
-                reply: Arc::new(Mutex::new(Some(tx))),
-            });
-            stop_reply = Some(rx);
-        } else if mode == "finish" {
-            let child_tasks = app
-                .world()
-                .get_component::<tool_core::ToolTasks>(children[0])
-                .unwrap()
-                .clone();
-            let (tx, _rx) = oneshot::channel();
-            let (held, _input) = tool_core::ToolTaskHandle::new(
-                &tool_core::ToolExecutionLimits::default(),
-                "held".into(),
-                "held".into(),
-                tx,
-                child_tasks.update_context(),
-                None,
-            )
-            .unwrap();
-            child_tasks.register("held".into(), held.clone()).unwrap();
-            let (release, wait) = oneshot::channel();
-            let cleanup = held.clone();
-            let runtime = tokio::runtime::Runtime::new().unwrap();
-            held.attach_task(runtime.spawn(async move {
-                wait.await.unwrap();
-                child_tasks.complete_cleanup("held", &cleanup, None);
-            }))
-            .unwrap();
-            let finishing = task.clone();
-            let (tx, mut rx) = oneshot::channel();
-            async_runtime_plugin::WorldAsyncExt::send_async_closure(
-                app.world(),
-                app_runtime_plugin::RuntimePlugin::UPDATE,
-                move || async move {
-                    let result = finishing.finish().await;
-                    let _ = tx.send(result);
-                    Ok::<(), async_runtime_plugin::AsyncTaskError>(())
-                },
-            );
-            until(&mut app, |_| held.cancel_token().is_cancelled());
-            assert!(rx.try_recv().is_err());
-            assert!(!task.is_cleanup_complete());
-            assert!(app.world().is_alive(children[0]));
-            release.send(()).unwrap();
-            drive(&mut app, &mut rx).unwrap();
-            assert!(children.iter().all(|entity| !app.world().is_alive(*entity)));
-        } else {
-            tasks.send(&task_id, serde_json::json!(mode)).unwrap();
+        Self {
+            app,
+            root,
+            workspace,
         }
-        until(&mut app, |world| {
-            children.iter().all(|entity| !world.is_alive(*entity))
-        });
-        if mode == "explicit" {
-            assert!(!task.is_cleanup_complete());
-            let task = task.clone();
-            let (tx, mut rx) = oneshot::channel();
-            async_runtime_plugin::WorldAsyncExt::send_async_closure(
-                app.world(),
-                app_runtime_plugin::RuntimePlugin::UPDATE,
-                move || async move {
-                    let _ = tx.send(task.finish().await);
-                    Ok::<(), async_runtime_plugin::AsyncTaskError>(())
-                },
-            );
-            drive(&mut app, &mut rx).unwrap();
-        }
-        if let Some(mut rx) = stop_reply {
-            drive(&mut app, &mut rx).unwrap();
-        }
-        until(&mut app, |_| task.is_cleanup_complete());
-        assert!(children.iter().all(|entity| !app.world().is_alive(*entity)));
-        if mode != "parent-stop" {
-            assert!(app.world().is_alive(parent));
-        }
-        let (tx, mut rx) = oneshot::channel();
-        app.world().emit_event(StopWorkspace {
-            id: "stop-workspace".into(),
-            workspace: workspace.workspace,
-            reply: Arc::new(Mutex::new(Some(tx))),
-        });
-        drive(&mut app, &mut rx).unwrap();
-        assert!(
-            app.world()
-                .query_with::<agent_core::Agent>()
-                .result()
-                .is_empty()
-        );
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(compose::shutdown_app(&mut app)).unwrap();
     }
+    pub fn driver(&self, name: &str, program: &str) -> PathBuf {
+        let folder = PathBuf::from(format!("tools/probe/{name}/dev"));
+        write(
+            self.root.path(),
+            folder.join("tool.toml"),
+            "schema_version=1\ndescription='Agent lifecycle driver'\n",
+        );
+        write(
+            self.root.path(),
+            folder.join("input.schema.json"),
+            "{\"type\":\"object\"}",
+        );
+        write(self.root.path(), folder.join("main.lua"), program);
+        write(
+            self.root.path(),
+            folder.join("setting.toml"),
+            "label='initial'\n",
+        );
+        write(
+            self.root.path(),
+            folder.join("ui/index.html"),
+            "<main>driver-ui</main>",
+        );
+        self.root.path().join(folder).join("tool.toml")
+    }
+    pub fn execute(
+        &mut self,
+        parent: Entity,
+        path: &Path,
+        arguments: Value,
+    ) -> Result<ToolExecuteResponse, tool_core::ToolError> {
+        let (tx, mut rx) = oneshot::channel();
+        self.app.world().send_event(ToolExecuteRequest::Path {
+            initiator: parent,
+            path: path.into(),
+            arguments,
+            reply: Arc::new(Mutex::new(Some(tx))),
+        });
+        drive(&mut self.app, &mut rx)
+    }
+    pub fn start(&mut self, parent: Entity, path: &Path, arguments: Value) -> Entity {
+        let response = self.execute(parent, path, arguments).unwrap();
+        assert!(!response.failed, "{response:?}");
+        let address = response.content;
+        let entity = self.app.world().entity_by_address(&address).unwrap();
+        until(&mut self.app, |world| {
+            world
+                .get_component::<Agent>(entity)
+                .is_some_and(|a| a.state() == agent_core::AgentState::Running)
+        });
+        entity
+    }
+    pub fn task(&self, agent: Entity) -> ToolTaskHandle {
+        let agent = self.app.world().get_component::<Agent>(agent).unwrap();
+        self.app
+            .world()
+            .get_component::<ToolTasks>(agent.parent())
+            .unwrap()
+            .get(agent.task_id())
+            .unwrap()
+    }
+    pub fn stop(&mut self, agent: Entity) {
+        let address = self
+            .app
+            .world()
+            .get_component::<Address>(agent)
+            .unwrap()
+            .as_str()
+            .to_owned();
+        let (tx, mut rx) = oneshot::channel();
+        self.app.world().send_event(StopAgent {
+            address,
+            reply: Arc::new(Mutex::new(Some(tx))),
+        });
+        drive(&mut self.app, &mut rx).unwrap();
+    }
+    pub fn finish(&mut self, task: ToolTaskHandle) {
+        let (tx, mut rx) = oneshot::channel();
+        self.app
+            .world()
+            .get_resource::<async_runtime_plugin::AsyncRuntimeHandle>()
+            .unwrap()
+            .spawn(async move {
+                let _ = tx.send(task.finish().await);
+            });
+        drive(&mut self.app, &mut rx).unwrap();
+    }
+    pub fn config(&self, agent: Entity) -> toml::Table {
+        let storage = self
+            .app
+            .world()
+            .get_component::<AgentStorage>(agent)
+            .unwrap();
+        let StorageValue::Config(value) =
+            storage_core::execute_storage(storage, StorageOperation::ReadConfig).unwrap()
+        else {
+            panic!("unexpected storage reply")
+        };
+        value
+    }
+    pub fn close(mut self) {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(compose::shutdown_app(&mut self.app)).unwrap();
+    }
+}
+fn nested_creators_own_actual_task_identity_and_close_descendants(runner: PathBuf) {
+    let mut h = Harness::with_runner(runner);
+    let path = h.driver("shared", DRIVER);
+    let parent = h.start(
+        h.workspace,
+        &path,
+        json!({"node_name":"parent","append":"parent-data","model":true}),
+    );
+    let child = h.start(
+        parent,
+        &path,
+        json!({"node_name":"child","append":"child-data"}),
+    );
+    let parent_agent = h.app.world().get_component::<Agent>(parent).unwrap();
+    assert_eq!(parent_agent.parent(), h.workspace);
+    let child_agent = h.app.world().get_component::<Agent>(child).unwrap();
+    assert_eq!(child_agent.parent(), parent);
+    let task = child_agent.task_id().to_owned();
+    assert!(
+        h.app
+            .world()
+            .get_component::<ToolTasks>(parent)
+            .unwrap()
+            .get(&task)
+            .is_ok()
+    );
+    assert_eq!(
+        h.app
+            .world()
+            .get_component::<Address>(child)
+            .unwrap()
+            .as_str(),
+        "/demo/parent/child"
+    );
+    let database = h
+        .app
+        .world()
+        .get_component::<Workspace>(h.workspace)
+        .unwrap()
+        .database
+        .clone();
+    assert_eq!(
+        database.agent_by_node("child").unwrap().parent_node,
+        "/demo/parent"
+    );
+    let parent_task = h.task(parent);
+    let child_task = h.task(child);
+    h.stop(parent);
+    assert!(!h.app.world().is_alive(child));
+    assert!(parent_task.is_cleanup_complete());
+    assert!(child_task.is_cleanup_complete());
+    assert!(database.agent_by_node("parent").is_ok());
+    assert!(database.agent_by_node("child").is_ok());
+    h.close();
+}
+fn same_task_closes_all_created_agents(runner: PathBuf) {
+    let mut h = Harness::with_runner(runner);
+    let path=h.driver("siblings",r#"
+function configure()return{timeout_ms=0}end
+function execute(args,context)
+ local addresses={}
+ for _,name in ipairs({'alpha','beta'})do
+  local a=margatroid.agent:create({node_name=name,project_root=context.project_root,config_path=context.resource_dir..'/setting.toml',ui_path=context.resource_dir..'/ui'})
+  local ready=margatroid.mcl:execute(a.address,'EFFECT ready');assert(not ready.Error)
+  addresses[#addresses+1]=a.address
+ end
+ margatroid.task:return_result(addresses)
+ margatroid.task:receive()
+end
+"#);
+    let reply = h.execute(h.workspace, &path, json!({})).unwrap();
+    assert!(!reply.failed);
+    let addresses: Vec<String> = serde_json::from_str(&reply.content).unwrap();
+    assert_eq!(addresses.len(), 2);
+    let alpha = h.app.world().entity_by_address(&addresses[0]).unwrap();
+    let beta = h.app.world().entity_by_address(&addresses[1]).unwrap();
+    assert_eq!(
+        h.app
+            .world()
+            .get_component::<Agent>(alpha)
+            .unwrap()
+            .task_id(),
+        h.app
+            .world()
+            .get_component::<Agent>(beta)
+            .unwrap()
+            .task_id()
+    );
+    h.stop(alpha);
+    assert!(!h.app.world().is_alive(beta));
+    h.close();
 }
 fn main() {
     if std::env::args()
@@ -704,12 +345,9 @@ fn main() {
             .unwrap();
         std::process::exit(rt.block_on(tool_plugin::runner_main()));
     }
-    creator_tasks_own_agents_until_explicit_stop_or_actual_task_cleanup();
-    let tests: Vec<(&str, fn())> = vec![(
-        "identical_lua_programs_create_independent_agents_and_stop_without_owning_the_vm",
-        identical_lua_programs_create_independent_agents_and_stop_without_owning_the_vm,
-    )];
-    for (_, test) in tests {
-        test();
-    }
+    let runner = std::env::var_os("MARGATROID_TEST_RUNNER")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| std::env::current_exe().unwrap());
+    nested_creators_own_actual_task_identity_and_close_descendants(runner.clone());
+    same_task_closes_all_created_agents(runner);
 }

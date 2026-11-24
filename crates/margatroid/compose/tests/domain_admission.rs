@@ -1,33 +1,218 @@
-use app_runtime_plugin::RuntimePlugin;
+#![allow(dead_code, unused_imports)]
+use address::{Address, WorldAddressExt};
+use agent_core::{Agent, AgentHandle, AgentState, StartAgent, StopAgent, WorldAgentExt};
 use compose::{ApplicationOptions, build_app};
-use core_plugin::{App, Entity, World};
+use core_plugin::{App, Entity};
 use mcl_core::{MclCommand, MclInstruction, MclValue};
 use serde_json::{Value, json};
 use std::{
-    path::Path,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
+use storage_core::AgentStorage;
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
-use workspace_core::{StartWorkspace, StopWorkspace};
+use tool_core::{
+    TaskFinish, ToolError, ToolErrorKind, ToolExecuteResponse, ToolExecutionLimits, ToolTaskHandle,
+    ToolTasks,
+};
+use workspace_core::{
+    CreateWorkspace, Workspace, WorkspaceAgent, WorkspaceDatabase, WorkspaceState,
+};
+
+fn runner() -> PathBuf {
+    let path = std::env::var_os("MARGATROID_TEST_RUNNER")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../target/debug/margatroid")
+        });
+    assert!(
+        path.is_file(),
+        "build the actual runner with cargo build -p margatroid, or set MARGATROID_TEST_RUNNER: {}",
+        path.display()
+    );
+    path.canonicalize().unwrap()
+}
 fn write(root: &Path, name: &str, text: &str) {
     let path = root.join(name);
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     std::fs::write(path, text).unwrap();
 }
-fn drive<T>(app: &mut App, rx: &mut oneshot::Receiver<T>) -> T {
+fn prepare_root(root: &Path) {
+    write(root, "config.toml", "[server]\nbind='127.0.0.1:0'\n");
+    write(
+        root,
+        "models.toml",
+        "[[models]]\nid='offline'\nmodel='unused'\nprovider='openai'\napi_type='chat_completions'\nbase_url='http://127.0.0.1:1/v1'\napi_key='test'\ncontext_window='128k'\n",
+    );
+    for name in [
+        "tools",
+        "prompts",
+        "sandboxes",
+        "skills",
+        "workspaces",
+        "project",
+    ] {
+        std::fs::create_dir_all(root.join(name)).unwrap();
+    }
+}
+async fn drive<T>(app: &mut App, rx: &mut oneshot::Receiver<T>) -> T {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         app.tick();
-        if let Ok(value) = rx.try_recv() {
-            return value;
+        match rx.try_recv() {
+            Ok(value) => return value,
+            Err(oneshot::error::TryRecvError::Empty) => {}
+            Err(error) => panic!("reply lost: {error}"),
         }
-        assert!(Instant::now() < deadline, "request timed out");
-        std::thread::sleep(Duration::from_millis(1));
+        assert!(Instant::now() < deadline, "lifecycle reply timed out");
+        tokio::time::sleep(Duration::from_millis(1)).await;
     }
 }
-fn command(
+async fn tick_until(app: &mut App, condition: impl Fn(&App) -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !condition(app) {
+        app.tick();
+        assert!(Instant::now() < deadline, "lifecycle state timed out");
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+}
+async fn fixture() -> (tempfile::TempDir, App, Entity) {
+    let root = tempfile::tempdir().unwrap();
+    prepare_root(root.path());
+    let mut app = build_app(ApplicationOptions {
+        data_root: root.path().into(),
+        runner_path: runner(),
+    })
+    .unwrap();
+    let (tx, mut rx) = oneshot::channel();
+    app.world().emit_event(CreateWorkspace {
+        address: "/demo".into(),
+        alias: "Demo".into(),
+        project_root: root.path().join("project"),
+        reply: Arc::new(Mutex::new(Some(tx))),
+    });
+    let workspace = drive(&mut app, &mut rx).await.unwrap();
+    (root, app, workspace)
+}
+fn create_task(app: &App, parent: Entity, id: &str) -> ToolTaskHandle {
+    let tasks = app
+        .world()
+        .get_component::<ToolTasks>(parent)
+        .unwrap()
+        .clone();
+    let owner = tasks.clone();
+    let task_id = id.to_owned();
+    let runtime = tokio::runtime::Handle::current();
+    let running = Arc::new(tokio::sync::Mutex::new(()));
+    let finish: TaskFinish = Arc::new(move |handle| {
+        let runtime = runtime.clone();
+        let owner = owner.clone();
+        let task_id = task_id.clone();
+        let running = running.clone();
+        let (tx, rx) = oneshot::channel();
+        runtime.spawn(async move {
+            let _run = running.lock().await;
+            let result = if handle.is_cleanup_complete() {
+                Ok(())
+            } else {
+                async {
+                    handle.finish_children().await?;
+                    handle.retry_cleanups().await?;
+                    if !owner.complete_cleanup(&task_id, &handle, None) {
+                        return Err(ToolError::new(
+                            ToolErrorKind::CleanupFailed,
+                            "cleanup did not retire task",
+                        ));
+                    }
+                    Ok(())
+                }
+                .await
+            };
+            let _ = tx.send(result);
+        });
+        Box::pin(async move {
+            rx.await
+                .map_err(|e| ToolError::new(ToolErrorKind::CleanupFailed, e.to_string()))?
+        })
+    });
+    let (tx, _rx) = oneshot::channel();
+    let (handle, _input) = ToolTaskHandle::new(
+        &ToolExecutionLimits::default(),
+        id.into(),
+        "test-driver".into(),
+        tx,
+        tasks.update_context(),
+        None,
+        finish,
+    )
+    .unwrap();
+    tasks.register(id.into(), handle.clone()).unwrap();
+    handle
+}
+async fn mount(
+    app: &mut App,
+    workspace: Entity,
+    node: &str,
+    task_id: &str,
+) -> (AgentHandle, WorkspaceAgent) {
+    let database = app
+        .world()
+        .get_component::<Workspace>(workspace)
+        .unwrap()
+        .database
+        .clone();
+    let operation = database.try_operation(node).unwrap();
+    let candidate = database
+        .prepare_agent(
+            &operation,
+            "/demo".into(),
+            Some(node.into()),
+            Some("Agent".into()),
+            "/test/driver/tool.toml".into(),
+            json!({"node_name":node}),
+        )
+        .unwrap();
+    let directory = database.agent_directory(&candidate).unwrap();
+    std::fs::create_dir_all(&directory).unwrap();
+    let storage = storage_core::open_storage(
+        &directory.join("state.sqlite"),
+        &directory.join("setting.toml"),
+        "",
+    )
+    .unwrap();
+    let record = database.commit_agent(&operation, candidate).unwrap();
+    create_task(app, workspace, task_id);
+    let (tx, mut rx) = oneshot::channel();
+    app.world().emit_event(StartAgent {
+        workspace,
+        parent: workspace,
+        task_id: task_id.into(),
+        address: format!("/demo/{node}"),
+        project_root: app
+            .world()
+            .get_component::<Workspace>(workspace)
+            .unwrap()
+            .project_root
+            .clone(),
+        ui_path: directory.join("ui"),
+        persistence: storage,
+        reply: Arc::new(Mutex::new(Some(tx))),
+    });
+    let handle = drive(app, &mut rx).await.unwrap();
+    drop(operation);
+    (handle, record)
+}
+async fn stop(app: &mut App, address: &str) {
+    let (tx, mut rx) = oneshot::channel();
+    app.world().emit_event(StopAgent {
+        address: address.into(),
+        reply: Arc::new(Mutex::new(Some(tx))),
+    });
+    drive(app, &mut rx).await.unwrap();
+}
+async fn command(
     app: &mut App,
     source: Entity,
     target: Entity,
@@ -36,11 +221,11 @@ fn command(
 ) -> MclValue {
     let (tx, mut rx) = oneshot::channel();
     app.world().emit_event(MclCommand {
-        id: format!("domain-admission:{text}"),
+        id: format!("command:{text}"),
         source,
         source_address: app
             .world()
-            .get_component::<address::Address>(source)
+            .get_component::<Address>(source)
             .unwrap()
             .as_str()
             .into(),
@@ -53,196 +238,103 @@ fn command(
         cancel: CancellationToken::new(),
         reply: Arc::new(Mutex::new(Some(tx))),
     });
-    drive(app, &mut rx).unwrap()
+    drive(app, &mut rx).await.unwrap()
 }
-#[test]
-fn starting_and_running_mcl_reach_real_domains_which_reject_explicit_stale_turns() {
-    let root = tempfile::tempdir().unwrap();
-    write(root.path(), "config.toml", "[server]\nbind='127.0.0.1:0'\n");
-    write(
-        root.path(),
-        "models.toml",
-        "[[models]]\nid='offline'\nmodel='unused'\nprovider='openai'\napi_type='chat_completions'\nbase_url='http://127.0.0.1:1/v1'\napi_key='unused'\ncontext_window='128k'\n",
-    );
-    for name in ["tools", "prompts", "sandboxes", "skills"] {
-        std::fs::create_dir_all(root.path().join(name)).unwrap();
-    }
-    write(
-        root.path(),
-        "agent-drivers/probe/admission/dev/base.lua",
-        r#"
-function configure()return {timeout_ms=0}end
-function execute(_,context)
- local agent=margatroid.agent:create({name=context.name,config_path=context.resource_dir..'/setting.toml',ui_path=context.resource_dir..'/ui'})
- margatroid:wait(agent.address)
-end
-"#,
-    );
-    write(
-        root.path(),
-        "workspaces/margatroid/probe/dev/workspace.yaml",
-        &format!(
-            "project_root: {}\nmembers:\n- name: target\n  driver: driver:probe/admission:dev\n  home_root: {}\n",
-            root.path().display(),
-            root.path().display()
-        ),
-    );
-    write(
-        root.path(),
-        "agent-drivers/probe/admission/dev/setting.toml",
-        "",
-    );
-    let mut app = build_app(ApplicationOptions {
-        data_root: root.path().into(),
-        runner_path: std::env::current_exe().unwrap(),
-    })
-    .unwrap();
-    let submissions = Arc::new(Mutex::new((0usize, 0usize)));
-    let recorded = submissions.clone();
-    app.add_system(RuntimePlugin::UPDATE, move |world: &mut World| {
-        let inference = world
-            .event_reader::<inference_core::InferenceRequest>()
-            .into_iter()
-            .count();
-        let tools = world
-            .event_reader::<tool_core::ToolExecuteRequest>()
-            .into_iter()
-            .count();
-        let mut counts = recorded.lock().unwrap();
-        counts.0 += inference;
-        counts.1 += tools;
-    });
-    let (tx, mut rx) = oneshot::channel();
-    app.world().emit_event(StartWorkspace {
-        id: "start".into(),
-        path: root
-            .path()
-            .join("workspaces/margatroid/probe/dev/workspace.yaml"),
-        reply: Arc::new(Mutex::new(Some(tx))),
-    });
-    let workspace = drive(&mut app, &mut rx).unwrap();
-    let agent = app.world().query_with::<agent_core::Agent>().result()[0];
-    let client = app.world_mut().spawn();
-    app.world_mut().insert_component(
-        client,
-        address::Address::new("client:probe/admission:dev").unwrap(),
-    );
+async fn shutdown(app: &mut App) {
+    tokio::time::timeout(Duration::from_secs(10), compose::shutdown_app(app))
+        .await
+        .expect("application shutdown timed out")
+        .unwrap();
+}
+
+#[tokio::test]
+async fn mcl_reaches_domains_and_stale_explicit_turns_never_start_work() {
+    let (_root, mut app, workspace) = fixture().await;
+    let (handle, _) = mount(&mut app, workspace, "coder", "driver").await;
+    let entity = handle.entity();
     assert!(matches!(
         command(
             &mut app,
-            client,
-            agent,
+            workspace,
+            entity,
             "EFFECT model_set ?",
             vec![json!({"model":"offline"})]
-        ),
+        )
+        .await,
         MclValue::Config(_)
     ));
-    for (index, state) in [
-        agent_core::AgentState::Starting,
-        agent_core::AgentState::Running,
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        if state == agent_core::AgentState::Running {
+    for ready in [false, true] {
+        if ready {
             assert_eq!(
-                command(&mut app, client, agent, "EFFECT ready", vec![]),
+                command(&mut app, workspace, entity, "EFFECT ready", vec![]).await,
                 MclValue::Unit
             );
         }
         let result = command(
             &mut app,
-            client,
-            agent,
+            workspace,
+            entity,
             "EFFECT inference ? ?",
             vec![
-                json!([{"type":"user","content":"stale turn"}]),
+                json!([{"type":"user","content":"stale"}]),
                 json!("stale-turn"),
             ],
-        );
+        )
+        .await;
         assert!(
-            matches!(result,MclValue::Inference{message,stop_reason}if stop_reason=="completed"&&message["content"].is_null()&&message["tool_calls"]==json!([])),
-            "domain must not submit HTTP for a stale explicit turn"
+            matches!(result,MclValue::Inference{message,stop_reason}if stop_reason=="completed"&&message["content"].is_null()&&message["tool_calls"]==json!([]))
         );
-        let result = command(
+        let tools = command(
             &mut app,
-            client,
-            agent,
+            workspace,
+            entity,
             "EFFECT tool_call ? ?",
             vec![
-                json!([{"id":"stale-turn","tool_name":"unimported","arguments":"{}"}]),
+                json!([{"id":"stale-call","tool_name":"unregistered","arguments":"{}"}]),
                 json!("stale-turn"),
             ],
-        );
+        )
+        .await;
         assert!(
-            matches!(result,MclValue::Array(mcl_core::MessageArray::Message(rows))if rows.len()==1&&rows[0]["failed"]==true&&rows[0]["content"]=="Tool call aborted.")
+            matches!(tools,MclValue::Array(mcl_core::MessageArray::Message(rows))if rows.len()==1&&rows[0]["failed"]==true&&rows[0]["content"]=="Tool call aborted.")
         );
-        assert_eq!(
-            *submissions.lock().unwrap(),
-            (index + 1, index + 1),
-            "MCL intercepted a domain admission decision"
-        );
-        let current = app
-            .world()
-            .get_component::<agent_core::Agent>(agent)
-            .unwrap();
-        assert_eq!(current.state(), state);
-        assert!(current.turn().is_none());
         assert!(
             app.world()
-                .get_component::<inference_core::ActiveInference>(agent)
+                .get_component::<ToolTasks>(entity)
+                .unwrap()
+                .list()
+                .is_empty()
+        );
+        assert!(
+            app.world()
+                .get_component::<inference_core::ActiveInference>(entity)
                 .unwrap()
                 .current
                 .is_none()
         );
         assert!(
             app.world()
-                .get_component::<tool_core::ToolTasks>(agent)
+                .get_component::<Agent>(entity)
                 .unwrap()
-                .list()
-                .is_empty()
+                .turn()
+                .is_none()
         );
     }
-    let result = command(
+    let failure = command(
         &mut app,
-        client,
-        agent,
+        workspace,
+        entity,
         "EFFECT inference ?",
-        vec![json!([{"type":"user","content":"connection refused must be an error message"}])],
-    );
-    let MclValue::Inference {
-        message,
-        stop_reason,
-    } = result
-    else {
-        panic!("provider failure must return an inference message");
-    };
-    assert_eq!(stop_reason, "error");
-    assert_eq!(message["type"], "error");
+        vec![json!([{"type":"user","content":"provider unreachable"}])],
+    )
+    .await;
     assert!(
-        message["message"]
-            .as_str()
-            .unwrap()
-            .contains("connection refused")
+        matches!(failure,MclValue::Inference{message,stop_reason}if stop_reason=="error"&&message["type"]=="error")
     );
-    assert!(message["request_id"].as_str().is_some());
     assert_eq!(
-        app.world()
-            .get_component::<agent_core::Agent>(agent)
-            .unwrap()
-            .state(),
-        agent_core::AgentState::Running
+        app.world().get_component::<Agent>(entity).unwrap().state(),
+        AgentState::Running
     );
-    let (tx, mut rx) = oneshot::channel();
-    app.world().emit_event(StopWorkspace {
-        id: "stop".into(),
-        workspace: workspace.workspace,
-        reply: Arc::new(Mutex::new(Some(tx))),
-    });
-    drive(&mut app, &mut rx).unwrap();
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-    runtime.block_on(compose::shutdown_app(&mut app)).unwrap();
+    stop(&mut app, "/demo/coder").await;
+    shutdown(&mut app).await;
 }

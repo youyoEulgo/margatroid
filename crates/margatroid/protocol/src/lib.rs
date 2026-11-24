@@ -37,6 +37,18 @@ pub fn parse_client_message(text: &str) -> Result<ClientMessage, ProtocolError> 
         ));
     }
     match &message {
+        ClientMessage::ResourceReq { message, .. } => {
+            if message
+                .resource_type
+                .as_deref()
+                .is_some_and(|v| !resource_type(v))
+            {
+                return Err(invalid("invalid resource type"));
+            }
+            for part in [&message.scope, &message.name].into_iter().flatten() {
+                validate_resource_part(part)?;
+            }
+        }
         ClientMessage::ConnectionRegister { message, .. } => {
             if message.client_type.is_empty()
                 || message.client_type.len() > 128
@@ -57,32 +69,55 @@ pub fn parse_client_message(text: &str) -> Result<ClientMessage, ProtocolError> 
         ClientMessage::ModelConfigReq { .. }
         | ClientMessage::WorkspaceReq { .. }
         | ClientMessage::AgentReq { .. } => {}
-        ClientMessage::WorkspaceCreate { message, .. }
-        | ClientMessage::WorkspaceUpdate { message, .. } => {
+        ClientMessage::WorkspaceCreate { message, .. } => {
             validate_address(&message.address, "workspace")?;
-            if message.definition.agents.len() > 1024 {
-                return Err(invalid("invalid Workspace definition"));
+            if message.address == "/" || message.address[1..].contains('/') {
+                return Err(invalid("Workspace must be a root child node"));
             }
-            validate_path(&message.definition.project_root)?;
-            for member in &message.definition.agents {
-                if member.name.trim().is_empty() {
-                    return Err(invalid("invalid member name"));
-                }
-                validate_address(&member.driver, "driver")?;
-                validate_path(&member.home_root)?;
+            if !valid_request_id(&message.alias) {
+                return Err(invalid("invalid Workspace alias"));
             }
-        }
-        ClientMessage::WorkspaceRename { message, .. } => {
-            validate_address(&message.address, "workspace")?;
-            validate_address(&message.new_address, "workspace")?;
+            validate_absolute_path(&message.project_root)?;
         }
         ClientMessage::WorkspaceDelete { message, .. } => {
             validate_address(&message.address, "workspace")?
         }
-        ClientMessage::WorkspaceStart { message, .. }
-        | ClientMessage::WorkspaceStop { message, .. }
-        | ClientMessage::WorkspaceRestart { message, .. } => {
-            validate_address(&message.address, "workspace")?
+        ClientMessage::AgentStart { message, .. } => match message {
+            AgentStartInputDto::Existing {
+                workspace,
+                node_name,
+            } => {
+                validate_address(workspace, "workspace")?;
+                validate_node_name(node_name)?;
+            }
+            AgentStartInputDto::New {
+                workspace,
+                tool_path,
+                arguments,
+            } => {
+                validate_address(workspace, "workspace")?;
+                validate_absolute_path(tool_path)?;
+                if !arguments.is_object() {
+                    return Err(invalid("Driver arguments must be an object"));
+                }
+                if let Some(name) = arguments.get("node_name").filter(|v| !v.is_null()) {
+                    validate_node_name(
+                        name.as_str()
+                            .ok_or_else(|| invalid("node_name must be a string or null"))?,
+                    )?;
+                }
+                if let Some(alias) = arguments.get("alias").filter(|v| !v.is_null())
+                    && !alias.as_str().is_some_and(valid_request_id)
+                {
+                    return Err(invalid("invalid Agent alias"));
+                }
+                validate_value(arguments, 0, &mut 0, false)?;
+            }
+        },
+        ClientMessage::AgentStop { message, .. } => validate_target(&message.address)?,
+        ClientMessage::AgentArchive { message, .. } => {
+            validate_address(&message.workspace, "workspace")?;
+            validate_node_name(&message.node_name)?;
         }
         ClientMessage::AgentTurnReq { message, .. }
         | ClientMessage::AgentTaskReq { message, .. }
@@ -145,6 +180,34 @@ pub fn encode_server_message(message: &ServerMessage) -> Result<String, Protocol
     Ok(text)
 }
 
+fn resource_type(value: &str) -> bool {
+    matches!(value, "driver" | "tool" | "prompt" | "sandbox")
+}
+fn validate_resource_part(value: &str) -> Result<(), ProtocolError> {
+    if value.is_empty()
+        || matches!(value, "." | "..")
+        || value
+            .chars()
+            .any(|c| c.is_control() || matches!(c, '/' | '\\' | ':'))
+    {
+        return Err(invalid("invalid resource path segment"));
+    }
+    Ok(())
+}
+
+fn validate_resource_path(value: &str) -> Result<(), ProtocolError> {
+    validate_absolute_path(value)?;
+    if std::path::Path::new(value).components().any(|v| {
+        matches!(
+            v,
+            std::path::Component::ParentDir | std::path::Component::CurDir
+        )
+    }) {
+        return Err(invalid("resource path contains traversal"));
+    }
+    Ok(())
+}
+
 fn logical_name(value: &str, maximum: usize) -> bool {
     !value.trim().is_empty()
         && value.len() <= maximum
@@ -166,31 +229,32 @@ fn validate_target(address: &str) -> Result<(), ProtocolError> {
     validate_address(address, "agent")
 }
 
-fn validate_address(value: &str, expected: &str) -> Result<(), ProtocolError> {
-    if value.len() > 4096 {
-        return Err(invalid("address exceeds size limit"));
+fn validate_address(value: &str, _expected: &str) -> Result<(), ProtocolError> {
+    if value.len() > 4096
+        || !value.starts_with('/')
+        || value.contains(['\\', ':'])
+        || value.chars().any(char::is_control)
+        || (value != "/"
+            && value[1..]
+                .split('/')
+                .any(|part| part.is_empty() || matches!(part, "." | "..")))
+    {
+        return Err(invalid("invalid absolute node path"));
     }
-    let (kind, rest) = value
-        .split_once(':')
-        .ok_or_else(|| invalid("invalid address format"))?;
-    if kind != expected {
-        return Err(invalid("address has the wrong kind"));
+    Ok(())
+}
+
+fn validate_node_name(value: &str) -> Result<(), ProtocolError> {
+    if !logical_name(value, 512) || value.starts_with("~temporary-") {
+        return Err(invalid("invalid ordinary Agent node name"));
     }
-    let (scope, remainder) = rest
-        .split_once('/')
-        .ok_or_else(|| invalid("invalid address format"))?;
-    let (name, tag) = remainder
-        .split_once(':')
-        .ok_or_else(|| invalid("address requires an explicit tag"))?;
-    let valid = |part: &str| {
-        !part.is_empty()
-            && !matches!(part, "." | "..")
-            && !part
-                .chars()
-                .any(|character| character.is_control() || matches!(character, '/' | '\\' | ':'))
-    };
-    if !valid(scope) || !valid(name) || !valid(tag) {
-        return Err(invalid("invalid address segment"));
+    Ok(())
+}
+
+fn validate_absolute_path(value: &str) -> Result<(), ProtocolError> {
+    validate_path(value)?;
+    if !std::path::Path::new(value).is_absolute() {
+        return Err(invalid("filesystem path must be absolute"));
     }
     Ok(())
 }
@@ -318,10 +382,11 @@ pub(crate) fn validate_server_value(value: &Value) -> Result<(), ProtocolError> 
             "model.config.res"
                 | "model.config.update.result"
                 | "connection.register.result"
+                | "resource.res"
                 | "workspace.res"
-                | "workspace.start.result"
-                | "workspace.stop.result"
-                | "workspace.restart.result"
+                | "agent.start.result"
+                | "agent.stop.result"
+                | "agent.archive.result"
                 | "workspace.create.result"
                 | "workspace.update.result"
                 | "workspace.rename.result"
@@ -362,6 +427,7 @@ pub(crate) fn validate_server_value(value: &Value) -> Result<(), ProtocolError> 
         let payload = match kind {
             "connection.register.result" => Some("client"),
             "model.config.res" => Some("content"),
+            "resource.res" => Some("resources"),
             "workspace.res" => Some("workspaces"),
             "agent.res" => Some("agents"),
             "agent.ui.res" => Some("ui"),
@@ -401,6 +467,65 @@ pub(crate) fn validate_server_value(value: &Value) -> Result<(), ProtocolError> 
             }
         }
     }
+    if kind == "resource.res" && value["success"] == true {
+        let records = value["resources"]
+            .as_array()
+            .ok_or_else(|| invalid("resources must be an array"))?;
+        let mut previous: Option<(&str, &str, &str, &str)> = None;
+        for row in records {
+            require_fields(
+                row,
+                &[
+                    "address",
+                    "type",
+                    "scope",
+                    "name",
+                    "tag",
+                    "path",
+                    "tool_path",
+                ],
+            )?;
+            let text = |key: &str| {
+                row[key]
+                    .as_str()
+                    .ok_or_else(|| invalid("resource field must be string"))
+            };
+            let kind = text("type")?;
+            if !resource_type(kind) {
+                return Err(invalid("invalid resource type"));
+            }
+            for key in ["scope", "name", "tag"] {
+                validate_resource_part(text(key)?)?;
+            }
+            let expected = format!(
+                "{}:{}/{}:{}",
+                kind,
+                text("scope")?,
+                text("name")?,
+                text("tag")?
+            );
+            if text("address")? != expected {
+                return Err(invalid("resource address and fields differ"));
+            }
+            let key = (kind, text("scope")?, text("name")?, text("tag")?);
+            if previous.is_some_and(|previous| previous >= key) {
+                return Err(invalid(
+                    "resource list must be uniquely sorted by type/scope/name/tag",
+                ));
+            }
+            previous = Some(key);
+            let path = text("path")?;
+            validate_resource_path(path)?;
+            match (kind, row["tool_path"].as_str(), row["tool_path"].is_null()) {
+                ("tool", Some(tool), _) if tool == path => {}
+                ("driver", Some(tool), _) => {
+                    validate_resource_path(tool)?;
+                }
+                ("driver" | "prompt" | "sandbox", None, true) => {}
+                _ => return Err(invalid("invalid resource tool_path")),
+            }
+        }
+    }
     if kind == "agent.ui.sync" {
         require_fields(value, &["ui", "error"])?;
         if !value["error"].is_null() && !value["ui"].is_null() {
@@ -437,30 +562,102 @@ pub(crate) fn validate_server_value(value: &Value) -> Result<(), ProtocolError> 
     for (key, expected) in [("workspaces", "workspace"), ("agents", "agent")] {
         if let Some(items) = value.get(key).and_then(Value::as_array) {
             for item in items {
-                require_fields(
-                    item,
-                    if expected == "workspace" {
-                        &["address", "error"]
-                    } else {
-                        &["creator", "sandboxes", "sandbox", "model", "error"]
-                    },
-                )?;
                 if expected == "workspace" {
-                    validate_path(
-                        item["path"]
-                            .as_str()
-                            .ok_or_else(|| invalid("missing workspace path"))?,
+                    require_fields(
+                        item,
+                        &["address", "alias", "project_root", "status", "agents"],
                     )?;
-                    if let Some(address) = item["address"].as_str() {
-                        validate_address(address, "workspace")?;
+                    validate_address(
+                        item["address"]
+                            .as_str()
+                            .ok_or_else(|| invalid("missing workspace address"))?,
+                        "workspace",
+                    )?;
+                    if !item["alias"].as_str().is_some_and(valid_request_id) {
+                        return Err(invalid("invalid Workspace alias"));
                     }
+                    validate_absolute_path(
+                        item["project_root"]
+                            .as_str()
+                            .ok_or_else(|| invalid("missing project_root"))?,
+                    )?;
                     if !matches!(
                         item["status"].as_str(),
-                        Some("inactive" | "starting" | "running" | "stopping" | "error")
+                        Some("running" | "deleting" | "error")
                     ) {
                         return Err(invalid("invalid workspace status"));
                     }
+                    let records = item["agents"]
+                        .as_array()
+                        .ok_or_else(|| invalid("missing Agent registrations"))?;
+                    let mut ids = std::collections::BTreeSet::new();
+                    let mut names = std::collections::BTreeSet::new();
+                    for record in records {
+                        require_fields(
+                            record,
+                            &[
+                                "id",
+                                "parent_node",
+                                "node_name",
+                                "alias",
+                                "category",
+                                "tool_path",
+                                "tool_arguments",
+                                "previous_node_name",
+                                "previous_alias",
+                            ],
+                        )?;
+                        let id = record["id"]
+                            .as_str()
+                            .filter(|v| valid_request_id(v))
+                            .ok_or_else(|| invalid("invalid registered Agent id"))?;
+                        if !ids.insert(id) {
+                            return Err(invalid("duplicate Agent registration id"));
+                        }
+                        validate_address(
+                            record["parent_node"]
+                                .as_str()
+                                .ok_or_else(|| invalid("missing parent node"))?,
+                            "agent",
+                        )?;
+                        validate_absolute_path(
+                            record["tool_path"]
+                                .as_str()
+                                .ok_or_else(|| invalid("missing Driver path"))?,
+                        )?;
+                        if !record["tool_arguments"].is_object() {
+                            return Err(invalid("Driver arguments must be an object"));
+                        }
+                        match record["category"].as_str() {
+                            Some("normal") => {
+                                let name = record["node_name"]
+                                    .as_str()
+                                    .ok_or_else(|| invalid("normal Agent requires node_name"))?;
+                                validate_node_name(name)?;
+                                if !names.insert(name) {
+                                    return Err(invalid("duplicate Agent node name"));
+                                }
+                            }
+                            Some("temporary" | "archived") if record["node_name"].is_null() => {}
+                            _ => {
+                                return Err(invalid(
+                                    "invalid Agent registration category or node_name",
+                                ));
+                            }
+                        }
+                        for key in ["alias", "previous_alias"] {
+                            if !record[key].is_null()
+                                && !record[key].as_str().is_some_and(valid_request_id)
+                            {
+                                return Err(invalid("invalid registered Agent alias"));
+                            }
+                        }
+                        if let Some(name) = record["previous_node_name"].as_str() {
+                            validate_node_name(name)?;
+                        }
+                    }
                 } else {
+                    require_fields(item, &["creator", "sandboxes", "sandbox", "model", "error"])?;
                     validate_target(
                         item["address"]
                             .as_str()
@@ -474,22 +671,26 @@ pub(crate) fn validate_server_value(value: &Value) -> Result<(), ProtocolError> 
                     )?;
                     if !matches!(
                         item["status"].as_str(),
-                        Some("starting" | "running" | "error" | "stopping")
+                        Some("starting" | "running" | "closing")
                     ) {
                         return Err(invalid("invalid active agent status"));
                     }
-                    if let Some(creator) = item.get("creator").filter(|value| !value.is_null()) {
-                        let address = creator["address"]
-                            .as_str()
-                            .ok_or_else(|| invalid("creator address missing"))?;
-                        if address.starts_with("workspace:") {
-                            validate_address(address, "workspace")?;
-                        } else {
-                            validate_address(address, "agent")?;
-                        }
-                        if !creator["task_id"].as_str().is_some_and(valid_request_id) {
-                            return Err(invalid("invalid creator task id"));
-                        }
+                    let creator = item["creator"]
+                        .as_object()
+                        .ok_or_else(|| invalid("Agent creator must be an object"))?;
+                    validate_address(
+                        creator
+                            .get("address")
+                            .and_then(Value::as_str)
+                            .ok_or_else(|| invalid("creator address missing"))?,
+                        "agent",
+                    )?;
+                    if !creator
+                        .get("task_id")
+                        .and_then(Value::as_str)
+                        .is_some_and(valid_request_id)
+                    {
+                        return Err(invalid("invalid creator task id"));
                     }
                     if let Some(model) = item.get("model").filter(|value| !value.is_null()) {
                         require_fields(model, &["thinking", "reasoning_effort"])?;
@@ -627,6 +828,8 @@ pub(crate) fn validate_server_value(value: &Value) -> Result<(), ProtocolError> 
             return Err(invalid("record sync requires new entries"));
         }
     }
+    serde_json::from_value::<types::ServerWire>(value.clone())
+        .map_err(|_| invalid("invalid response shape or unknown field"))?;
     let mut nodes = 0;
     validate_value(value, 0, &mut nodes, false)?;
     if !kind.starts_with("agent.log.") {
@@ -661,8 +864,10 @@ fn validate_internal_message_fields(value: &Value) -> Result<(), ProtocolError> 
                     return Err(invalid("invalid persisted sequence"));
                 }
             }
-            for item in fields.values() {
-                validate_internal_message_fields(item)?;
+            for (key, item) in fields {
+                if !matches!(key.as_str(), "tool_arguments" | "input_schema" | "binding") {
+                    validate_internal_message_fields(item)?;
+                }
             }
         }
         _ => {}

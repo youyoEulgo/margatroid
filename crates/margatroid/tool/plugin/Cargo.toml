@@ -6,7 +6,6 @@ edition = "2021"
 [dependencies]
 tracing = "0.1"
 mcl_core = { path = "../../mcl/core" }
-client_core = { path = "../../client/core" }
 address = { path = "../../address" }
 tool_core = { path = "../core" }
 lua_runtime_core = { path = "../../lua_runtime/core" }

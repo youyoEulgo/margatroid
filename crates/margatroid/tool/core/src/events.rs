@@ -17,14 +17,22 @@ pub struct InitToolTasks {
 impl Event for InitToolTasks {}
 
 #[derive(Clone, Debug)]
-pub struct ToolExecuteRequest {
-    pub id: String,
-    pub agent: Entity,
-    pub turn: Option<String>,
-    pub alias: String,
-    pub call_id: String,
-    pub arguments: Value,
-    pub reply: ToolExecuteReply,
+pub enum ToolExecuteRequest {
+    Registered {
+        id: String,
+        agent: Entity,
+        turn: Option<String>,
+        alias: String,
+        call_id: String,
+        arguments: Value,
+        reply: ToolExecuteReply,
+    },
+    Path {
+        initiator: Entity,
+        path: std::path::PathBuf,
+        arguments: Value,
+        reply: ToolExecuteReply,
+    },
 }
 
 impl Event for ToolExecuteRequest {}

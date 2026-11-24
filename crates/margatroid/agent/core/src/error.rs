@@ -7,7 +7,6 @@ pub enum AgentErrorKind {
     StateRejected,
     StartFailed,
     StopFailed,
-    RestartFailed,
     CleanupFailed,
     ReplyClosed,
 }

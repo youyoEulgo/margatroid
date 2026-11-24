@@ -1,12 +1,14 @@
 #![cfg(target_os = "linux")]
 
+#[path = "support/lifecycle.rs"]
+mod test_support;
+
 #[path = "support/storage.rs"]
 mod storage_fixture;
 
 #[path = "support/shell_client.rs"]
 mod shell_client;
 
-use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -57,7 +59,7 @@ impl Fixture {
             .add_plugin(ClosurePlugin)
             .add_closure_system(RuntimePlugin::UPDATE)
             .add_plugin(
-                ToolPlugin::new(crate::test_binding())
+                ToolPlugin::new()
                     .with_runner_path(env!("CARGO_BIN_EXE_tool_runner"))
                     .with_limits(limits),
             );
@@ -65,25 +67,22 @@ impl Fixture {
         let workspace = app.world_mut().spawn();
         app.world_mut().insert_component(
             workspace,
-            address::Address::new("workspace:test/unit:dev").unwrap(),
+            address::Address::new("/workspace-test-unit-dev").unwrap(),
         );
         app.world_mut().insert_component(
             workspace,
-            workspace_core::Workspace::new(
+            test_support::workspace(
                 "test".into(),
                 root.path().join("workspace.yaml"),
                 root.path().to_owned(),
                 WorkspaceState::Running,
-                BTreeSet::new(),
-                None,
-                crate::test_workspace_context(),
             ),
         );
         let agent = app.world_mut().spawn();
         storage_fixture::mount(app.world_mut(), agent, root.path());
         app.world_mut().insert_component(
             agent,
-            agent_core::Agent::new(
+            test_support::agent(
                 "test".into(),
                 workspace,
                 AgentState::Running,
@@ -132,7 +131,7 @@ impl Fixture {
         if !self.app.world().contains_component::<Tools>(self.agent) {
             self.app
                 .world_mut()
-                .insert_component(self.agent, Tools::new(crate::test_probe()));
+                .insert_component(self.agent, Tools::new());
         }
         self.app
             .world_mut()
@@ -149,7 +148,7 @@ impl Fixture {
         arguments: Value,
     ) -> oneshot::Receiver<Result<ToolExecuteResponse, ToolError>> {
         let (sender, receiver) = oneshot::channel();
-        self.app.world().emit_event(ToolExecuteRequest {
+        self.app.world().emit_event(ToolExecuteRequest::Registered {
             id: id.into(),
             agent: self.agent,
             turn: Some("test-turn".into()),
@@ -241,7 +240,7 @@ impl Fixture {
         if !self.app.world().contains_component::<Tools>(self.agent) {
             self.app
                 .world_mut()
-                .insert_component(self.agent, Tools::new(crate::test_probe()));
+                .insert_component(self.agent, Tools::new());
         }
         self.app
             .world_mut()
@@ -475,7 +474,7 @@ fn standard_guidance_skills_and_actual_resource_schemas_are_available() {
         let content =
             std::fs::read_to_string(root.join("skills/margatroid").join(name).join("SKILL.md"))
                 .unwrap();
-        assert!(content.starts_with(&format!("---\n")));
+        assert!(content.starts_with("---\n"));
         assert!(content.contains("Guidance"));
         assert!(!root.join("tools/margatroid").join(name).exists());
     }
@@ -1187,26 +1186,10 @@ fn bundled_search_host_failures_keep_tracebacks_in_storage_and_brief_call_errors
     }
 }
 
-fn test_binding() -> tool_core::TaskSyncBinding {
-    tool_core::TaskSyncBinding::new(
-        client_core::Clients::default(),
-        std::sync::Arc::from([]),
-        |snapshot| {
-            serde_json::to_string(&snapshot)
-                .map(|text| std::sync::Arc::new(client_core::ClientFrame::Text(text)))
-                .map_err(|_| client_core::ClientPrepareError::EncodeFailed)
-        },
-    )
-}
-
 fn test_agent_context() -> agent_core::AgentUpdateContext {
     agent_core::AgentUpdateContext::new(|_, _, _| Vec::new(), |_, _| {})
 }
 
-fn test_workspace_context() -> workspace_core::WorkspaceUpdateContext {
-    workspace_core::WorkspaceUpdateContext::new(|_, _| {})
-}
-
-fn test_probe<T>() -> client_core::UpdateProbe<T> {
-    client_core::UpdateProbe::new(|_| {})
+fn test_probe<T>() -> std::sync::Arc<dyn Fn(T) + Send + Sync> {
+    std::sync::Arc::new(|_| {})
 }

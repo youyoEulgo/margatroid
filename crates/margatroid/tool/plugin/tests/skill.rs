@@ -1,4 +1,6 @@
-//! Pure Lua skill resource integration through the actual tool host.
+#[path = "support/lifecycle.rs"]
+mod test_support;
+// Pure Lua skill resource integration through the actual tool host.
 #[path = "support/storage.rs"]
 mod storage_fixture;
 
@@ -11,7 +13,6 @@ mod linux {
     use core_plugin::{App, Entity};
     use serde_json::{json, Value};
     use std::{
-        collections::BTreeSet,
         path::PathBuf,
         sync::{Arc, Mutex},
         time::{Duration, Instant},
@@ -60,7 +61,7 @@ mod linux {
                 }
             }
             let imported = read_tool(&resource.join("tool.toml")).unwrap();
-            let mut tools = Tools::new(crate::test_probe());
+            let mut tools = Tools::new();
             tools
                 .insert(
                     "skill_register".into(),
@@ -79,33 +80,27 @@ mod linux {
                 .add_plugin(AsyncRuntimePlugin)
                 .add_plugin(ClosurePlugin)
                 .add_closure_system(RuntimePlugin::UPDATE)
-                .add_plugin(
-                    ToolPlugin::new(crate::test_binding())
-                        .with_runner_path(env!("CARGO_BIN_EXE_tool_runner")),
-                );
+                .add_plugin(ToolPlugin::new().with_runner_path(env!("CARGO_BIN_EXE_tool_runner")));
             super::storage_fixture::config_system(&mut app);
             let workspace = app.world_mut().spawn();
             app.world_mut().insert_component(
                 workspace,
-                address::Address::new("workspace:test/unit:dev").unwrap(),
+                address::Address::new("/workspace-test-unit-dev").unwrap(),
             );
             app.world_mut().insert_component(
                 workspace,
-                workspace_core::Workspace::new(
+                crate::test_support::workspace(
                     "skill-integration".into(),
                     root.path().join("workspace.yaml"),
                     root.path().to_owned(),
                     WorkspaceState::Running,
-                    BTreeSet::new(),
-                    None,
-                    crate::test_workspace_context(),
                 ),
             );
             let agent = app.world_mut().spawn();
             super::storage_fixture::mount(app.world_mut(), agent, root.path());
             app.world_mut().insert_component(
                 agent,
-                agent_core::Agent::new(
+                crate::test_support::agent(
                     "skill-integration".into(),
                     workspace,
                     AgentState::Running,
@@ -147,7 +142,7 @@ mod linux {
         }
         fn execute(&mut self, id: &str, alias: &str, arguments: Value) -> Reply {
             let (sender, reply) = oneshot::channel();
-            self.app.world().emit_event(ToolExecuteRequest {
+            self.app.world().emit_event(ToolExecuteRequest::Registered {
                 id: id.into(),
                 agent: self.agent,
                 turn: Some("integration-turn".into()),
@@ -572,26 +567,6 @@ mod linux {
     }
 }
 
-fn test_binding() -> tool_core::TaskSyncBinding {
-    tool_core::TaskSyncBinding::new(
-        client_core::Clients::default(),
-        std::sync::Arc::from([]),
-        |snapshot| {
-            serde_json::to_string(&snapshot)
-                .map(|text| std::sync::Arc::new(client_core::ClientFrame::Text(text)))
-                .map_err(|_| client_core::ClientPrepareError::EncodeFailed)
-        },
-    )
-}
-
 fn test_agent_context() -> agent_core::AgentUpdateContext {
     agent_core::AgentUpdateContext::new(|_, _, _| Vec::new(), |_, _| {})
-}
-
-fn test_workspace_context() -> workspace_core::WorkspaceUpdateContext {
-    workspace_core::WorkspaceUpdateContext::new(|_, _| {})
-}
-
-fn test_probe<T>() -> client_core::UpdateProbe<T> {
-    client_core::UpdateProbe::new(|_| {})
 }

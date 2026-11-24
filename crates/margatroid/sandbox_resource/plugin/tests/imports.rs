@@ -56,12 +56,12 @@ impl Drop for Fixture {
 fn app() -> App {
     let mut app = App::new();
     app.world_mut()
-        .insert_resource(sandbox_resource_core::SandboxSyncBinding::new(|_| {
-            client_core::UpdateProbe::new(|_| {})
+        .insert_resource(sandbox_resource_core::SandboxObserverFactory::new(|_| {
+            (Arc::new(|_| {}), Arc::new(|_| {}))
         }));
     app.world_mut()
-        .insert_resource(sandbox_resource_core::SandboxSyncBinding::new(|_| {
-            client_core::UpdateProbe::new(|_| {})
+        .insert_resource(sandbox_resource_core::SandboxObserverFactory::new(|_| {
+            (Arc::new(|_| {}), Arc::new(|_| {}))
         }));
     app.add_plugin(RuntimePlugin::default())
         .add_plugin(AsyncRuntimePlugin)
@@ -301,8 +301,8 @@ fn invalid_paths_do_not_create_collections() {
 fn installation_requires_async_runtime() {
     let mut app = App::new();
     app.world_mut()
-        .insert_resource(sandbox_resource_core::SandboxSyncBinding::new(|_| {
-            client_core::UpdateProbe::new(|_| {})
+        .insert_resource(sandbox_resource_core::SandboxObserverFactory::new(|_| {
+            (Arc::new(|_| {}), Arc::new(|_| {}))
         }));
     app.add_plugin(RuntimePlugin::default())
         .add_plugin(SandboxResourcePlugin::default());
@@ -321,8 +321,8 @@ fn configured_budget_is_enforced_on_the_configured_schedule() {
     let path = fixture.entry("sample");
     let mut app = App::new();
     app.world_mut()
-        .insert_resource(sandbox_resource_core::SandboxSyncBinding::new(|_| {
-            client_core::UpdateProbe::new(|_| {})
+        .insert_resource(sandbox_resource_core::SandboxObserverFactory::new(|_| {
+            (Arc::new(|_| {}), Arc::new(|_| {}))
         }));
     let limits = sandbox_resource_core::SandboxReadLimits { policy_bytes: 1 };
     app.add_plugin(RuntimePlugin::default())
@@ -368,6 +368,6 @@ fn canonicalizes_a_real_entry_symlink_before_publication() {
     );
 }
 
-fn test_probe<T>() -> client_core::UpdateProbe<T> {
-    client_core::UpdateProbe::new(|_| {})
+fn test_probe() -> sandbox_resource_core::SandboxChanged {
+    Arc::new(|_| {})
 }

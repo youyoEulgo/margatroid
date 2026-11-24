@@ -1,15 +1,8 @@
-use crate::{AgentError, AgentState};
+use crate::{AgentError, AgentUpdateKind};
 use core_plugin::{Entity, Resource, World};
 use std::{future::Future, pin::Pin, sync::Arc};
 
 pub type AgentObservationWait = Pin<Box<dyn Future<Output = Result<(), AgentError>> + Send>>;
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum AgentUpdateKind {
-    Changed,
-    RuntimeInstalled,
-    RuntimeStopped,
-    Removed,
-}
 type AgentPublisher =
     Arc<dyn Fn(&mut World, Entity, AgentUpdateKind) -> Vec<AgentObservationWait> + Send + Sync>;
 #[derive(Clone)]
@@ -69,7 +62,7 @@ impl AgentUpdateContext {
     ) -> Vec<AgentObservationWait> {
         if matches!(
             kind,
-            AgentUpdateKind::RuntimeStopped | AgentUpdateKind::Removed
+            AgentUpdateKind::SourcesClosing | AgentUpdateKind::Removed
         ) {
             if let Some(scope) = self.scopes.lock().unwrap().remove(&owner) {
                 scope.store(false, std::sync::atomic::Ordering::Release);
@@ -78,92 +71,21 @@ impl AgentUpdateContext {
         (self.publish)(world, owner, kind)
     }
 }
-pub enum AgentChange {
-    Transition {
-        state: AgentState,
-        turn: Option<String>,
-    },
-    Fault(AgentError),
-}
-pub fn update_agent(
-    world: &mut World,
-    owner: Entity,
-    context: &AgentUpdateContext,
-    change: AgentChange,
-) -> Result<(), AgentError> {
-    let agent = world
-        .get_component_mut::<crate::Agent>(owner)
-        .ok_or_else(|| AgentError::new(crate::AgentErrorKind::AgentMissing, "Agent missing"))?;
-    let changed = match change {
-        AgentChange::Transition { state, turn } => {
-            let changed = agent.state != state
-                || agent.turn != turn
-                || (state == AgentState::Running && agent.fault.is_some());
-            if state == AgentState::Running {
-                agent.fault = None;
-            }
-            agent.state = state;
-            agent.turn = turn;
-            changed
-        }
-        AgentChange::Fault(error) => {
-            let changed = agent.fault.as_ref() != Some(&error)
-                || agent.state != AgentState::Error
-                || agent.turn.is_some();
-            agent.fault = Some(error);
-            agent.state = AgentState::Error;
-            agent.turn = None;
-            changed
-        }
-    };
-    if changed {
-        let waits = context.notify(world, owner, AgentUpdateKind::Changed);
-        assert!(
-            waits.is_empty(),
-            "state publication cannot create monitor cleanup work"
-        );
-    }
-    Ok(())
-}
-pub fn notify_agent_runtime(
-    world: &mut World,
-    owner: Entity,
-    stopped: bool,
-) -> Result<Vec<AgentObservationWait>, AgentError> {
-    let agent = world
-        .get_component_mut::<crate::Agent>(owner)
-        .ok_or_else(|| AgentError::new(crate::AgentErrorKind::AgentMissing, "Agent missing"))?;
-    if stopped {
-        agent.close_source();
-    } else {
-        agent.reset_source();
-    }
-    let context = world
-        .get_component::<crate::Agent>(owner)
-        .ok_or_else(|| AgentError::new(crate::AgentErrorKind::AgentMissing, "Agent missing"))?
-        .updates
-        .clone();
-    Ok(context.notify(
-        world,
-        owner,
-        if stopped {
-            AgentUpdateKind::RuntimeStopped
-        } else {
-            AgentUpdateKind::RuntimeInstalled
-        },
-    ))
-}
 pub fn remove_agent(world: &mut World, owner: Entity) {
-    let context = world
-        .get_component::<crate::Agent>(owner)
-        .map(|agent| agent.updates.clone());
     world.despawn(owner);
+    let context = world.get_resource::<AgentUpdateContext>().cloned();
     if let Some(context) = context {
         let waits = context.notify(world, owner, AgentUpdateKind::Removed);
         assert!(
             waits.is_empty(),
-            "Agent must await actual monitor cleanup before despawn"
+            "removed observation cannot require cleanup"
         );
+    }
+}
+pub(crate) fn publish_changed(world: &mut World, owner: Entity) {
+    if let Some(context) = world.get_resource::<AgentUpdateContext>().cloned() {
+        let waits = context.notify(world, owner, AgentUpdateKind::Changed);
+        assert!(waits.is_empty(), "state updates cannot require cleanup");
     }
 }
 

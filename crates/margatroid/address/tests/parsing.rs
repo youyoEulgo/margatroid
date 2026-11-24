@@ -21,7 +21,10 @@ fn missing_tag_is_rejected_and_explicit_tag_is_preserved() {
         let parsed = ParsedAddress::parse(&value).unwrap();
         assert_eq!(parsed.tag, tag);
         assert_eq!(parsed.to_string(), value);
-        assert_eq!(Address::new(&value).unwrap().as_str(), value);
+        assert!(matches!(
+            Address::new(&value),
+            Err(AddressError::InvalidNodePath)
+        ));
     }
 }
 
@@ -29,7 +32,10 @@ fn missing_tag_is_rejected_and_explicit_tag_is_preserved() {
 fn field_content_is_preserved_without_extra_tag_restrictions() {
     let value = "custom_kind-2:作用域/Some name:标签 beta";
     assert_eq!(ParsedAddress::parse(value).unwrap().to_string(), value);
-    assert_eq!(Address::new(value).unwrap().as_str(), value);
+    assert!(matches!(
+        Address::new(value),
+        Err(AddressError::InvalidNodePath)
+    ));
 }
 
 #[test]
@@ -78,5 +84,45 @@ fn invalid_parts_and_path_traversal_are_rejected_in_every_field() {
             assert!(ParsedAddress::parse(&value).is_err(), "{value:?}");
             assert!(Address::new(&value).is_err(), "{value:?}");
         }
+    }
+}
+
+#[test]
+fn entity_nodes_preserve_absolute_case_sensitive_paths() {
+    for value in [
+        "/",
+        "/workspace",
+        "/workspace/Agent/subagent",
+        "/工作区/Some name",
+        "/a/%2F",
+    ] {
+        assert_eq!(Address::new(value).unwrap().as_str(), value);
+    }
+    assert_ne!(
+        Address::new("/Agent").unwrap(),
+        Address::new("/agent").unwrap()
+    );
+    for value in [
+        "",
+        "agent",
+        "./agent",
+        "//",
+        "/a/",
+        "/a//b",
+        "/.",
+        "/..",
+        "/a/../b",
+        "/a/./b",
+        "/a\\b",
+        "/a:b",
+        "/a\n",
+        "/a\0",
+        "/a\u{7f}",
+        "tool:scope/name:dev",
+    ] {
+        assert!(
+            matches!(Address::new(value), Err(AddressError::InvalidNodePath)),
+            "{value:?}"
+        );
     }
 }

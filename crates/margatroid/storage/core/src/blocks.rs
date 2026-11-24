@@ -316,18 +316,16 @@ fn locked<T>(
     ) -> Result<T, StorageError>,
 ) -> Result<T, StorageError> {
     let state = &storage.database.shared;
-    let db = state
+    let guard = state
         .connection
         .lock()
         .map_err(|_| err(K::Closed, "database lock poisoned"))?;
-    if state.retired.load(Ordering::Acquire) {
-        return Err(err(K::CleanupFailed, "database connection retired"));
-    }
+    let db = open_connection(state, &guard)?;
     let mut memory = state
         .temporary
         .lock()
         .map_err(|_| err(K::Closed, "TEMP lock poisoned"))?;
-    operation(&db, &state.block_root, &state.retired, &mut memory)
+    operation(db, &state.block_root, &state.retired, &mut memory)
 }
 pub fn snapshot_block(
     storage: &AgentStorage,

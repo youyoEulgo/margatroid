@@ -12,7 +12,6 @@ use std::thread::ThreadId;
 use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
-use workspace_core::{WorkspaceExecutionClose, WorkspaceExecutor, spawn_workspace_executor};
 
 #[derive(Clone, Debug)]
 struct CommandRecord {
@@ -28,7 +27,6 @@ struct Fixture {
     app: App,
     owner: Entity,
     workspace: Entity,
-    close: WorkspaceExecutionClose,
     commands: Arc<Mutex<Vec<CommandRecord>>>,
     exits: Arc<Mutex<Vec<DriverLuaVmExited>>>,
 }
@@ -42,10 +40,8 @@ impl Fixture {
             .add_plugin(AsyncRuntimePlugin)
             .add_plugin(LuaRuntimePlugin::new().with_config(config).unwrap());
         let owner = app.world_mut().spawn();
-        app.world_mut().insert_component(
-            owner,
-            address::Address::new("agent:margatroid/runtime-test:dev").unwrap(),
-        );
+        app.world_mut()
+            .insert_component(owner, address::Address::new("/test/runtime").unwrap());
         let directory = tempfile::tempdir().unwrap();
         let storage = storage_core::open_storage(
             &directory.path().join("agent.sqlite"),
@@ -57,19 +53,21 @@ impl Fixture {
         let workspace = app.world_mut().spawn();
         app.world_mut().insert_component(
             workspace,
-            workspace_core::Workspace::new(
-                "test".into(),
-                directory.path().join("workspace.yaml"),
-                directory.path().to_owned(),
-                workspace_core::WorkspaceState::Running,
-                Default::default(),
-                None,
-                crate::test_workspace_context(),
-            ),
+            workspace_core::Workspace::new("test".into(), directory.path().to_owned(), {
+                for kind in ["normal", "temporary", "archived"] {
+                    std::fs::create_dir_all(directory.path().join("agents").join(kind)).unwrap();
+                }
+                workspace_core::WorkspaceDatabase::create(
+                    directory.path().join("workspace.sqlite"),
+                    workspace_core::WorkspaceMetadata {
+                        address: "/test".into(),
+                        alias: "test".into(),
+                        project_root: directory.path().to_owned(),
+                    },
+                )
+                .unwrap()
+            }),
         );
-        let executor = spawn_workspace_executor().unwrap();
-        let close = executor.close.clone();
-        app.world_mut().insert_component(workspace, executor);
         let events = app.world().event_sender();
         let closures = app.world().closure_sender(RuntimePlugin::UPDATE);
         app.world_mut().insert_resource(LuaServices::new(move|identity,method,args|{let events=events.clone();let closures=closures.clone();Box::pin(async move{
@@ -79,7 +77,7 @@ impl Fixture {
                 let(tx,rx)=oneshot::channel();let source=identity.source;closures.send(move|world|{let _=tx.send(world.get_component::<DriverLuaVm>(source).unwrap().wake.clone());});let slot=rx.await.unwrap();let cancel=identity.cancel.clone();
                 tokio::select!{_=cancel.cancelled()=>Err(invalid("wait cancelled")),result=DriverWakeSlot::wait(slot)=>{result?;Ok(serde_json::Value::Null)}}
             }else if method=="mcl_execute"{
-                if args["target"]!="agent:margatroid/runtime-test:dev"{return Ok(json!({"Error":{"type":"error","message":"target mismatch"}}));}
+                if args["target"]!="/test/runtime"{return Ok(json!({"Error":{"type":"error","message":"target mismatch"}}));}
                 let text=args["instruction"].as_str().filter(|s|!s.trim().is_empty()).ok_or_else(||invalid("instruction required"))?.to_owned();
                 let arguments=serde_json::from_value::<Vec<serde_json::Value>>(args["arguments"].clone()).map_err(|_|invalid("arguments must be array"))?;
                 let(tx,rx)=oneshot::channel();events.send_event(MclCommand{id:"fixture-mcl".into(),source:identity.source,source_address:identity.address,source_instance:Some(identity.instance),target:owner,instruction:mcl_core::MclInstruction{text,arguments},cancel:identity.cancel,reply:Arc::new(Mutex::new(Some(tx)))});
@@ -95,7 +93,7 @@ impl Fixture {
                 .cloned()
                 .collect::<Vec<_>>();
             for command in commands {
-                assert_eq!(command.source_address, "agent:margatroid/runtime-test:dev");
+                assert_eq!(command.source_address, "/test/runtime");
                 recorded.lock().unwrap().push(CommandRecord {
                     source: command.source,
 
@@ -157,7 +155,6 @@ impl Fixture {
             app,
             owner,
             workspace,
-            close,
             commands,
             exits,
         }
@@ -209,11 +206,21 @@ impl Fixture {
         drive(&mut self.app, &mut receiver).await
     }
 
-    async fn close(self) {
-        tokio::time::timeout(Duration::from_secs(3), self.close.close_and_join())
-            .await
-            .unwrap()
-            .unwrap();
+    async fn close(mut self) {
+        if let Some(vm) = self.app.world().get_component::<DriverLuaVm>(self.owner) {
+            let mut reply = self.stop_request(vm.instance.clone());
+            let _ = drive(&mut self.app, &mut reply).await;
+        }
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while self
+            .app
+            .world()
+            .contains_component::<DriverLuaVm>(self.owner)
+        {
+            self.app.tick();
+            assert!(Instant::now() < deadline, "VM thread did not finish");
+            tokio::task::yield_now().await;
+        }
     }
 }
 
@@ -232,7 +239,7 @@ async fn drive<T>(app: &mut App, receiver: &mut oneshot::Receiver<T>) -> T {
 }
 
 #[tokio::test]
-async fn starts_on_workspace_thread_binds_source_and_stops_without_closing_workspace() {
+async fn starts_on_owned_thread_binds_source_and_stops_without_closing_workspace() {
     let mut fixture = Fixture::new(LuaRuntimeConfig::default());
     let threads = Arc::new(Mutex::new(Vec::new()));
     let mut environment = fixture.environment();
@@ -240,23 +247,9 @@ async fn starts_on_workspace_thread_binds_source_and_stops_without_closing_works
         "record".into(),
         LuaBinding::Function(Arc::new(RecordThread(threads.clone()))),
     );
-    let mut receiver = fixture.start_request("assert(io ~= nil and os ~= nil and package ~= nil); assert(load ~= nil and loadfile ~= nil and dofile ~= nil); record(); margatroid.mcl:execute('agent:margatroid/runtime-test:dev', 'EFFECT ready'); margatroid:wait('agent:margatroid/runtime-test:dev')", environment);
+    let mut receiver = fixture.start_request("assert(io ~= nil and os ~= nil and package ~= nil); assert(load ~= nil and loadfile ~= nil and dofile ~= nil); record(); margatroid.mcl:execute('/test/runtime', 'EFFECT ready'); margatroid:wait('/test/runtime')", environment);
     let instance = drive(&mut fixture.app, &mut receiver).await.unwrap();
     assert_ne!(threads.lock().unwrap()[0], std::thread::current().id());
-    let (sender, receiver) = oneshot::channel();
-    fixture
-        .app
-        .world()
-        .get_component::<WorkspaceExecutor>(fixture.workspace)
-        .unwrap()
-        .entry
-        .submit(Box::new(move || -> workspace_core::LocalFuture {
-            Box::pin(async move {
-                sender.send(std::thread::current().id()).unwrap();
-            })
-        }))
-        .unwrap();
-    assert_eq!(receiver.await.unwrap(), threads.lock().unwrap()[0]);
     let commands = fixture.commands.lock().unwrap().clone();
     assert_eq!(commands[0].source, fixture.owner);
     assert_eq!(commands[0].target, fixture.owner);
@@ -273,14 +266,15 @@ async fn starts_on_workspace_thread_binds_source_and_stops_without_closing_works
             .get_component::<DriverLuaVm>(fixture.owner)
             .is_none()
     );
+    assert!(fixture.app.world().is_alive(fixture.workspace));
     assert!(
-        !fixture
+        fixture
             .app
             .world()
-            .get_component::<WorkspaceExecutor>(fixture.workspace)
+            .get_component::<workspace_core::Workspace>(fixture.workspace)
             .unwrap()
-            .entry
-            .is_closed()
+            .database
+            .is_open()
     );
     fixture.close().await;
 }
@@ -303,7 +297,7 @@ async fn startup_timeout_cancels_and_waits_for_vm_cleanup() {
         ..LuaRuntimeConfig::default()
     });
     let error = fixture
-        .start("margatroid:wait('agent:margatroid/runtime-test:dev')")
+        .start("margatroid:wait('/test/runtime')")
         .await
         .unwrap_err();
     assert_eq!(error.kind, LuaRuntimeErrorKind::StartupTimeout);
@@ -342,7 +336,7 @@ async fn compile_error_early_exit_and_host_panic_settle_start_after_cleanup() {
                 .is_none()
         );
         let instance = fixture
-            .start("margatroid.mcl:execute('agent:margatroid/runtime-test:dev','EFFECT ready'); margatroid:wait('agent:margatroid/runtime-test:dev')")
+            .start("margatroid.mcl:execute('/test/runtime','EFFECT ready'); margatroid:wait('/test/runtime')")
             .await
             .unwrap();
         fixture.stop(instance).await.unwrap();
@@ -363,12 +357,12 @@ impl LuaHostFunction for PanicHost {
 async fn old_instances_cannot_ready_wake_or_stop_a_restarted_vm() {
     let mut fixture = Fixture::new(LuaRuntimeConfig::default());
     let old = fixture
-        .start("margatroid.mcl:execute('agent:margatroid/runtime-test:dev','EFFECT ready'); margatroid:wait('agent:margatroid/runtime-test:dev')")
+        .start("margatroid.mcl:execute('/test/runtime','EFFECT ready'); margatroid:wait('/test/runtime')")
         .await
         .unwrap();
     fixture.stop(old.clone()).await.unwrap();
     let current = fixture
-        .start("margatroid.mcl:execute('agent:margatroid/runtime-test:dev','EFFECT ready'); margatroid:wait('agent:margatroid/runtime-test:dev')")
+        .start("margatroid.mcl:execute('/test/runtime','EFFECT ready'); margatroid:wait('/test/runtime')")
         .await
         .unwrap();
     assert_ne!(old.start_id, current.start_id);
@@ -401,7 +395,7 @@ async fn old_instances_cannot_ready_wake_or_stop_a_restarted_vm() {
 async fn duplicate_stop_consumes_original_ended_receiver_only_once() {
     let mut fixture = Fixture::new(LuaRuntimeConfig::default());
     let instance = fixture
-        .start("margatroid.mcl:execute('agent:margatroid/runtime-test:dev','EFFECT ready'); margatroid:wait('agent:margatroid/runtime-test:dev')")
+        .start("margatroid.mcl:execute('/test/runtime','EFFECT ready'); margatroid:wait('/test/runtime')")
         .await
         .unwrap();
     let mut first = fixture.stop_request(instance.clone());
@@ -418,43 +412,20 @@ async fn duplicate_stop_consumes_original_ended_receiver_only_once() {
 }
 
 #[tokio::test]
-async fn lost_ended_notification_keeps_component_and_does_not_fake_exit() {
+async fn natural_exit_releases_owned_vm_thread_without_stop_request() {
     let mut fixture = Fixture::new(LuaRuntimeConfig::default());
-    let (sender, ended) = oneshot::channel();
-    drop(sender);
-    let instance = DriverLuaVmInstance {
-        owner: fixture.owner,
-        start_id: "lost-ended".into(),
-    };
-    fixture.app.world_mut().insert_component(
-        fixture.owner,
-        DriverLuaVm {
-            instance: instance.clone(),
-            wake: DriverWakeSlot::shared(),
-            ready: Arc::new(Mutex::new(None)),
-            ended: Some(ended),
-            cancel: CancellationToken::new(),
-        },
-    );
-    assert_eq!(
-        fixture.stop(instance.clone()).await.unwrap_err().kind,
-        LuaRuntimeErrorKind::EndNotificationLost
-    );
-    let vm = fixture
+    let mut reply = fixture.start_request("return", fixture.environment());
+    drive(&mut fixture.app, &mut reply).await.unwrap();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while fixture
         .app
         .world()
-        .get_component::<DriverLuaVm>(fixture.owner)
-        .unwrap();
-    assert!(vm.cancel.is_cancelled());
-    assert!(vm.ended.is_none());
-    assert_eq!(
-        fixture.stop(instance).await.unwrap_err().kind,
-        LuaRuntimeErrorKind::StopAlreadyWaiting
-    );
-    fixture
-        .app
-        .world_mut()
-        .remove_component::<DriverLuaVm>(fixture.owner);
+        .contains_component::<DriverLuaVm>(fixture.owner)
+    {
+        fixture.app.tick();
+        tokio::task::yield_now().await;
+        assert!(Instant::now() < deadline);
+    }
     fixture.close().await;
 }
 
@@ -502,25 +473,23 @@ async fn source_and_environment_validation_leave_no_vm_installed() {
 }
 
 #[tokio::test]
-async fn closed_workspace_entry_rejects_submission_and_rolls_back_vm() {
+async fn standalone_vm_does_not_require_or_replace_workspace_execution_components() {
     let mut fixture = Fixture::new(LuaRuntimeConfig::default());
+    let tasks = tool_core::ToolTasks::new();
     fixture
         .app
-        .world()
-        .get_component::<WorkspaceExecutor>(fixture.workspace)
-        .unwrap()
-        .entry
-        .close_admission();
-    assert_eq!(
-        fixture.start("return").await.unwrap_err().kind,
-        LuaRuntimeErrorKind::Closed
-    );
+        .world_mut()
+        .insert_component(fixture.owner, tasks.clone());
+    let instance = fixture.start("margatroid.mcl:execute('/test/runtime','EFFECT ready'); margatroid:wait('/test/runtime')").await.unwrap();
+    fixture.stop(instance).await.unwrap();
     assert!(
         fixture
             .app
             .world()
-            .get_component::<DriverLuaVm>(fixture.owner)
-            .is_none()
+            .get_component::<tool_core::ToolTasks>(fixture.owner)
+            .unwrap()
+            .update_context()
+            .same_collection(&tasks.update_context())
     );
     fixture.close().await;
 }
@@ -550,7 +519,7 @@ async fn host_bridge_preserves_empty_arrays_nulls_and_rejects_mixed_sparse_cycli
         "bridge".into(),
         LuaBinding::Function(Arc::new(Bridge(calls.clone()))),
     );
-    let mut receiver = fixture.start_request("local value = bridge(); bridge(value); assert(not pcall(bridge, {[1]=true,x=true})); assert(not pcall(bridge, {[2]=true})); local cycle = {}; cycle.self=cycle; assert(not pcall(bridge, cycle)); margatroid.mcl:execute('agent:margatroid/runtime-test:dev','EFFECT ready'); margatroid:wait('agent:margatroid/runtime-test:dev')", environment);
+    let mut receiver = fixture.start_request("local value = bridge(); bridge(value); assert(not pcall(bridge, {[1]=true,x=true})); assert(not pcall(bridge, {[2]=true})); local cycle = {}; cycle.self=cycle; assert(not pcall(bridge, cycle)); margatroid.mcl:execute('/test/runtime','EFFECT ready'); margatroid:wait('/test/runtime')", environment);
     let instance = drive(&mut fixture.app, &mut receiver).await.unwrap();
     let values = calls.lock().unwrap().clone();
     assert_eq!(values.len(), 1);
@@ -565,7 +534,7 @@ async fn host_bridge_preserves_empty_arrays_nulls_and_rejects_mixed_sparse_cycli
 #[tokio::test]
 async fn mcl_host_passes_json_parameters_and_rejects_foreign_entity_targets() {
     let mut fixture = Fixture::new(LuaRuntimeConfig::default());
-    let instance = fixture.start("local result = margatroid.mcl:execute('agent:margatroid/runtime-test:dev', 'ECHO', {{value=42}, {}}); assert(result.Array.Message[1].value == 42); assert(margatroid.mcl:execute('agent:missing/target:dev', 'ECHO').Error.type == 'error'); margatroid.mcl:execute('agent:margatroid/runtime-test:dev','EFFECT ready'); margatroid:wait('agent:margatroid/runtime-test:dev')").await.unwrap();
+    let instance = fixture.start("local result = margatroid.mcl:execute('/test/runtime', 'ECHO', {{value=42}, {}}); assert(result.Array.Message[1].value == 42); assert(margatroid.mcl:execute('agent:missing/target:dev', 'ECHO').Error.type == 'error'); margatroid.mcl:execute('/test/runtime','EFFECT ready'); margatroid:wait('/test/runtime')").await.unwrap();
     let records = fixture.commands.lock().unwrap().clone();
     assert_eq!(records.len(), 2);
     assert_eq!(records[0].arguments, [json!({"value": 42}), json!([])]);
@@ -588,7 +557,7 @@ async fn require_only_resolves_injected_modules() {
             LuaValue::Integer(42),
         )]))),
     );
-    let mut receiver = fixture.start_request("assert(require('provided').value == 42); assert(not pcall(require, 'os')); margatroid.mcl:execute('agent:margatroid/runtime-test:dev','EFFECT ready'); margatroid:wait('agent:margatroid/runtime-test:dev')", environment);
+    let mut receiver = fixture.start_request("assert(require('provided').value == 42); assert(not pcall(require, 'os')); margatroid.mcl:execute('/test/runtime','EFFECT ready'); margatroid:wait('/test/runtime')", environment);
     let instance = drive(&mut fixture.app, &mut receiver).await.unwrap();
     fixture.stop(instance).await.unwrap();
     fixture.close().await;
@@ -598,7 +567,7 @@ async fn require_only_resolves_injected_modules() {
 async fn instruction_hook_cancels_running_lua_without_wait_or_host_calls() {
     let mut fixture = Fixture::new(LuaRuntimeConfig::default());
     let instance = fixture
-        .start("margatroid.mcl:execute('agent:margatroid/runtime-test:dev','EFFECT ready'); while true do end")
+        .start("margatroid.mcl:execute('/test/runtime','EFFECT ready'); while true do end")
         .await
         .unwrap();
     fixture.stop(instance).await.unwrap();
@@ -606,10 +575,10 @@ async fn instruction_hook_cancels_running_lua_without_wait_or_host_calls() {
 }
 
 #[tokio::test]
-async fn natural_exit_is_reported_without_consuming_stop_receiver() {
+async fn natural_exit_is_reported_and_thread_is_joined_automatically() {
     let mut fixture = Fixture::new(LuaRuntimeConfig::default());
     let instance = fixture
-        .start("margatroid.mcl:execute('agent:margatroid/runtime-test:dev','EFFECT ready'); error('after-ready')")
+        .start("margatroid.mcl:execute('/test/runtime','EFFECT ready'); error('after-ready')")
         .await
         .unwrap();
     let deadline = Instant::now() + Duration::from_secs(3);
@@ -624,16 +593,15 @@ async fn natural_exit_is_reported_without_consuming_stop_receiver() {
         exits[0].result.as_ref().unwrap_err().kind,
         LuaRuntimeErrorKind::ExecutionFailed
     );
-    assert!(
-        fixture
-            .app
-            .world()
-            .get_component::<DriverLuaVm>(fixture.owner)
-            .unwrap()
-            .ended
-            .is_some()
-    );
-    fixture.stop(instance).await.unwrap();
+    while fixture
+        .app
+        .world()
+        .contains_component::<DriverLuaVm>(fixture.owner)
+    {
+        fixture.app.tick();
+        tokio::task::yield_now().await;
+        assert!(Instant::now() < deadline);
+    }
     fixture.close().await;
 }
 
@@ -641,7 +609,7 @@ async fn natural_exit_is_reported_without_consuming_stop_receiver() {
 async fn duplicate_start_is_rejected_and_original_instance_remains() {
     let mut fixture = Fixture::new(LuaRuntimeConfig::default());
     let instance = fixture
-        .start("margatroid.mcl:execute('agent:margatroid/runtime-test:dev','EFFECT ready'); margatroid:wait('agent:margatroid/runtime-test:dev')")
+        .start("margatroid.mcl:execute('/test/runtime','EFFECT ready'); margatroid:wait('/test/runtime')")
         .await
         .unwrap();
     assert_eq!(
@@ -666,20 +634,20 @@ async fn mcl_failures_are_values_and_same_vm_continues_until_explicit_stop() {
     let mut fixture = Fixture::new(LuaRuntimeConfig::default());
     let instance = fixture.start(r#"
         for _, instruction in ipairs({'REJECT', 'CANCEL_CALL', 'LOST_REPLY', 'ERROR_VALUE'}) do
-            local ok, result = pcall(function(...) return margatroid.mcl:execute('agent:margatroid/runtime-test:dev',...) end, instruction)
+            local ok, result = pcall(function(...) return margatroid.mcl:execute('/test/runtime',...) end, instruction)
             assert(ok and result.Error.type == 'error')
             assert(type(result.Error.request_id) == 'string')
             assert(type(result.Error.message) == 'string')
         end
         for _, arguments in ipairs({{}, {''}, {true}, {'ECHO', {[2]=true}}, {'ECHO', function() end}}) do
-            local ok, result = pcall(function(...) return margatroid.mcl:execute('agent:margatroid/runtime-test:dev',...) end, arguments[1], arguments[2])
+            local ok, result = pcall(function(...) return margatroid.mcl:execute('/test/runtime',...) end, arguments[1], arguments[2])
             assert(not ok or result.Error.type == 'error')
         end
         local cycle = {}; cycle.self = cycle
-        assert(not pcall(function() margatroid.mcl:execute('agent:margatroid/runtime-test:dev','ECHO', cycle) end))
-        assert(margatroid.mcl:execute('agent:margatroid/runtime-test:dev','ECHO', {{after_error=true}}).Array.Message[1].after_error)
-        margatroid.mcl:execute('agent:margatroid/runtime-test:dev','EFFECT ready')
-        while true do margatroid:wait('agent:margatroid/runtime-test:dev') end
+        assert(not pcall(function() margatroid.mcl:execute('/test/runtime','ECHO', cycle) end))
+        assert(margatroid.mcl:execute('/test/runtime','ECHO', {{after_error=true}}).Array.Message[1].after_error)
+        margatroid.mcl:execute('/test/runtime','EFFECT ready')
+        while true do margatroid:wait('/test/runtime') end
     "#).await.unwrap();
     assert!(fixture.exits.lock().unwrap().is_empty());
     assert_eq!(
@@ -701,13 +669,19 @@ async fn shared_host_logs_use_current_turn_and_do_not_log_caught_faults_or_cance
     fixture.app.world_mut().insert_component(
         fixture.owner,
         agent_core::Agent::new(
-            "trusted-agent".into(),
             fixture.workspace,
-            agent_core::AgentState::Running,
-            Some("first-turn".into()),
-            crate::test_agent_context(),
+            fixture.workspace,
+            "driver-task".into(),
+            fixture._directory.path().to_owned(),
         ),
     );
+    use agent_core::WorldAgentExt;
+    fixture.app.world_mut().agent_ready(fixture.owner).unwrap();
+    fixture
+        .app
+        .world_mut()
+        .agent_set_turn(fixture.owner, Some("first-turn".into()))
+        .unwrap();
     let instance = fixture
         .start(
             r#"
@@ -721,19 +695,18 @@ async fn shared_host_logs_use_current_turn_and_do_not_log_caught_faults_or_cance
         assert(not pcall(function() margatroid:log('info', 'explicit null', margatroid.data.null) end))
         margatroid:log('info', 'first', {answer=42})
         margatroid:log('debug', 'empty details', {})
-        margatroid.mcl:execute('agent:margatroid/runtime-test:dev','EFFECT ready')
-        margatroid:wait('agent:margatroid/runtime-test:dev')
+        margatroid.mcl:execute('/test/runtime','EFFECT ready')
+        margatroid:wait('/test/runtime')
         margatroid:log('warn', 'second')
-        margatroid.mcl:execute('agent:margatroid/runtime-test:dev','SECOND')
-        margatroid:wait('agent:margatroid/runtime-test:dev')
+        margatroid.mcl:execute('/test/runtime','SECOND')
+        margatroid:wait('/test/runtime')
     "#,
         )
         .await
         .unwrap();
-    agent_core::WorldAgentExt::agent_transition(
+    agent_core::WorldAgentExt::agent_set_turn(
         fixture.app.world_mut(),
         fixture.owner,
-        agent_core::AgentState::Running,
         Some("second-turn".into()),
     )
     .unwrap();
@@ -844,8 +817,8 @@ async fn driver_can_use_shared_data_files_processes_and_wait_any() {
         local running = margatroid.process:start('/bin/cat', {})
         running:write('still running')
         assert(running:read().data == 'still running')
-        margatroid.mcl:execute('agent:margatroid/runtime-test:dev','EFFECT ready')
-        margatroid:wait('agent:margatroid/runtime-test:dev')
+        margatroid.mcl:execute('/test/runtime','EFFECT ready')
+        margatroid:wait('/test/runtime')
     "#).await.unwrap();
     fixture.stop(instance).await.unwrap();
     fixture.close().await;
@@ -905,8 +878,8 @@ async fn stop_reaps_driver_process_before_ended_acknowledgement() {
         r#"
         local process = margatroid.process:start('/bin/sh', {'-c', 'echo $$; exec cat'})
         record_process(process:read().data)
-        margatroid.mcl:execute('agent:margatroid/runtime-test:dev','EFFECT ready')
-        margatroid:wait('agent:margatroid/runtime-test:dev')
+        margatroid.mcl:execute('/test/runtime','EFFECT ready')
+        margatroid:wait('/test/runtime')
     "#,
         environment,
     );
@@ -978,8 +951,8 @@ async fn driver_host_denies_tools_and_tasks_and_keeps_context_and_namespaces_rea
         context.kind='tool'
         assert(margatroid.context.kind == 'driver')
         assert(margatroid.data.null ~= nil)
-        margatroid.mcl:execute('agent:margatroid/runtime-test:dev','EFFECT ready')
-        margatroid:wait('agent:margatroid/runtime-test:dev')
+        margatroid.mcl:execute('/test/runtime','EFFECT ready')
+        margatroid:wait('/test/runtime')
     "#,
         )
         .await
@@ -988,10 +961,38 @@ async fn driver_host_denies_tools_and_tasks_and_keeps_context_and_namespaces_rea
     fixture.close().await;
 }
 
-fn test_agent_context() -> agent_core::AgentUpdateContext {
-    agent_core::AgentUpdateContext::new(|_, _, _| Vec::new(), |_, _| {})
-}
-
-fn test_workspace_context() -> workspace_core::WorkspaceUpdateContext {
-    workspace_core::WorkspaceUpdateContext::new(|_, _| {})
+#[tokio::test]
+async fn standalone_configure_and_execute_receive_real_arguments_and_context() {
+    let mut fixture = Fixture::new(LuaRuntimeConfig::default());
+    let mut environment = fixture.environment();
+    environment.globals.insert("execution_context".into(),LuaBinding::Value(LuaValue::from_json(json!({
+        "workspace":{"address":"/test"},"arguments":{"node_name":"runtime","alias":"Fixture","path":".","nested":{"value":42}}
+    })).unwrap()));
+    let (sender, mut reply) = oneshot::channel();
+    fixture.app.world().send_event(StartDriverLuaVm {
+        owner: fixture.owner,
+        workspace: fixture.workspace,
+        program: LuaProgram {
+            origin: "arguments.lua".into(),
+            source: r#"
+            function configure(arguments, context)
+                assert(arguments.node_name=='runtime' and arguments.nested.value==42)
+                assert(context.project_root:sub(1,1)=='/')
+                return {timeout_ms=0}
+            end
+            function execute(arguments, context)
+                assert(arguments.alias=='Fixture' and arguments.path=='.')
+                assert(context.project_root:sub(1,1)=='/')
+                assert(margatroid.context.arguments.node_name=='runtime')
+                arguments.node_name='mutated'
+                assert(margatroid.context.arguments.node_name=='runtime')
+            end
+        "#
+            .into(),
+        },
+        environment,
+        reply: Arc::new(Mutex::new(Some(sender))),
+    });
+    drive(&mut fixture.app, &mut reply).await.unwrap();
+    fixture.close().await;
 }

@@ -1,11 +1,14 @@
 use crate::sync::update_task;
 use crate::types::lock;
+use crate::{TaskChangeObserver, TaskRetireObserver, TaskSnapshotSource, TaskUpdateContext};
 use crate::{TaskReadResult, ToolError, ToolErrorKind, ToolTaskHandle, ToolTaskSnapshot};
-use crate::{TaskSyncBinding, TaskUpdateContext};
 use core_plugin::Component;
 use serde_json::Value;
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex, atomic::AtomicU64};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, AtomicU64, Ordering},
+};
 
 #[derive(Clone, Debug)]
 pub struct ToolTasks {
@@ -14,27 +17,59 @@ pub struct ToolTasks {
 }
 
 impl ToolTasks {
-    pub fn new(owner: core_plugin::Entity, address: String, binding: TaskSyncBinding) -> Self {
+    pub fn new() -> Self {
         let shared = Arc::new(TaskSetShared {
             entries: Mutex::default(),
             gate: Arc::default(),
             revision: Arc::new(AtomicU64::new(0)),
             retire: Mutex::new(None),
+            accepting: AtomicBool::new(true),
         });
-        let updates = binding.bind(owner, address, Arc::downgrade(&shared));
-        let retirement = updates.clone();
-        *lock(&shared.retire) = Some(Box::new(move || retirement.close()));
+        let updates = TaskUpdateContext {
+            gate: shared.gate.clone(),
+            revision: shared.revision.clone(),
+            changed: Arc::default(),
+        };
         Self { shared, updates }
     }
     pub fn update_context(&self) -> TaskUpdateContext {
         self.updates.clone()
     }
-    pub fn close_sync(&self) {
-        self.updates.close();
+    pub fn close_admission(&self) {
+        let _gate = lock(&self.shared.gate);
+        self.shared.accepting.store(false, Ordering::Release);
+    }
+    pub fn is_accepting(&self) -> bool {
+        self.shared.accepting.load(Ordering::Acquire)
+    }
+    pub fn observe(&self, changed: TaskChangeObserver, retired: TaskRetireObserver) {
+        *lock(&self.updates.changed) = Some(changed);
+        let previous = lock(&self.shared.retire).replace(retired);
+        if let Some(previous) = previous {
+            previous();
+        }
+    }
+    pub fn snapshot_source(&self) -> TaskSnapshotSource {
+        let weak = Arc::downgrade(&self.shared);
+        Arc::new(move || {
+            let shared = weak.upgrade()?;
+            let _gate = lock(&shared.gate);
+            let tasks = lock(&shared.entries)
+                .iter()
+                .filter_map(|(id, handle)| handle.snapshot(id))
+                .collect();
+            Some((shared.revision.load(Ordering::Acquire), tasks))
+        })
     }
 
     pub fn register(&self, id: String, handle: ToolTaskHandle) -> Result<(), ToolError> {
         update_task(&self.updates, || {
+            if !self.is_accepting() {
+                return Err(ToolError::new(
+                    ToolErrorKind::Closed,
+                    "task collection is closed",
+                ));
+            }
             if id.trim().is_empty() || id.chars().any(char::is_control) {
                 return Err(ToolError::new(
                     ToolErrorKind::InvalidRequest,
@@ -54,7 +89,7 @@ impl ToolTasks {
                     "tool task id already registered",
                 ));
             }
-            if !self.updates.same_owner(handle.update_context()) {
+            if !self.updates.same_collection(handle.update_context()) {
                 return Err(ToolError::new(
                     ToolErrorKind::InvalidRequest,
                     "task belongs to another update context",
@@ -122,14 +157,20 @@ impl ToolTasks {
         error: Option<ToolError>,
     ) -> bool {
         let context = handle.update_context();
-        if !self.updates.same_owner(context) {
+        if !self.updates.same_collection(context) {
             return update_task(context, || {
+                if !handle.begin_cleanup_completion() {
+                    return Ok((false, false));
+                }
                 handle.complete_cleanup_raw(error);
                 Ok((false, false))
             })
             .unwrap_or(false);
         }
         update_task(&self.updates, || {
+            if !handle.begin_cleanup_completion() {
+                return Ok((false, false));
+            }
             let mut entries = lock(&self.shared.entries);
             let current = entries
                 .get(id)
@@ -144,13 +185,19 @@ impl ToolTasks {
     }
 }
 
+impl Default for ToolTasks {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 impl Component for ToolTasks {}
 
 pub(crate) struct TaskSetShared {
     pub(crate) entries: Mutex<BTreeMap<String, ToolTaskHandle>>,
     pub(crate) gate: Arc<Mutex<()>>,
     pub(crate) revision: Arc<AtomicU64>,
-    retire: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
+    retire: Mutex<Option<TaskRetireObserver>>,
+    accepting: AtomicBool,
 }
 
 impl std::fmt::Debug for TaskSetShared {

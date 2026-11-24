@@ -7,8 +7,9 @@ pub struct StorageDatabase {
     pub(crate) shared: Arc<DatabaseState>,
 }
 pub(crate) struct DatabaseState {
-    pub(crate) connection: Mutex<Connection>,
+    pub(crate) connection: Mutex<Option<Connection>>,
     pub(crate) retired: AtomicBool,
+    pub(crate) closing: AtomicBool,
     pub(crate) record_changes: tokio::sync::watch::Sender<RecordWatermarks>,
     pub(crate) block_root: std::path::PathBuf,
     pub(crate) temporary:

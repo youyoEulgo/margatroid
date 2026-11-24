@@ -1,4 +1,8 @@
 #![cfg(target_os = "linux")]
+use agent_core::WorldAgentExt;
+
+#[path = "support/lifecycle.rs"]
+mod test_support;
 
 #[path = "support/storage.rs"]
 mod storage_fixture;
@@ -6,7 +10,6 @@ mod storage_fixture;
 #[path = "support/shell_client.rs"]
 mod shell_client;
 
-use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -64,32 +67,29 @@ impl Fixture {
             .add_plugin(ClosurePlugin)
             .add_closure_system(RuntimePlugin::UPDATE)
             .add_plugin(
-                ToolPlugin::new(crate::test_binding())
+                ToolPlugin::new()
                     .with_runner_path(runner)
                     .with_limits(limits),
             );
         let workspace = app.world_mut().spawn();
         app.world_mut().insert_component(
             workspace,
-            address::Address::new("workspace:test/unit:dev").unwrap(),
+            address::Address::new("/workspace-test-unit-dev").unwrap(),
         );
         app.world_mut().insert_component(
             workspace,
-            workspace_core::Workspace::new(
+            test_support::workspace(
                 "test".into(),
                 root.path().join("workspace.yaml"),
                 root.path().to_owned(),
                 WorkspaceState::Running,
-                BTreeSet::new(),
-                None,
-                crate::test_workspace_context(),
             ),
         );
         let agent = app.world_mut().spawn();
         storage_fixture::mount(app.world_mut(), agent, root.path());
         app.world_mut().insert_component(
             agent,
-            agent_core::Agent::new(
+            test_support::agent(
                 "test".into(),
                 workspace,
                 AgentState::Running,
@@ -146,7 +146,7 @@ impl Fixture {
         if !self.app.world().contains_component::<Tools>(self.agent) {
             self.app
                 .world_mut()
-                .insert_component(self.agent, Tools::new(crate::test_probe()));
+                .insert_component(self.agent, Tools::new());
         }
         self.app
             .world_mut()
@@ -163,7 +163,7 @@ impl Fixture {
         arguments: Value,
     ) -> oneshot::Receiver<Result<ToolExecuteResponse, ToolError>> {
         let (sender, receiver) = oneshot::channel();
-        self.app.world().emit_event(ToolExecuteRequest {
+        self.app.world().emit_event(ToolExecuteRequest::Registered {
             id: id.into(),
             agent: self.agent,
             turn: Some("test-turn".into()),
@@ -376,7 +376,10 @@ frame({'type': 'stopped', 'result': {'Ok': None}, 'cleanup_proven': True})
             let finish = fixture.drive(async move {
                 tokio::time::timeout(Duration::from_secs(5), finishing.finish()).await
             });
-            assert_eq!(finish.unwrap().unwrap_err().kind, Kind::CleanupFailed);
+            assert!(
+                finish.is_err(),
+                "unconfirmed process cleanup must keep finish pending"
+            );
         } else {
             assert_eq!(handle.read().unwrap().error.unwrap().kind, Kind::Cancelled);
         }
@@ -433,10 +436,9 @@ fn return_keeps_vm_alive_across_turn_changes_and_supports_json_cache_replacement
         .get("background-task")
         .unwrap()
         .is_cleanup_complete());
-    agent_core::WorldAgentExt::agent_transition(
+    agent_core::WorldAgentExt::agent_set_turn(
         fixture.app.world_mut(),
         fixture.agent,
-        AgentState::Running,
         Some("unrelated-new-turn".into()),
     )
     .unwrap();
@@ -623,13 +625,7 @@ fn init_preserves_existing_tasks_and_closed_agent_rejects_new_calls() {
     fixture.app.tick();
     assert!(reply.try_recv().unwrap().is_ok());
     assert_eq!(fixture.tasks().list().len(), 1);
-    agent_core::WorldAgentExt::agent_transition(
-        fixture.app.world_mut(),
-        fixture.agent,
-        AgentState::Stopping,
-        Some("test-turn".into()),
-    )
-    .unwrap();
+    agent_core::WorldAgentExt::agent_begin_close(fixture.app.world_mut(), fixture.agent).unwrap();
     let reply = fixture.execute("new", "background", json!({}));
     let rejected = fixture.response(reply).unwrap();
     assert!(rejected.failed);
@@ -1403,15 +1399,18 @@ fn accepted_batch_abort_returns_long_call_immediately_and_preserves_returned_bac
         ("unreturned-abort", "long-abort"),
     ] {
         let (sender, receiver) = oneshot::channel();
-        fixture.app.world().emit_event(ToolExecuteRequest {
-            id: id.into(),
-            agent: fixture.agent,
-            turn: Some("test-turn".into()),
-            alias: alias.into(),
-            call_id: format!("original-{id}"),
-            arguments: json!({}),
-            reply: Arc::new(Mutex::new(Some(sender))),
-        });
+        fixture
+            .app
+            .world()
+            .emit_event(ToolExecuteRequest::Registered {
+                id: id.into(),
+                agent: fixture.agent,
+                turn: Some("test-turn".into()),
+                alias: alias.into(),
+                call_id: format!("original-{id}"),
+                arguments: json!({}),
+                reply: Arc::new(Mutex::new(Some(sender))),
+            });
         replies.push(receiver);
     }
     fixture.app.tick();
@@ -1432,13 +1431,8 @@ fn accepted_batch_abort_returns_long_call_immediately_and_preserves_returned_bac
         .parse()
         .unwrap();
     assert_eq!(fixture.tasks().list().len(), 2);
-    agent_core::WorldAgentExt::agent_transition(
-        fixture.app.world_mut(),
-        fixture.agent,
-        AgentState::Running,
-        None,
-    )
-    .unwrap();
+    agent_core::WorldAgentExt::agent_set_turn(fixture.app.world_mut(), fixture.agent, None)
+        .unwrap();
     let started = Instant::now();
     assert_eq!(fixture.tasks().abort_unreturned("test-turn"), 1);
     let response = fixture
@@ -1807,28 +1801,12 @@ end
     f.removed("contract");
 }
 
-fn test_binding() -> tool_core::TaskSyncBinding {
-    tool_core::TaskSyncBinding::new(
-        client_core::Clients::default(),
-        std::sync::Arc::from([]),
-        |snapshot| {
-            serde_json::to_string(&snapshot)
-                .map(|text| std::sync::Arc::new(client_core::ClientFrame::Text(text)))
-                .map_err(|_| client_core::ClientPrepareError::EncodeFailed)
-        },
-    )
-}
-
 fn test_agent_context() -> agent_core::AgentUpdateContext {
     agent_core::AgentUpdateContext::new(|_, _, _| Vec::new(), |_, _| {})
 }
 
-fn test_workspace_context() -> workspace_core::WorkspaceUpdateContext {
-    workspace_core::WorkspaceUpdateContext::new(|_, _| {})
-}
-
-fn test_probe<T>() -> client_core::UpdateProbe<T> {
-    client_core::UpdateProbe::new(|_| {})
+fn test_probe<T>() -> std::sync::Arc<dyn Fn(T) + Send + Sync> {
+    std::sync::Arc::new(|_| {})
 }
 
 fn sibling_agent(
@@ -1840,7 +1818,11 @@ fn sibling_agent(
     storage_fixture::mount(f.app.world_mut(), agent, f.root.path());
     f.app.world_mut().insert_component(
         agent,
-        agent_core::Agent::new(
+        address::Address::new(&format!("/agents/{name}")).unwrap(),
+    );
+    f.app.world_mut().insert_component(
+        agent,
+        test_support::agent(
             name.into(),
             workspace,
             AgentState::Running,
@@ -1848,19 +1830,15 @@ fn sibling_agent(
             crate::test_agent_context(),
         ),
     );
-    let address = f
+    let _address = f
         .app
         .world()
         .get_component::<address::Address>(agent)
         .unwrap()
         .as_str()
         .to_owned();
-    f.app
-        .world_mut()
-        .insert_component(agent, ToolTasks::new(agent, address, crate::test_binding()));
-    f.app
-        .world_mut()
-        .insert_component(agent, Tools::new(crate::test_probe()));
+    f.app.world_mut().insert_component(agent, ToolTasks::new());
+    f.app.world_mut().insert_component(agent, Tools::new());
     agent
 }
 #[test]
@@ -1895,7 +1873,7 @@ fn cross_agent_registration_uses_third_agent_lifetime_and_preserves_accepted_cal
     f.tool("factory",r#"function configure() return {timeout_ms=0} end
  function execute()
   local ctx=margatroid.context
-  assert(ctx.workspace.address=='workspace:test/unit:dev' and ctx.workspace.name=='test',margatroid.data:encode('json',ctx.workspace))
+  assert(ctx.workspace.address=='/workspace-test-unit-dev' and ctx.workspace.alias=='test',margatroid.data:encode('json',ctx.workspace))
   if ctx.binding then
    local output=margatroid.task:read_output({agent=ctx.owner_agent,task_id=ctx.owner_task_id})
    assert(output.output[1]=='owner-ready')
@@ -2016,8 +1994,7 @@ fn workspace_members_are_live_and_cross_workspace_registration_is_rejected() {
 
 #[test]
 fn free_tools_initialize_without_turn_and_do_not_inherit_an_active_turn() {
-    use agent_core::WorldAgentExt;
-    for (state, current) in [
+    for (_state, current) in [
         (AgentState::Starting, None),
         (AgentState::Running, None),
         (AgentState::Running, Some("unrelated-turn".to_owned())),
@@ -2027,18 +2004,21 @@ fn free_tools_initialize_without_turn_and_do_not_inherit_an_active_turn() {
         fixture
             .app
             .world_mut()
-            .agent_transition(fixture.agent, state, current.clone())
+            .agent_set_turn(fixture.agent, current.clone())
             .unwrap();
         let (tx, rx) = oneshot::channel();
-        fixture.app.world().emit_event(ToolExecuteRequest {
-            id: "free-init".into(),
-            agent: fixture.agent,
-            turn: None,
-            alias: "free-init".into(),
-            call_id: "free-init-call".into(),
-            arguments: json!({}),
-            reply: Arc::new(Mutex::new(Some(tx))),
-        });
+        fixture
+            .app
+            .world()
+            .emit_event(ToolExecuteRequest::Registered {
+                id: "free-init".into(),
+                agent: fixture.agent,
+                turn: None,
+                alias: "free-init".into(),
+                call_id: "free-init-call".into(),
+                arguments: json!({}),
+                reply: Arc::new(Mutex::new(Some(tx))),
+            });
         let result = fixture.response(rx).unwrap();
         assert!(!result.failed, "{result:?}");
         assert_eq!(result.content, "free-initialized");

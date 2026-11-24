@@ -117,7 +117,24 @@ pub fn open_storage(
         .get_or_init(Mutex::default)
         .lock()
         .map_err(|_| err(K::Closed, "database registry poisoned"))?;
-    let shared = if let Some(shared) = registry.get(&db_path).and_then(Weak::upgrade) {
+    let existing = registry.get(&db_path).and_then(Weak::upgrade);
+    let existing = match existing {
+        Some(shared) => {
+            let guard = shared
+                .connection
+                .lock()
+                .map_err(|_| err(K::Closed, "database lock poisoned"))?;
+            if guard.is_none() {
+                None
+            } else {
+                open_connection(&shared, &guard)?;
+                drop(guard);
+                Some(shared)
+            }
+        }
+        None => None,
+    };
+    let shared = if let Some(shared) = existing {
         shared
     } else {
         let mut connection = Connection::open(&db_path).map_err(write_err)?;
@@ -137,8 +154,9 @@ pub fn open_storage(
                 path.push(".blocks");
                 PathBuf::from(path)
             },
-            connection: Mutex::new(connection),
+            connection: Mutex::new(Some(connection)),
             retired: AtomicBool::new(false),
+            closing: AtomicBool::new(false),
             temporary: Mutex::new(BTreeMap::new()),
         });
         {
@@ -146,7 +164,11 @@ pub fn open_storage(
                 .connection
                 .lock()
                 .map_err(|_| err(K::Closed, "database lock poisoned"))?;
-            blocks::initialize(&db, &shared.block_root, &shared.retired)?;
+            blocks::initialize(
+                open_connection(&shared, &db)?,
+                &shared.block_root,
+                &shared.retired,
+            )?;
         }
         registry.insert(db_path, Arc::downgrade(&shared));
         shared
@@ -167,6 +189,12 @@ pub fn open_storage(
         });
     drop(locks);
     {
+        let connection = database
+            .shared
+            .connection
+            .lock()
+            .map_err(|_| err(K::Closed, "database lock poisoned"))?;
+        open_connection(&database.shared, &connection)?;
         let _guard = settings_lock
             .lock()
             .map_err(|_| err(K::Closed, "settings lock poisoned"))?;
@@ -181,6 +209,51 @@ pub fn open_storage(
         settings_path,
         settings_lock,
     })
+}
+
+fn open_connection<'a>(
+    state: &types::DatabaseState,
+    connection: &'a Option<Connection>,
+) -> Result<&'a Connection, StorageError> {
+    if state.retired.load(Ordering::Acquire) {
+        return Err(err(
+            if state.closing.load(Ordering::Acquire) {
+                K::Closed
+            } else {
+                K::CleanupFailed
+            },
+            "database connection retired",
+        ));
+    }
+    connection
+        .as_ref()
+        .ok_or_else(|| err(K::Closed, "database connection closed"))
+}
+
+/// Retire every clone and physically close its shared SQLite connection.
+/// Async callers must run this in a blocking worker and await its completion.
+pub fn close_storage(storage: &AgentStorage) -> Result<(), StorageError> {
+    let state = &storage.database.shared;
+    let mut guard = state
+        .connection
+        .lock()
+        .map_err(|_| err(K::CloseFailed, "database lock poisoned"))?;
+    state.closing.store(true, Ordering::Release);
+    state.retired.store(true, Ordering::Release);
+    // Persistent Block connections are scoped to operations under this same lock.
+    // Acquiring it proves that their reads, backups and writes have all returned.
+    if let Some(connection) = guard.take() {
+        if let Err((connection, error)) = connection.close() {
+            *guard = Some(connection);
+            return Err(err(K::CloseFailed, error));
+        }
+    }
+    state
+        .temporary
+        .lock()
+        .map_err(|_| err(K::CloseFailed, "TEMP lock poisoned"))?
+        .clear();
+    Ok(())
 }
 
 fn initialize(db: &mut Connection) -> Result<(), StorageError> {
@@ -251,6 +324,13 @@ pub fn execute_storage(
     storage: &AgentStorage,
     operation: StorageOperation,
 ) -> Result<StorageValue, StorageError> {
+    let guard = storage
+        .database
+        .shared
+        .connection
+        .lock()
+        .map_err(|_| err(K::Closed, "database lock poisoned"))?;
+    let connection = open_connection(&storage.database.shared, &guard)?;
     if matches!(
         operation,
         StorageOperation::ReadConfig
@@ -263,18 +343,9 @@ pub fn execute_storage(
             .map_err(|_| err(K::Closed, "settings lock poisoned"))?;
         return config_operation(&storage.settings_path, operation);
     }
-    let connection = storage
-        .database
-        .shared
-        .connection
-        .lock()
-        .map_err(|_| err(K::Closed, "database lock poisoned"))?;
-    if storage.database.shared.retired.load(Ordering::Acquire) {
-        return Err(err(K::CleanupFailed, "database connection retired"));
-    }
     if blocks::is_operation(&operation) {
         return blocks::execute(
-            &connection,
+            connection,
             &storage.database.shared.block_root,
             &storage.database.shared.retired,
             &mut *storage
@@ -303,18 +374,18 @@ pub fn execute_storage(
         })
         .map_err(write_err)?;
     let records = matches!(operation, StorageOperation::AppendHistory { .. });
-    let outcome = database_operation(&connection, operation).and_then(|value| {
+    let outcome = database_operation(connection, operation).and_then(|value| {
         Ok((
             value,
             if records {
-                Some(pages::record_watermarks(&connection)?)
+                Some(pages::record_watermarks(connection)?)
             } else {
                 None
             },
         ))
     });
     let (value, committed) =
-        finish_transaction(&connection, &storage.database.shared.retired, outcome)?;
+        finish_transaction(connection, &storage.database.shared.retired, outcome)?;
     if let Some(committed) = committed {
         publish_record_changes(&storage.database.shared, committed);
     }
@@ -631,3 +702,6 @@ fn publish_record_changes(database: &types::DatabaseState, committed: RecordWate
         }
     });
 }
+
+#[cfg(test)]
+mod close_tests;

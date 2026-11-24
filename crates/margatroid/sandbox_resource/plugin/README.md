@@ -8,6 +8,8 @@
 
 私有 ImportContext、ImportOutput、ImportError 位于 types。System 仅路由 Import 请求和 Result 校验结果，Handler 提交异步服务，在 spawn_blocking 中规范化路径、调用 core 同步读取并丢弃本次正文。异步服务等待真实 JoinHandle 完成后发送 Result 并唤醒 ECS，不提前返回取消结果或脱离读取任务。
 
-Handler 收到结果后再次核对完整 owner 和 cancel，成功时创建或更新 `Sandboxes` 的单个 alias 规范路径，其他条目保持不变，然后回复原 oneshot。失败保持旧条目；原 index 被复用也不会向新 Entity 发布迟到结果。不同请求的同 alias 顺序由调用入口串行协调。
+Handler 收到结果后再次核对完整 owner 和 cancel，成功时从sandbox_resource_core::SandboxObserverFactory取得通用列表回调，创建缺失的Sandboxes，再更新单个alias规范路径，其他条目保持不变，然后回复原 oneshot。失败保持旧条目；原 index 被复用也不会向新 Entity 发布迟到结果。不同请求的同 alias 顺序由调用入口串行协调。
 
 导入只保存路径。每次使用由对应 core 的同步读取函数重新读取，使用方安排 blocking worker 并等待完成。测试位于 tests，使用真实异步运行时覆盖更新、失败保留、取消、Entity generation、唯一回复、预算、自定义 schedule、路径规范化及安装约束。
+
+ObserverFactory由装配方作为core Resource提供，plugin不依赖client_core或其他业务plugin的绑定类型；仍在原有导入结果入口完成发布和唯一回复，不增加同步事件。该说明对应当前源码，不表示运行服务已经更新。

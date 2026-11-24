@@ -1,5 +1,8 @@
 #![cfg(target_os = "linux")]
 
+#[path = "support/lifecycle.rs"]
+mod test_support;
+
 use serde_json::{json, Value};
 use std::process::Stdio;
 use std::time::Duration;
@@ -55,7 +58,7 @@ async fn runner(
     let output = BufReader::new(child.stdout.take().unwrap());
     send(&mut input, json!({
         "protocol_version": 1, "program": program, "arguments": arguments,
-        "context": {"agent_address":"agent:test/fixture:dev","workspace":{"address":"workspace:test/unit:dev","name":"test","project_root":"/tmp"},"owner_agent":null,"agent_name":"protocol-fixture","turn":"test-turn","source_origin":"protocol-fixture.lua","task_id":"configure-test", "call_id":"call", "alias":"tool", "owner_task_id":null,"binding":null,"resource_dir":root.path(),"project_root":root.path(), "temp_dir":root.path()},
+        "context": {"agent_address":"/agents/test/fixture-dev","workspace":{"address":"/workspace-test-unit-dev","name":"test","project_root":"/tmp"},"owner_agent":null,"agent_name":"protocol-fixture","turn":"test-turn","source_origin":"protocol-fixture.lua","task_id":"configure-test", "call_id":"call", "alias":"tool", "owner_task_id":null,"binding":null,"resource_dir":root.path(),"project_root":root.path(), "temp_dir":root.path()},
         "limits": ToolExecutionLimits::default()
     })).await;
     (root, child, input, output)

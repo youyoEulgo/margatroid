@@ -80,6 +80,13 @@ resolve_file(root: &Path, address: &str) -> Result<PathBuf, AddressError>
         按资源类型的磁盘布局解析真实入口文件，类型对应根目录由调用方提供。
         规范化root与候选路径，要求候选仍位于root内且为真实普通文件。
         返回规范绝对路径；格式错误、越界、不存在或非文件时返回错误。
+
+query_resources(roots: &ResourceRoots, query: &ResourceQuery) -> Result<Vec<ResourceFile>, AddressError>
+    行为：同步只读文件枚举，异步调用方在blocking worker执行；不读取程序、配置正文或创建任何目录。
+        校验可选type只允许driver/tool/prompt/sandbox，scope与name遵循文件资源段规则；各条件精确匹配并取交集，省略条件不限，返回所有tag。
+        仅扫描匹配的scope/name目录，跳过不完整入口、非法名称及越界链接；类型根不存在返回空列表，实际目录读取失败返回错误。
+        入口path沿resolve_file规则，tool的tool_path等于path，driver额外定位同目录tool.toml，无工具清单或其他类型时tool_path=None。
+        结果按type/scope/name/tag稳定升序；每次查询读取当前文件系统，不保存索引、不建立监控、不发同步事件。
 ```
 
 # types pub
@@ -88,6 +95,26 @@ resolve_file(root: &Path, address: &str) -> Result<PathBuf, AddressError>
 
 公开：
 ```text
+ResourceRoots：文件资源根配置，Resource + Clone
+    driver: PathBuf
+    tool: PathBuf
+    prompt: PathBuf
+    sandbox: PathBuf
+    new(data_root: impl AsRef<Path>) -> Self
+        行为：只拼接agent-drivers/tools/prompts/sandboxes目录，不执行IO；由compose显式注入，不从HOME猜测。
+    root(&self, kind: &str) -> Result<&Path, AddressError>
+        行为：返回四类根之一，未知类型返回InvalidPart。
+ResourceQuery：资源筛选，Clone + Default
+    resource_type: Option<String>
+    scope: Option<String>
+    name: Option<String>
+    validate(&self) -> Result<(), AddressError>
+        行为：校验类型及各非空单段；拒绝路径遍历和非法分隔符，不把模糊匹配语法当表达式。
+ResourceFile：本次查询的owned值
+    address: ParsedAddress
+    path: PathBuf
+    tool_path: Option<PathBuf>
+
 ParsedAddress：解析后的文件资源地址，公开值类型
     kind: String--类型段
     scope: String--作用域

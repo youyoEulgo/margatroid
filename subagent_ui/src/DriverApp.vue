@@ -383,7 +383,7 @@ const contextWindowUsage = computed(() => {
 const currentChannelLabel = computed(() => {
   const workspace = selectedWorkspace.value;
   if (!workspace) return "Select a workspace";
-  if (selectedAgent.value) return resourceName(selectedAgent.value);
+  if (selectedAgent.value) return selectedAgentName.value;
   return selectedDefinition.value?.cache.agents.length
     ? "Choose an agent"
     : "No members configured";
@@ -563,18 +563,6 @@ async function runWorkspaceAction(action: () => Promise<unknown>) {
   } catch {
     workspaceNotice.value = "Workspace operation failed";
   }
-}
-
-function startWorkspace(path: string) {
-  void runWorkspaceAction(() => store.startWorkspace(path));
-}
-
-function restartWorkspace(path: string) {
-  void runWorkspaceAction(() => store.restartWorkspace(path));
-}
-
-function stopWorkspace(address: string) {
-  void runWorkspaceAction(() => store.stopWorkspace(address));
 }
 
 function abortTurn() {
@@ -923,9 +911,6 @@ const conversationRows = computed<ConversationRow[]>(() => {
           @select-workspace="selectWorkspace"
           @toggle-workspace="store.toggleWorkspace"
           @select-agent="selectMember"
-          @start-workspace="startWorkspace"
-          @restart-workspace="restartWorkspace"
-          @stop-workspace="stopWorkspace"
         />
       </nav>
 

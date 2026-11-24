@@ -165,5 +165,22 @@ pub fn read_sandbox(
     Ok(SandboxInput { policy, origin })
 }
 
-pub type SandboxSyncBinding = client_core::ProbeFactory<Vec<(String, std::path::PathBuf)>>;
-pub type SandboxSelectionSyncBinding = client_core::ProbeFactory<Option<String>>;
+pub type SandboxChanged = std::sync::Arc<dyn Fn(Vec<(String, PathBuf)>) + Send + Sync>;
+pub type SandboxSelectionChanged = std::sync::Arc<dyn Fn(Option<String>) + Send + Sync>;
+#[derive(Clone)]
+pub struct SandboxObserverFactory {
+    bind: std::sync::Arc<dyn Fn(Entity) -> (SandboxChanged, SandboxSelectionChanged) + Send + Sync>,
+}
+impl SandboxObserverFactory {
+    pub fn new(
+        bind: impl Fn(Entity) -> (SandboxChanged, SandboxSelectionChanged) + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            bind: std::sync::Arc::new(bind),
+        }
+    }
+    pub fn for_owner(&self, owner: Entity) -> (SandboxChanged, SandboxSelectionChanged) {
+        (self.bind)(owner)
+    }
+}
+impl core_plugin::Resource for SandboxObserverFactory {}

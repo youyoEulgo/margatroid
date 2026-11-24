@@ -4,6 +4,7 @@ use std::fmt;
 pub enum StorageErrorKind {
     OwnerMissing,
     Closed,
+    CloseFailed,
     InvalidRequest,
     InvalidRecord,
     SchemaMismatch,

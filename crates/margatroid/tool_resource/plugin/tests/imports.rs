@@ -61,14 +61,6 @@ impl Drop for Fixture {
 
 fn app() -> App {
     let mut app = App::new();
-    app.world_mut()
-        .insert_resource(tool_resource_core::ToolResourceSyncBinding::new(|_| {
-            client_core::UpdateProbe::new(|_| {})
-        }));
-    app.world_mut()
-        .insert_resource(tool_resource_core::ToolResourceSyncBinding::new(|_| {
-            client_core::UpdateProbe::new(|_| {})
-        }));
     app.add_plugin(RuntimePlugin::default())
         .add_plugin(AsyncRuntimePlugin)
         .add_plugin(ClosurePlugin)
@@ -140,7 +132,7 @@ fn publishes_complete_definition_and_rejects_duplicate_alias() {
     let second = fixture.entry("second");
     let mut app = app();
     let owner = app.world_mut().spawn();
-    let mut collection = Tools::new(crate::test_probe());
+    let mut collection = Tools::new();
     collection
         .insert("other".into(), entry(PathBuf::from("/unopened/other")))
         .unwrap();
@@ -189,7 +181,7 @@ fn failed_validation_preserves_existing_alias_and_reports_actual_path() {
     fs::write(&broken, "invalid [").unwrap();
     let mut app = app();
     let owner = app.world_mut().spawn();
-    let mut collection = Tools::new(crate::test_probe());
+    let mut collection = Tools::new();
     collection
         .insert("sample".into(), entry(first.clone()))
         .unwrap();
@@ -216,7 +208,7 @@ fn cancellation_after_validation_prevents_publication_and_preserves_old_path() {
     let new = fixture.entry("new");
     let mut app = app();
     let owner = app.world_mut().spawn();
-    let mut collection = Tools::new(crate::test_probe());
+    let mut collection = Tools::new();
     collection
         .insert("sample".into(), entry(old.clone()))
         .unwrap();
@@ -337,10 +329,6 @@ fn invalid_paths_do_not_create_collections() {
 #[should_panic(expected = "AsyncRuntimePlugin is required")]
 fn installation_requires_async_runtime() {
     let mut app = App::new();
-    app.world_mut()
-        .insert_resource(tool_resource_core::ToolResourceSyncBinding::new(|_| {
-            client_core::UpdateProbe::new(|_| {})
-        }));
     app.add_plugin(RuntimePlugin::default())
         .add_plugin(ToolResourcePlugin::default());
 }
@@ -357,10 +345,6 @@ fn imports_complete_materials_on_the_configured_schedule() {
     let fixture = Fixture::new();
     let path = fixture.entry("sample");
     let mut app = App::new();
-    app.world_mut()
-        .insert_resource(tool_resource_core::ToolResourceSyncBinding::new(|_| {
-            client_core::UpdateProbe::new(|_| {})
-        }));
     app.add_plugin(RuntimePlugin::default())
         .add_plugin(AsyncRuntimePlugin)
         .add_plugin(ClosurePlugin)
@@ -403,8 +387,4 @@ fn canonicalizes_a_real_entry_symlink_before_publication() {
             .map(|entry| entry.path.as_path()),
         Some(entry.canonicalize().unwrap().as_path())
     );
-}
-
-fn test_probe<T>() -> client_core::UpdateProbe<T> {
-    client_core::UpdateProbe::new(|_| {})
 }

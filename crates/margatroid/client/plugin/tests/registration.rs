@@ -74,7 +74,7 @@ fn registration_has_an_independent_address_and_disconnect_destroys_both() {
     let world = harness.app.world();
     let client = world.get_component::<Client>(registered.client).unwrap();
     assert_eq!(client.name, "console");
-    let address = format!("client:webui/console:{}", connection.get());
+    let address = format!("/clients/webui/console/{}", connection.get());
     assert_eq!(
         world.entity_by_address(&address).unwrap(),
         registered.client
@@ -117,7 +117,7 @@ fn occupied_address_is_rejected_without_overwriting_owner() {
     let mut harness = Harness::new();
     let (socket, connection) = harness.connect();
     let blocker = harness.app.world_mut().spawn();
-    let value = format!("client:webui/console:{}", connection.get());
+    let value = format!("/clients/webui/console/{}", connection.get());
     harness
         .app
         .world_mut()

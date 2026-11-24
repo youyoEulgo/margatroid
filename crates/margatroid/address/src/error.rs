@@ -4,6 +4,7 @@ use std::{fmt, io, path::PathBuf};
 pub enum AddressError {
     InvalidFormat,
     InvalidPart,
+    InvalidNodePath,
     EntityMissing,
     DuplicateAddress,
     PathOutsideRoot { root: PathBuf, path: PathBuf },
@@ -18,6 +19,10 @@ impl fmt::Display for AddressError {
             Self::InvalidFormat => write!(
                 formatter,
                 "invalid address format: expected type:scope/name:tag"
+            ),
+            Self::InvalidNodePath => write!(
+                formatter,
+                "invalid entity address: expected absolute node path"
             ),
             Self::InvalidPart => write!(formatter, "invalid address part or unsupported file type"),
             Self::EntityMissing => write!(formatter, "no entity has this address"),

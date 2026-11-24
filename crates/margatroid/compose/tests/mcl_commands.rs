@@ -47,6 +47,73 @@ impl ErrorValueExt for Result<MclValue, MclError> {
     }
 }
 
+#[derive(Clone)]
+struct RecordedToolRequest {
+    id: String,
+    agent: Entity,
+    turn: Option<String>,
+    alias: String,
+    call_id: String,
+    arguments: Value,
+    reply: tool_core::ToolExecuteReply,
+}
+
+trait FixtureAgentState {
+    fn fixture_state(
+        &mut self,
+        entity: Entity,
+        state: AgentState,
+        turn: Option<String>,
+    ) -> Result<(), agent_core::AgentError>;
+}
+impl FixtureAgentState for World {
+    fn fixture_state(
+        &mut self,
+        entity: Entity,
+        state: AgentState,
+        turn: Option<String>,
+    ) -> Result<(), agent_core::AgentError> {
+        if state == AgentState::Starting {
+            let old = self.get_component::<Agent>(entity).unwrap();
+            let new = Agent::new(
+                old.workspace(),
+                old.parent(),
+                old.task_id().to_owned(),
+                old.project_root().to_owned(),
+            );
+            self.insert_component(entity, new);
+            return Ok(());
+        }
+        if state == AgentState::Closing {
+            return self.agent_begin_close(entity);
+        }
+        self.agent_ready(entity)?;
+        self.agent_set_turn(entity, turn)
+    }
+}
+fn test_finish() -> tool_core::TaskFinish {
+    Arc::new(|handle| {
+        Box::pin(async move {
+            handle.cancel();
+            handle.finish_children().await
+        })
+    })
+}
+fn workspace_database(root: &std::path::Path) -> workspace_core::WorkspaceDatabase {
+    for name in ["normal", "temporary", "archived"] {
+        fs::create_dir_all(root.join("agents").join(name)).unwrap();
+    }
+    workspace_core::WorkspaceDatabase::create(
+        root.join("workspace.sqlite"),
+        workspace_core::WorkspaceMetadata {
+            address: "/unit".into(),
+            alias: "test".into(),
+            project_root: root.to_owned(),
+        },
+    )
+    .unwrap()
+}
+
 struct Fixture {
     app: App,
     owner: Entity,
@@ -56,8 +123,8 @@ struct Fixture {
     inference: Arc<Mutex<Vec<InferenceRequest>>>,
     auto_inference: Arc<AtomicBool>,
     inference_submissions: Arc<Mutex<Vec<InferenceRequest>>>,
-    tool_submissions: Arc<Mutex<Vec<ToolExecuteRequest>>>,
-    tools: Arc<Mutex<Vec<ToolExecuteRequest>>>,
+    tool_submissions: Arc<Mutex<Vec<RecordedToolRequest>>>,
+    tools: Arc<Mutex<Vec<RecordedToolRequest>>>,
     tool_error: Arc<Mutex<Option<tool_core::ToolError>>>,
     tool_modes: Arc<Mutex<std::collections::BTreeMap<String, u8>>>,
     imports: Arc<Mutex<Vec<String>>>,
@@ -82,20 +149,14 @@ impl Fixture {
             .add_plugin(StoragePlugin::new())
             .add_plugin(MclPlugin::new().with_import_config(roots));
         let workspace = app.world_mut().spawn();
-        app.world_mut().insert_component(
-            workspace,
-            address::Address::new("workspace:test/unit:dev").unwrap(),
-        );
+        app.world_mut()
+            .insert_component(workspace, address::Address::new("/unit").unwrap());
         let owner = app.world_mut().spawn();
         let client = app.world_mut().spawn();
-        app.world_mut().insert_component(
-            owner,
-            address::Address::new("agent:margatroid/test:dev").unwrap(),
-        );
-        app.world_mut().insert_component(
-            client,
-            address::Address::new("client:margatroid/frontend:dev").unwrap(),
-        );
+        app.world_mut()
+            .insert_component(owner, address::Address::new("/unit/test").unwrap());
+        app.world_mut()
+            .insert_component(client, address::Address::new("/clients/frontend").unwrap());
         let storage = open_storage(
             &root.path().join("agent.sqlite"),
             &root.path().join("settings.toml"),
@@ -106,18 +167,13 @@ impl Fixture {
         app.world_mut().insert_component(
             owner,
             agent_core::Agent::new(
-                "test".into(),
                 workspace,
-                AgentState::Running,
-                None,
-                crate::test_agent_context(),
+                workspace,
+                "driver-task".into(),
+                root.path().to_owned(),
             ),
         );
-        app.world_mut().insert_component(owner, MclQueue::default());
-        app.world_mut()
-            .insert_component(owner, agent_core::AgentSession::new());
-        app.world_mut()
-            .insert_component(owner, lua_runtime_core::AgentWaitSlot::default());
+        app.world_mut().agent_ready(owner).unwrap();
         app.world_mut().insert_component(
             owner,
             inference_core::AgentInferenceConfig::new(
@@ -128,7 +184,7 @@ impl Fixture {
                     top_p: None,
                     stop: vec![],
                 },
-                crate::test_probe(),
+                Arc::new(|_| {}),
             ),
         );
         app.world_mut()
@@ -187,6 +243,27 @@ impl Fixture {
                 .cloned()
                 .collect::<Vec<_>>();
             for request in requests {
+                let ToolExecuteRequest::Registered {
+                    id,
+                    agent,
+                    turn,
+                    alias,
+                    call_id,
+                    arguments,
+                    reply,
+                } = request
+                else {
+                    panic!("MCL must submit registered tools");
+                };
+                let request = RecordedToolRequest {
+                    id,
+                    agent,
+                    turn,
+                    alias,
+                    call_id,
+                    arguments,
+                    reply,
+                };
                 submitted.lock().unwrap().push(request.clone());
                 if world
                     .get_component::<Agent>(request.agent)
@@ -267,6 +344,7 @@ impl Fixture {
                                     .unwrap()
                                     .update_context(),
                                 request.turn.clone(),
+                                test_finish(),
                             )
                             .unwrap();
                             world
@@ -296,6 +374,7 @@ impl Fixture {
                         .unwrap()
                         .update_context(),
                     request.turn.clone(),
+                    test_finish(),
                 )
                 .unwrap();
                 handle
@@ -349,7 +428,7 @@ impl Fixture {
                     .unwrap()
                     .push(format!("tool:{}", request.alias));
                 if !world.contains_component::<Tools>(request.owner) {
-                    world.insert_component(request.owner, Tools::new(crate::test_probe()));
+                    world.insert_component(request.owner, Tools::new());
                 }
                 world
                     .get_component_mut::<Tools>(request.owner)
@@ -371,14 +450,14 @@ impl Fixture {
                     .unwrap()
                     .push(format!("sandbox:{}", request.alias));
                 if !world.contains_component::<Sandboxes>(request.owner) {
-                    world.insert_component(request.owner, Sandboxes::new(crate::test_probe()));
+                    world.insert_component(request.owner, Sandboxes::new(Arc::new(|_| {})));
                     if world
                         .get_component::<sandbox_resource_core::SelectedSandbox>(request.owner)
                         .is_none()
                     {
                         world.insert_component(
                             request.owner,
-                            sandbox_resource_core::SelectedSandbox::new(None, crate::test_probe()),
+                            sandbox_resource_core::SelectedSandbox::new(None, Arc::new(|_| {})),
                         );
                     }
                 }
@@ -482,12 +561,16 @@ impl Fixture {
     }
 
     fn vm(&mut self, id: &str) -> oneshot::Receiver<Result<(), LuaRuntimeError>> {
-        self.app
-            .world_mut()
-            .insert_component(self.owner, agent_core::AgentSession(id.to_owned()));
-        let slot = lua_runtime_core::AgentWaitSlot::default();
-        let wake = slot.0.clone();
-        self.app.world_mut().insert_component(self.owner, slot);
+        let old = self.app.world().get_component::<Agent>(self.owner).unwrap();
+        let component = Agent::new(
+            old.workspace(),
+            old.parent(),
+            old.task_id().to_owned(),
+            old.project_root().to_owned(),
+        );
+        self.app.world_mut().insert_component(self.owner, component);
+        self.app.world_mut().agent_ready(self.owner).unwrap();
+        let wake = DriverWakeSlot::shared();
         let (sender, ready) = oneshot::channel();
         let (_sender, ended) = oneshot::channel();
         self.app.world_mut().insert_component(
@@ -510,7 +593,7 @@ impl Fixture {
         if !self.app.world().contains_component::<Tools>(self.owner) {
             self.app
                 .world_mut()
-                .insert_component(self.owner, Tools::new(crate::test_probe()));
+                .insert_component(self.owner, Tools::new());
         }
         let directory = self.root.path().join("fixture-tool").join(alias);
         fs::create_dir_all(&directory).unwrap();
@@ -1223,12 +1306,11 @@ async fn inference_does_not_block_same_agent_config_or_other_agents() {
     let other = fixture.app.world_mut().spawn();
     fixture.app.world_mut().insert_component(
         other,
-        agent_core::Agent::new(
-            "other".into(),
+        Agent::new(
             workspace,
-            AgentState::Running,
-            None,
-            crate::test_agent_context(),
+            workspace,
+            "other-task".into(),
+            fixture.root.path().to_owned(),
         ),
     );
     let shared_storage = fixture
@@ -1324,7 +1406,7 @@ async fn ready_targets_agent_and_wake_consumes_the_agent_wait_slot_without_a_vm(
     fixture
         .app
         .world_mut()
-        .agent_transition(fixture.owner, AgentState::Starting, None)
+        .fixture_state(fixture.owner, AgentState::Starting, None)
         .unwrap();
     fixture.command("EFFECT ready", vec![]).await.unwrap();
     assert_eq!(
@@ -1347,11 +1429,10 @@ async fn ready_targets_agent_and_wake_consumes_the_agent_wait_slot_without_a_vm(
     let slot = fixture
         .app
         .world()
-        .get_component::<AgentWaitSlot>(fixture.owner)
+        .get_component::<Agent>(fixture.owner)
         .unwrap()
-        .0
-        .clone();
-    DriverWakeSlot::wait(slot).await.unwrap();
+        .wake_slot();
+    agent_core::AgentWakeSlot::wait(slot).await.unwrap();
 }
 #[tokio::test]
 async fn finish_turn_waits_for_real_inference_cleanup_and_keeps_abort_control() {
@@ -1379,6 +1460,7 @@ async fn finish_turn_waits_for_real_inference_cleanup_and_keeps_abort_control() 
             cancel: cancel.clone(),
             stop_stream: Arc::new(|| {}),
             task: Arc::new(InferenceTaskState::default()),
+            source_alive: Arc::new(AtomicBool::new(true)),
         },
         tokio::spawn(async move {
             waiting.await.unwrap();
@@ -1595,6 +1677,7 @@ async fn inference_error_is_a_value_and_finish_turn_waits_for_cleanup() {
                 cancel: cancel.clone(),
                 stop_stream: Arc::new(|| {}),
                 task: Arc::new(InferenceTaskState::default()),
+                source_alive: Arc::new(AtomicBool::new(true)),
             },
             tokio::spawn(async move {
                 waiting.await.unwrap();
@@ -1705,7 +1788,7 @@ async fn inference_error_does_not_finish_a_replacement_turn() {
     fixture
         .app
         .world_mut()
-        .agent_transition(
+        .fixture_state(
             fixture.owner,
             AgentState::Running,
             Some("replacement".into()),
@@ -1741,9 +1824,15 @@ async fn inference_error_does_not_finish_a_replacement_turn() {
 
 #[tokio::test]
 async fn bundled_drivers_record_inference_error_messages_and_keep_running_while_cleanup_finishes() {
-    for source in [
-        include_str!("../../../../resources/agent-drivers/margatroid/coder/dev/base.lua"),
-        include_str!("../../../../resources/agent-drivers/margatroid/reviewer/dev/base.lua"),
+    for (role, source) in [
+        (
+            "coder",
+            include_str!("../../../../resources/agent-drivers/margatroid/coder/dev/base.lua"),
+        ),
+        (
+            "reviewer",
+            include_str!("../../../../resources/agent-drivers/margatroid/reviewer/dev/base.lua"),
+        ),
     ] {
         for kind in [
             InferenceErrorKind::RequestFailed,
@@ -1771,6 +1860,27 @@ async fn bundled_drivers_record_inference_error_messages_and_keep_running_while_
             );
 
             tool_plugin::install_lua_services(&mut fixture.app);
+            let services = fixture
+                .app
+                .world()
+                .get_resource::<LuaServices>()
+                .unwrap()
+                .clone();
+            fixture.app.world_mut().insert_resource(LuaServices::new(
+                move |identity, method, arguments| {
+                    let services = services.clone();
+                    Box::pin(async move {
+                        match method.as_str() {
+                            "agent_create" => Ok(json!({"address":"/unit/test"})),
+                            "task_return_result" | "tools_register" => Ok(json!({})),
+                            "task_receive" => {
+                                std::future::pending::<Result<Value, LuaRuntimeError>>().await
+                            }
+                            _ => services.call(identity, method, arguments).await,
+                        }
+                    })
+                },
+            ));
             fixture
                 .app
                 .world_mut()
@@ -1806,20 +1916,10 @@ async fn bundled_drivers_record_inference_error_messages_and_keep_running_while_
                 workspace,
                 workspace_core::Workspace::new(
                     "bundled-driver".into(),
-                    fixture.root.path().join("workspace.yaml"),
                     fixture.root.path().to_owned(),
-                    workspace_core::WorkspaceState::Running,
-                    Default::default(),
-                    None,
-                    crate::test_workspace_context(),
+                    workspace_database(fixture.root.path()),
                 ),
             );
-            let executor = workspace_core::spawn_workspace_executor().unwrap();
-            let close = executor.close.clone();
-            fixture
-                .app
-                .world_mut()
-                .insert_component(workspace, executor);
             // Run the bundled initialization list; fake only resource imports and inference.
             let initial: Value = toml::from_str(include_str!(
                 "../../../../resources/agent-drivers/margatroid/coder/dev/setting.toml"
@@ -1877,41 +1977,39 @@ async fn bundled_drivers_record_inference_error_messages_and_keep_running_while_
             fixture
                 .app
                 .world_mut()
-                .agent_transition(fixture.owner, AgentState::Starting, None)
+                .fixture_state(fixture.owner, AgentState::Starting, None)
                 .unwrap();
             let environment = LuaEnvironment {
-            globals: std::collections::BTreeMap::from([("agent_info".into(), LuaBinding::Value(LuaValue::from_json(json!({
-                "entity": {"index": fixture.owner.index(), "generation": fixture.owner.generation()},
-                "model": {"context_window_tokens": 4096}
-            })).unwrap()))]),
-            modules: Default::default(),
-        };
+                globals: std::collections::BTreeMap::from([("execution_context".into(),LuaBinding::Value(LuaValue::from_json(json!({
+                    "workspace":{"address":"/unit"},"arguments":{"node_name":"test","alias":"Bundled fixture","path":"."}
+                })).unwrap()))]),modules:Default::default(),
+            };
             let (sender, mut started) = oneshot::channel();
             fixture.app.world().send_event(StartDriverLuaVm {
-            owner: fixture.owner,
-            workspace,
-            program: LuaProgram {
-                source: source.replace("task = function() return margatroid.task:receive() end,", "").replace("if not subdriver then\n            margatroid.tools:register", "if false then\n            margatroid.tools:register").replace("local agent = margatroid.agent:create({\n        name = child_name,\n        config_path = config_path,\n        ui_path = context.resource_dir .. (subdriver and \"/subagent-ui\" or \"/ui\"),\n    })", "local agent = {address='agent:margatroid/test:dev'}"),
-
-                origin: "bundled-driver".into(),
-
-            },
-            environment,
-            reply: Arc::new(Mutex::new(Some(sender))),
-        });
+                owner: fixture.owner,
+                workspace,
+                program: LuaProgram {
+                    source: source.to_owned(),
+                    origin: std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                        .join("../../../resources/agent-drivers/margatroid")
+                        .join(role)
+                        .join("dev/base.lua"),
+                },
+                environment,
+                reply: Arc::new(Mutex::new(Some(sender))),
+            });
             let instance = drive(&mut fixture.app, &mut started).await.unwrap();
             fixture
                 .app
                 .world_mut()
-                .agent_transition(fixture.owner, AgentState::Running, None)
+                .fixture_state(fixture.owner, AgentState::Running, None)
                 .unwrap();
             let waiting = fixture
                 .app
                 .world()
-                .get_component::<AgentWaitSlot>(fixture.owner)
+                .get_component::<Agent>(fixture.owner)
                 .unwrap()
-                .0
-                .clone();
+                .wake_slot();
             tick_until(&mut fixture.app, || waiting.lock().unwrap().is_waiting()).await;
             let index = 0;
             fixture
@@ -1941,6 +2039,7 @@ async fn bundled_drivers_record_inference_error_messages_and_keep_running_while_
                     cancel: cancel.clone(),
                     stop_stream: Arc::new(|| {}),
                     task: Arc::new(InferenceTaskState::default()),
+                    source_alive: Arc::new(AtomicBool::new(true)),
                 },
                 tokio::spawn(async move {
                     waiting.await.unwrap();
@@ -2024,7 +2123,6 @@ async fn bundled_drivers_record_inference_error_messages_and_keep_running_while_
                 reply: Arc::new(Mutex::new(Some(sender))),
             });
             drive(&mut fixture.app, &mut stopped).await.unwrap();
-            close.close_and_join().await.unwrap();
         }
     }
 }
@@ -2032,10 +2130,7 @@ async fn bundled_drivers_record_inference_error_messages_and_keep_running_while_
 #[tokio::test]
 async fn callers_must_supply_their_own_address_before_any_mcl_side_effect() {
     let mut fixture = Fixture::new();
-    for (index, source_address) in ["", "agent:margatroid/test:dev", "entity:2:0"]
-        .into_iter()
-        .enumerate()
-    {
+    for (index, source_address) in ["", "/unit/test", "entity:2:0"].into_iter().enumerate() {
         let (sender, mut receiver) = oneshot::channel();
         fixture.app.world().send_event(MclCommand {
             id: format!("bad-source-{index}"),
@@ -2066,12 +2161,8 @@ async fn callers_must_supply_their_own_address_before_any_mcl_side_effect() {
 async fn one_executor_records_mcl_caller_addresses_and_message_types_with_content_and_payload() {
     let mut fixture = Fixture::new();
     for (source, address, text) in [
-        (
-            fixture.client,
-            "client:margatroid/frontend:dev",
-            "from client",
-        ),
-        (fixture.owner, "agent:margatroid/test:dev", "from driver"),
+        (fixture.client, "/clients/frontend", "from client"),
+        (fixture.owner, "/unit/test", "from driver"),
     ] {
         let payload = json!({"type":"user", "content":text});
         let mut reply = fixture.enqueue_as(
@@ -2829,17 +2920,22 @@ async fn block_snapshot_temporary_namespaces_isolate_vm_snapshots_and_permanent_
     assert!(second["snapshots"][0]["file_name"].is_null());
 
     let _ready_first_again = fixture.vm("snapshot-vm-first");
-    assert_eq!(snapshot_map(&mut fixture, "entry").await, first);
-    snapshot_command_unit(
-        &mut fixture,
-        "EFFECT block_restore ? ?",
-        vec![json!("entry"), json!(1)],
-    )
-    .await;
-    snapshot_assert_message(&mut fixture, "entry.conversation", "first VM snapshot").await;
+    assert!(matches!(
+        fixture
+            .command("EFFECT block_snapshots ?", vec![json!("entry")])
+            .await
+            .unwrap(),
+        MclValue::Error(_)
+    ));
+    assert_eq!(snapshot_map(&mut fixture, "session").await, permanent);
     let _ready_second_again = fixture.vm("snapshot-vm-second");
-    assert_eq!(snapshot_map(&mut fixture, "entry").await, second);
-    snapshot_assert_message(&mut fixture, "entry.conversation", "second VM snapshot").await;
+    assert!(matches!(
+        fixture
+            .command("EFFECT block_snapshots ?", vec![json!("entry")])
+            .await
+            .unwrap(),
+        MclValue::Error(_)
+    ));
 }
 
 #[tokio::test]
@@ -2940,37 +3036,8 @@ async fn recorded_message_sequence_survives_context_snapshot_and_restore() {
     assert_eq!(current, vec![forged]);
 }
 
-fn test_binding() -> tool_core::TaskSyncBinding {
-    tool_core::TaskSyncBinding::new(
-        client_core::Clients::default(),
-        std::sync::Arc::from([]),
-        |snapshot| {
-            serde_json::to_string(&snapshot)
-                .map(|text| std::sync::Arc::new(client_core::ClientFrame::Text(text)))
-                .map_err(|_| client_core::ClientPrepareError::EncodeFailed)
-        },
-    )
-}
 fn test_tasks() -> tool_core::ToolTasks {
-    let mut app = core_plugin::App::new();
-    let owner = app.world_mut().spawn();
-    tool_core::ToolTasks::new(
-        owner,
-        "agent:margatroid-test-dev/unit:dev".into(),
-        test_binding(),
-    )
-}
-
-fn test_agent_context() -> agent_core::AgentUpdateContext {
-    agent_core::AgentUpdateContext::new(|_, _, _| Vec::new(), |_, _| {})
-}
-
-fn test_workspace_context() -> workspace_core::WorkspaceUpdateContext {
-    workspace_core::WorkspaceUpdateContext::new(|_, _| {})
-}
-
-fn test_probe<T>() -> client_core::UpdateProbe<T> {
-    client_core::UpdateProbe::new(|_| {})
+    tool_core::ToolTasks::new()
 }
 
 #[tokio::test]
@@ -3113,6 +3180,7 @@ async fn finishing_a_turn_does_not_wait_for_or_remove_unbound_inference() {
             cancel: cancel.clone(),
             stop_stream: Arc::new(|| {}),
             task: Arc::new(InferenceTaskState::default()),
+            source_alive: Arc::new(AtomicBool::new(true)),
         },
         tokio::spawn(async move {
             rx.await.unwrap();
@@ -3238,4 +3306,88 @@ async fn active_nonlocking_request_id_remains_reserved_until_direct_reply() {
         drive(&mut fixture.app, &mut reused).await.unwrap(),
         MclValue::Config(_)
     ));
+}
+
+#[tokio::test]
+async fn sandbox_use_initializes_missing_components_and_still_requires_real_aliases() {
+    let mut fixture = Fixture::new();
+    let selections = Arc::new(Mutex::new(Vec::<Option<String>>::new()));
+    let captured = selections.clone();
+    fixture
+        .app
+        .world_mut()
+        .insert_resource(sandbox_resource_core::SandboxObserverFactory::new(
+            move |_| {
+                let captured = captured.clone();
+                (
+                    Arc::new(|_| {}),
+                    Arc::new(move |alias| captured.lock().unwrap().push(alias)),
+                )
+            },
+        ));
+    assert!(
+        !fixture
+            .app
+            .world()
+            .contains_component::<Sandboxes>(fixture.owner)
+    );
+    assert!(
+        !fixture
+            .app
+            .world()
+            .contains_component::<SelectedSandbox>(fixture.owner)
+    );
+    assert!(matches!(
+        fixture
+            .command("EFFECT sandbox_use ?", vec![json!([])])
+            .await
+            .unwrap(),
+        MclValue::Unit
+    ));
+    assert!(
+        fixture
+            .app
+            .world()
+            .get_component::<Sandboxes>(fixture.owner)
+            .unwrap()
+            .iter()
+            .next()
+            .is_none()
+    );
+    assert_eq!(
+        fixture
+            .app
+            .world()
+            .get_component::<SelectedSandbox>(fixture.owner)
+            .unwrap()
+            .alias,
+        None
+    );
+    assert_eq!(
+        fixture
+            .command("EFFECT sandbox_use ?", vec![json!(["missing"])])
+            .await
+            .error_kind(),
+        MclErrorKind::AliasMissing
+    );
+    let path = fixture.root.path().join("existing-policy.json");
+    std::fs::write(&path, "{}").unwrap();
+    fixture
+        .app
+        .world_mut()
+        .get_component_mut::<Sandboxes>(fixture.owner)
+        .unwrap()
+        .insert("actual".into(), path);
+    fixture
+        .command("EFFECT sandbox_use ?", vec![json!(["actual"])])
+        .await
+        .unwrap();
+    fixture
+        .command("EFFECT sandbox_use ?", vec![json!([])])
+        .await
+        .unwrap();
+    assert_eq!(
+        *selections.lock().unwrap(),
+        vec![Some("actual".into()), None]
+    );
 }

@@ -110,7 +110,10 @@ pub(super) async fn persist_log(
         "task_id": context.request.id, "call_id": context.request.call_id, "alias": context.request.alias,
         "resource_path": context.tool_entry.path, "stage": record.stage}).as_object().unwrap().clone());
     record.context_json = Some(Value::Object(metadata));
-    let storage = context.storage.clone();
+    let Some(storage) = context.storage.clone().filter(|s| s.is_open()) else {
+        tracing::event!(tracing::Level::INFO, level=?record.level, message=%record.message, "unbound tool diagnostic");
+        return Ok(());
+    };
     tokio::task::spawn_blocking(move || storage_core::append_agent_log(&storage, record))
         .await
         .map_err(|failure| {

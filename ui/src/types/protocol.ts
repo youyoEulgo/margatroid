@@ -4,7 +4,7 @@ export interface WorkspaceRef {
   project_root: string;
 }
 export type WorkspaceReference = WorkspaceRef | string;
-export type WorkspaceStatus = 'starting' | 'running' | 'error' | 'stopping';
+export type WorkspaceStatus = 'running' | 'deleting' | 'error';
 export interface WorkspaceInfo extends WorkspaceRef {
   definition_path: string;
   status: WorkspaceStatus;
@@ -81,7 +81,7 @@ export interface AgentState {
   workspace: WorkspaceRef;
   agent: string;
   creator?: AgentCreator | null;
-  status: 'starting' | 'running' | 'error' | 'stopping';
+  status: 'starting' | 'running' | 'closing';
   turn: string | null;
   sandbox: string | null;
   tools: string[];
@@ -136,12 +136,32 @@ export type MclValue =
   | { Error: MclError };
 export type MclCommandResult = { Ok: MclValue };
 export type AbortResult = { Ok: null } | { Err: ProtocolError };
+export interface AgentRegistration {
+  id: string;
+  parent_node: string;
+  node_name: string | null;
+  alias: string | null;
+  category: 'normal' | 'temporary' | 'archived';
+  tool_path: string;
+  tool_arguments: Record<string, unknown>;
+  previous_node_name: string | null;
+  previous_alias: string | null;
+}
 export interface WorkspaceSnapshot {
+  address: string;
+  alias: string;
+  project_root: string;
+  status: WorkspaceStatus;
+  agents: AgentRegistration[];
+}
+export interface ResourceItem {
+  address: string;
+  type: 'driver' | 'tool' | 'prompt' | 'sandbox';
+  scope: string;
+  name: string;
+  tag: string;
   path: string;
-  definition: WorkspaceDefinition;
-  status: 'inactive' | WorkspaceStatus;
-  address: string | null;
-  error: ProtocolError | null;
+  tool_path: string | null;
 }
 export interface AgentTool {
   alias: string;
@@ -168,7 +188,7 @@ export interface AgentInfo {
   address: string;
   workspace: string;
   creator: AgentCreator;
-  status: 'starting' | 'running' | 'error' | 'stopping';
+  status: 'starting' | 'running' | 'closing';
   tools: AgentTool[];
   sandboxes: AgentSandbox[];
   sandbox: string | null;
@@ -235,25 +255,29 @@ export type MclData =
 export type ClientMessage =
   | { type: 'connection.register'; id: string; message: { client_type: string; name?: string } }
   | {
-      type: 'workspace.req' | 'agent.req';
+      type: 'workspace.req' | 'agent.req' | 'resource.req';
       id: string;
-      message: Record<string, never>;
+      message:
+        | { type?: 'driver' | 'tool' | 'prompt' | 'sandbox'; scope?: string; name?: string }
+        | Record<string, never>;
     }
   | {
-      type: 'workspace.start' | 'workspace.restart' | 'workspace.stop' | 'workspace.delete';
+      type: 'workspace.create';
       id: string;
-      message: { address: string };
+      message: { address: string; alias: string; project_root: string };
     }
+  | { type: 'workspace.delete'; id: string; message: { address: string } }
+  | { type: 'workspace.rename'; id: string; message: { address: string; alias: string } }
+  | { type: 'agent.rename'; id: string; message: { address: string; alias: string } }
   | {
-      type: 'workspace.create' | 'workspace.update';
+      type: 'agent.start';
       id: string;
-      message: { address: string; definition: WorkspaceDefinition };
+      message:
+        | { mode: 'existing'; workspace: string; node_name: string }
+        | { mode: 'new'; workspace: string; tool_path: string; arguments: Record<string, unknown> };
     }
-  | {
-      type: 'workspace.rename';
-      id: string;
-      message: { address: string; new_address: string };
-    }
+  | { type: 'agent.stop'; id: string; message: { address: string } }
+  | { type: 'agent.archive'; id: string; message: { workspace: string; node_name: string } }
   | {
       type: 'agent.turn.req' | 'agent.task.req';
       id: string;
@@ -293,17 +317,20 @@ export type ServerMessage =
       { success: true; workspaces: WorkspaceSnapshot[] } | Failure
     ))
   | { type: 'workspace.sync'; workspaces: WorkspaceSnapshot[] }
+  | ({ type: 'resource.res'; id: string } & (
+      { success: true; resources: ResourceItem[] } | Failure
+    ))
   | ({ type: 'agent.res'; id: string } & ({ success: true; agents: AgentInfo[] } | Failure))
   | { type: 'agent.sync'; agents: AgentInfo[] }
   | ({
       type:
-        | 'workspace.start.result'
-        | 'workspace.stop.result'
-        | 'workspace.restart.result'
         | 'workspace.create.result'
-        | 'workspace.update.result'
-        | 'workspace.rename.result'
         | 'workspace.delete.result'
+        | 'workspace.rename.result'
+        | 'agent.rename.result'
+        | 'agent.start.result'
+        | 'agent.stop.result'
+        | 'agent.archive.result'
         | 'agent.turn.abort.result';
     } & Receipt)
   | ({ type: 'agent.turn.res'; id: string } & ({ success: true; state: TurnState } | Failure))
@@ -370,13 +397,34 @@ const definition = (v: unknown): boolean =>
   string(v.project_root) &&
   Array.isArray(v.agents) &&
   v.agents.every((a) => isRecord(a) && string(a.name) && string(a.driver) && string(a.home_root));
+const agentRegistration = (v: unknown): boolean =>
+  isRecord(v) &&
+  string(v.id) &&
+  string(v.parent_node) &&
+  (v.node_name === null || string(v.node_name)) &&
+  (v.alias === null || string(v.alias)) &&
+  ['normal', 'temporary', 'archived'].includes(String(v.category)) &&
+  string(v.tool_path) &&
+  isRecord(v.tool_arguments) &&
+  (v.previous_node_name === null || string(v.previous_node_name)) &&
+  (v.previous_alias === null || string(v.previous_alias));
 const workspaceSnapshot = (v: unknown): boolean =>
   isRecord(v) &&
+  string(v.address) &&
+  string(v.alias) &&
+  string(v.project_root) &&
+  ['running', 'deleting', 'error'].includes(String(v.status)) &&
+  Array.isArray(v.agents) &&
+  v.agents.every(agentRegistration);
+const resourceItem = (v: unknown): boolean =>
+  isRecord(v) &&
+  string(v.address) &&
+  ['driver', 'tool', 'prompt', 'sandbox'].includes(String(v.type)) &&
+  string(v.scope) &&
+  string(v.name) &&
+  string(v.tag) &&
   string(v.path) &&
-  definition(v.definition) &&
-  ['inactive', 'starting', 'running', 'error', 'stopping'].includes(String(v.status)) &&
-  nullableString(v.address) &&
-  errorOrNull(v.error);
+  (v.tool_path === null || string(v.tool_path));
 const uiPath = (v: unknown): boolean =>
   string(v) &&
   v.length > 0 &&
@@ -406,7 +454,7 @@ const agentInfo = (v: unknown): boolean =>
   isRecord(v.creator) &&
   target(v.creator) &&
   string(v.creator.task_id) &&
-  ['starting', 'running', 'error', 'stopping'].includes(String(v.status)) &&
+  ['starting', 'running', 'closing'].includes(String(v.status)) &&
   errorOrNull(v.error) &&
   Array.isArray(v.tools) &&
   v.tools.every(
@@ -579,6 +627,13 @@ export function parseServerMessage(raw: string): ServerMessage | null {
             ? v.client === undefined
             : isRecord(v.client) && string(v.client.address) && string(v.client.client_type));
         break;
+      case 'resource.res':
+        valid =
+          reply &&
+          (v.success === false
+            ? v.resources === undefined
+            : Array.isArray(v.resources) && v.resources.every(resourceItem));
+        break;
       case 'workspace.res':
         valid =
           reply &&
@@ -602,13 +657,13 @@ export function parseServerMessage(raw: string): ServerMessage | null {
       case 'agent.sync':
         valid = v.id === undefined && Array.isArray(v.agents) && v.agents.every(agentInfo);
         break;
-      case 'workspace.start.result':
-      case 'workspace.stop.result':
-      case 'workspace.restart.result':
       case 'workspace.create.result':
-      case 'workspace.update.result':
-      case 'workspace.rename.result':
       case 'workspace.delete.result':
+      case 'workspace.rename.result':
+      case 'agent.rename.result':
+      case 'agent.start.result':
+      case 'agent.stop.result':
+      case 'agent.archive.result':
       case 'agent.turn.abort.result':
         valid = reply;
         break;

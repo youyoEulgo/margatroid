@@ -278,7 +278,7 @@ StreamDelivery：前端出口，私有类型
     instance: String
     turn: Option<String>
     clients: Clients
-    source_alive: Arc<AtomicBool>--本次InferenceHandle持有的来源租约，不来自Agent字段；停止Agent、取消本生成或回合中止时关闭，正常生成结束不抹掉已入队full
+    source_alive: Arc<AtomicBool>--本次InferenceHandle持有的来源租约，不来自Agent字段；Agent关闭或实际来源替换时显式退休；普通取消与回合中止保留租约，允许同generation终态full
 InferenceLaunchOutput：已将监督任务交给共享句柄的启动事实
 InferenceLaunchError：InferenceError及原回复、共享句柄关联，实现From<AsyncTaskError>
 
@@ -382,13 +382,15 @@ InferenceHandle：本次推理句柄，公开类型
         行为：
             区分未启动、运行中、启动失败和真实join完成，不以slot为None推断完成。
     source_lease(&self) -> Arc<AtomicBool>
-        行为：返回同一生成的租约，plugin的stream及writer共享；取消入口先失效它再请求任务取消。
+        行为：返回同一生成的租约，plugin的stream及writer共享；普通cancel不失效租约，来源退休由retire_source单独执行。
     wait_finished(&self) -> Future<Output = Result<(), InferenceError>>
         行为：
             Agent退出流程等待真实监督任务结束或明确启动失败，不跨await持锁，不通过取走句柄使其他读者误判完成。
+    retire_source(&self)
+        行为：将source_alive置false，Agent关闭或实际来源替换时调用，使旧实例已入队帧失效；不代替实际取消和清理。
     cancel(&self)
         行为：
-            先将source_alive置false，再同步调用stop_stream冻结接受门并触发cancel，不直接abort监督任务。
+            同步调用stop_stream冻结接受门并触发cancel，不直接abort监督任务；保留source_alive，使正常回合中止仍可交付一次同generation终态full。
             回合中止仅对handle.turn==Some(被中止turn)调用；自由推理不受其他回合的start/finish/abort影响。Agent关闭及调用者取消仍取消并等待真实收口。
 
 InferenceParameters：单次模型参数

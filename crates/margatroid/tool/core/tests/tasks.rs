@@ -19,6 +19,7 @@ fn with_limits(
         reply,
         test_tasks().update_context(),
         Some("test-turn".into()),
+        test_finish(),
     )
     .unwrap()
 }
@@ -248,6 +249,7 @@ async fn return_delivers_original_association_and_keeps_background_task_alive() 
         reply,
         tasks.update_context(),
         Some("test-turn".into()),
+        test_finish(),
     )
     .unwrap();
     tasks.register("task".into(), task.clone()).unwrap();
@@ -280,6 +282,7 @@ fn abort_and_return_race_delivers_exactly_one_reply_and_cancels_only_abort_winne
             reply,
             tasks.update_context(),
             Some("test-turn".into()),
+            test_finish(),
         )
         .unwrap();
         tasks.register("task".into(), task.clone()).unwrap();
@@ -323,6 +326,7 @@ async fn abort_is_immediate_and_does_not_touch_returned_tasks() {
         pending_reply,
         tasks.update_context(),
         Some("test-turn".into()),
+        test_finish(),
     )
     .unwrap();
     tasks.register("pending".into(), pending.clone()).unwrap();
@@ -595,21 +599,11 @@ fn snapshots_preserve_script_cursor_replaced_and_skip_cleanup() {
     assert!(task.snapshot("z").is_none());
 }
 
-fn test_binding() -> tool_core::TaskSyncBinding {
-    tool_core::TaskSyncBinding::new(
-        client_core::Clients::default(),
-        std::sync::Arc::from([]),
-        |snapshot| {
-            serde_json::to_string(&snapshot)
-                .map(|text| std::sync::Arc::new(client_core::ClientFrame::Text(text)))
-                .map_err(|_| client_core::ClientPrepareError::EncodeFailed)
-        },
-    )
-}
 fn test_tasks() -> tool_core::ToolTasks {
-    let mut app = core_plugin::App::new();
-    let owner = app.world_mut().spawn();
-    tool_core::ToolTasks::new(owner, "agent:test/unit:dev".into(), test_binding())
+    tool_core::ToolTasks::new()
+}
+fn test_finish() -> tool_core::TaskFinish {
+    std::sync::Arc::new(|handle| Box::pin(async move { handle.wait_finished().await }))
 }
 
 fn handle_for(tasks: &ToolTasks) -> (ToolTaskHandle, tokio::sync::mpsc::UnboundedReceiver<Value>) {
@@ -621,6 +615,7 @@ fn handle_for(tasks: &ToolTasks) -> (ToolTaskHandle, tokio::sync::mpsc::Unbounde
         reply,
         tasks.update_context(),
         Some("test-turn".into()),
+        test_finish(),
     )
     .unwrap()
 }
@@ -642,6 +637,7 @@ async fn turn_abort_preserves_free_calls_and_other_turns() {
             tx,
             tasks.update_context(),
             turn,
+            test_finish(),
         )
         .unwrap();
         tasks.register(id.into(), handle.clone()).unwrap();

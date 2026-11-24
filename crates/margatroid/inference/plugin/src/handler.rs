@@ -235,7 +235,8 @@ pub(crate) fn handle_inference(world: &mut World, request: InferenceRequest) {
         let agent_instance = world
             .get_component::<Agent>(request.agent)
             .unwrap()
-            .source_lease();
+            .instance()
+            .to_owned();
         let clients = world.clients();
         let runtime = world
             .get_resource::<HttpRuntime>()
@@ -247,10 +248,7 @@ pub(crate) fn handle_inference(world: &mut World, request: InferenceRequest) {
             agent_address,
             agent_instance,
             clients,
-            world
-                .get_component::<Agent>(request.agent)
-                .unwrap()
-                .source_lease(),
+            Arc::new(std::sync::atomic::AtomicBool::new(true)),
             runtime.client.clone(),
             runtime.schedule.clone(),
         ))
@@ -287,7 +285,8 @@ pub(crate) fn handle_inference(world: &mut World, request: InferenceRequest) {
     let cleanup = InferenceCleanupFinished {
         agent,
         request_id: request_id.clone(),
-        source: agent_instance.clone(),
+        source: source_alive.clone(),
+        instance: agent_instance,
     };
     let context = InferenceContext {
         cleanup_notification: None,
@@ -296,7 +295,7 @@ pub(crate) fn handle_inference(world: &mut World, request: InferenceRequest) {
             agent: agent_address,
             turn: turn.clone(),
             clients,
-            source_alive,
+            source_alive: source_alive.clone(),
         },
         request,
         reply: Some(reply),
@@ -315,6 +314,7 @@ pub(crate) fn handle_inference(world: &mut World, request: InferenceRequest) {
         cancel,
         stop_stream,
         task: Arc::new(inference_core::InferenceTaskState::default()),
+        source_alive,
     };
     world
         .get_component_mut::<ActiveInference>(agent)
@@ -384,6 +384,7 @@ impl Drop for InferenceLaunchGuard {
         }
     }
 }
+#[allow(clippy::result_large_err)] // The owned fallback preserves the original reply on failed handoff.
 async fn launch_inference(
     mut launch: InferenceLaunchGuard,
 ) -> Result<InferenceLaunchOutput, InferenceLaunchError> {

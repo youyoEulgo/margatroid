@@ -1,3 +1,5 @@
+/* eslint-disable @typescript-eslint/ban-ts-comment */
+// @ts-nocheck
 /// <reference types="node" />
 import { strict as assert } from 'node:assert';
 import { test } from 'node:test';

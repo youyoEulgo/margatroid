@@ -30,8 +30,8 @@ Margatroid领域使用原生Axum装配及普通异步闭包。网络服务属于
 ```text
 build_app(options: ApplicationOptions) -> Result<App, ComposeError>
     行为：构造插件、读取启动配置、安装基础设施和业务插件，返回未进入运行循环的App。
-shutdown_application(app: &mut App) -> Future<Output = Result<(), ComposeError>>
-    行为：调用shutdown_app；统一使用任务句柄与实际关闭结果，不发送不存在的StopWorkspace事件，不调用DeleteWorkspace删除数据。
+shutdown_app(app: &mut App) -> Future<Output = Result<(), ComposeError>>
+    行为：调用handler::shutdown_application；保持World推进到已受理生产和真实清理完成，不使用删除事件代替退出。
 
 ```
 
@@ -49,7 +49,8 @@ resolve_tool_limits(config: &FileToolConfig) -> Result<ToolExecutionLimits, Conf
 
 install(app: &mut App, parts: ApplicationParts) -> Result<(), ComposeError>
     行为：先安装既有mecs Runtime、AsyncRuntime、Closure和日志设施，再安装Margatroid axum_plugin及各业务插件。
-        install先创建唯一Clients，只调用一次dto_plugin::sync_bindings(clients.clone())，取得共享视图衍生的通用绑定包；不分别创建孤立的AgentViews。
+        install先按options.data_root构造address::ResourceRoots并作为Resource插入World；不扫描目录或启动监控。
+        install先创建唯一Clients，只调用一次dto_plugin::sync_bindings(clients.clone())，取得共享AgentUpdateContext衍生的通用绑定包；WorkspaceSyncBinding与任务来源分别持有自己的视图。
         将唯一Clients、WorkspaceUpdateContext、AgentUpdateContext以及推理和沙箱core定义的ObserverFactory作为Resource插入同一World；网络探针和集合绑定状态由DTO plugin持有，其他plugin只取得core通用入口或装配方注入的回调，不依赖DTO或资源plugin的类型。
         ClientPlugin和DtoPlugin复用同一Clients Resource；WorkspaceUpdateContext与AgentUpdateContext保存core定义的通用回调，由DTO构造，安装前注入World。
         Tools::new()与ToolTasks::new()保持无参独立构造；绑定包内部生命周期回调在实际Installed时绑定工具/任务，ToolPlugin同时接收tasks通用回调用于非Agent对象，按集合身份幂等去重。
@@ -69,10 +70,14 @@ install(app: &mut App, parts: ApplicationParts) -> Result<(), ComposeError>
         不安装dto_sync_system，不创建WebSocketMessageSend或sync中转通道，不用活动帧轮询获得更新；业务命令、生命周期及中止控制的原事件链保持。
         现有API目录的sync类别保持；状态源按版本覆盖，有序记录和chunk不作状态覆盖，不因补充探针另增网络事件。
 
-shutdown_app(app: &mut App) -> Future<Output = Result<(), ComposeError>>
+shutdown_application(app: &mut App) -> Future<Output = Result<(), ComposeError>>--handler私有
     行为：关闭外部新业务受理并请求Axum停止；保持World和AsyncRuntime推进。
+        每轮继续推进World并发现新增Workspace，WorkspacePendingWork.is_idle且实体集合为空后才允许完成；异步初始化加载和已受理创建须先交接到实体，再按正常关闭清理。
         World阶段逐个Workspace关闭database及ToolTasks的受理门，克隆所有实际工具任务及在途操作等待；不删除Workspace或Agent持久目录。
-        World外等待任务finish、Agent创建交接和子Agent关闭，等database.wait_idle；任何失败保留实体与任务监督并返回错误，允许显式重试。
+        ApplicationDraining私有组件区分应用关停与已受理DeleteWorkspace；后者继续由原监督和reply完成，不被应用退出抢占。
+        每个Workspace从AsyncRuntimeHandle::spawn启动独立清理，顺序等待已取消的任务finish；无任务错误才等待database.wait_idle，经原oneshot返回database或错误。
+        shutdown_application每轮app.tick并try_recv pending；失败保留ApplicationDraining实体及任务能力返回ComposeError，后续显式调用可重试；不能丢弃已受理清理Future。
+        仅pending为空、Workspace实体集合为空、WorkspacePendingWork.is_idle及server.is_stopped同时满足才返回；其余循环异步等待1ms，不阻塞World。
         调用Workspace探针Closing失效来源，再关闭实际数据库连接；watch收到None后结束，monitor的真实退出由AxumWorkGuard跟踪，不借用World或数据库连接。
         World阶段移除已清理Workspace并notify(Removed)，最终Axum停止等待也覆盖这些monitor guard；正常退出不删除目录。普通退出不发DeleteWorkspace，不删除文件。
         等所有UI、配置、记录、模型监控和客户端prepare worker退出，再等待socket writer及AxumHandle真实停止，最后释放World运行设施。
@@ -92,8 +97,14 @@ ApplicationOptions：应用装配参数
 
 私有：
 ```text
-ApplicationParts：安装前材料--已构造插件、Axum监听参数、ingress配置及日志过滤
-    tool_limits: ToolExecutionLimits--已补齐默认值并校验的工具预算
+ApplicationParts：安装前材料
+    options: ApplicationOptions--规范化数据根及runner路径
+    config: config_plugin::ConfigPlugin
+    tool_limits: tool_core::ToolExecutionLimits
+    inference: inference_plugin::InferencePlugin
+    workspace: workspace_plugin::WorkspacePlugin
+ApplicationDraining：私有无字段Component
+    行为：应用退出受理时挂载；仅标记本应用退出拥有的Workspace收口，与用户DeleteWorkspace的Deleting区分。
 ```
 
 # error

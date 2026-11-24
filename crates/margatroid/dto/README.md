@@ -1,76 +1,56 @@
 # DTO
 
-本轮同步架构已实现，设计检查点为8e0ed9d，当前源码改动尚未提交。网络恢复45种既有消息，运行级日志直接输出tracing；运行进程需使用新构建。字段、函数和职责见[DESIGN.md](DESIGN.md)。
+DTO 提供统一 `/ws` 入口、HTTP 工作目录文件读取，以及48种 WebSocket 消息：19种请求、19种一次性响应、10种主动同步。字段和信息流见本领域 [DESIGN.md](DESIGN.md) 及独立 API 仓库。源码与测试通过不代表正在运行的 daemon 已更新。
 
-## 统一入口与共享槽位
+## 请求与回复
 
-同步分为异步领域监控和同步领域探针。二者都持有同一Clients Arc槽位，每次更新直接按当前注册身份与投递配置筛选ClientSender，入队到该连接原有的发送队列。Axum唯一writer实际发送WS；没有额外sync通道、统一分发循环、WebSocketMessageSend或每帧调查。
+客户端先注册连接，后续请求由 `DtoRequest` 交给 `dto_route_system`；回合中止使用 PRE_UPDATE 的 `AbortTurnControl`。领域请求沿原 oneshot 交给实际执行方，网络闭包等待原结果并返回专属 `res` 或 `result`，不另发网络完成事件。
 
-同步领域的探针是唯一写入口的固有职责。入口接收目标、具体修改以及必需的更新上下文；所有派生句柄、World扩展、Lua宿主和异常/清理路径都必须经过该入口，底层可变字段保持私有。只有成功且可观察状态变化才推进版本并同步。读取、拒绝、重复值和脚本游标变化不制造同步。
+Workspace 创建／删除分别调用对应生命周期事件；Agent 启动转为 `StartWorkspaceAgent::Existing/New`，最终调用 Driver 工具；关闭按 Agent 的父实体与任务 ID 找实际创建任务，归档等待真实清理及目录和数据库提交。网络层不准备 Agent 存储连接或直接装配实体。
 
-异步领域长期等待真正变化。Workspace定义与Driver UI使用notify磁盘监控，过滤无关/Access事件并合并连续构建写入；数据库记录使用确认COMMIT的watch高水位，不能用SQLite/WAL文件事件冒充事务成功。读取稳定数据后直接使用共享槽位发送，不回World取sender、不唤醒帧。
+## 资源查询
 
-## 九种sync来源
+`resource.req` 支持可选 `type`、`scope`、`name`，精确匹配并取交集。type 为 driver、tool、prompt 或 sandbox；不指定筛选时返回全部匹配条目及所有 tag，不补默认 scope 或 tag。
 
-| 接口 | 更新入口或监控 | 发布形式 |
+World 阶段只核对已注册连接并克隆装配方注入的 `address::ResourceRoots`。一次性异步闭包持有请求和 HTTP 生命周期 guard，在 blocking worker 调用 `address::query_resources`，结果由原 oneshot 返回，不需要额外 World 帧。查询不启动 Agent、执行脚本、写文件、建立缓存或监控，也不新增资源 sync。
+
+响应包含完整资源地址、四个地址段、解析后的绝对 `path` 和可空 `tool_path`。工具的 tool_path 等于 path；Driver 有工具清单时返回该实际启动入口；提示词、沙箱或无清单的 Driver 为 null。路径遵循文件资源解析规则，允许根内入口链接，越界链接不会进入结果；资源内容合法性仍由实际导入或执行时验证。
+
+没有匹配时成功返回空数组；目录读取、worker 或路径编码失败则返回错误并省略 resources，不以空数组伪装失败。每次查询读取当前文件系统，不提供隐式重放、模糊匹配或目录选择器。
+
+## 探针与共享槽位
+
+组件变化、集合修改及异步监控持有同一个 Clients Arc 槽位，按当前注册身份投递连接原有出站队列。只有实际变化推进版本，读取、重复值、失败事务及脚本输出游标变化不制造同步；不安装同步 System、不设置同步中转通道、不逐帧扫描。
+
+| 接口 | 实际来源 | 发布内容 |
 |---|---|---|
-| workspace.sync | 启动时建立定义磁盘监控；Workspace生命周期、成员、故障及定义缓存统一更新入口 | 最新完整列表 |
-| agent.sync | Agent生命周期/故障及Tools、沙箱、模型公共视图的统一更新入口 | 最新完整列表 |
-| agent.turn.sync | Agent的StartTurn、FinishTurn、AbortTurn统一写入口 | 当前turn或null |
-| agent.task.sync | Task的Register、Append、Replace、Return、AbortReturn、SetError、CompleteCleanup统一入口 | 最新完整活跃任务集合及保留窗口 |
-| agent.ui.sync | 安装Agent实际Driver来源时启动UI磁盘监控 | 稳定完整集合、缺失或错误 |
-| agent.log.sync | 实际AgentStorage成功提交监控 | 有序新增日志 |
-| agent.mcl.sync | 实际AgentStorage成功提交监控 | 有序新增审计 |
-| agent.message.chunk.sync | 推理接受门确认片段后的唯一流出口 | 有序片段 |
-| agent.message.full.sync | 推理终态出口；消息持久提交监控 | 完整生成结果或真实持久消息 |
+| workspace.sync | Workspace 生命周期探针与数据库确认提交 watch | 当前 Workspace 和 Agent 登记完整列表 |
+| agent.sync | Agent 状态、工具、沙箱、模型公共值的统一入口 | 运行 Agent 完整列表 |
+| agent.turn.sync | Agent 回合统一入口 | 当前 turn 或 null |
+| agent.task.sync | 任务登记、输出、Return、错误与真实清理 | 活跃集合及完整保留窗口 |
+| agent.ui.sync | 创建时明确提供的 UI 目录监控 | 稳定完整集合或错误 |
+| agent.log.sync | AgentStorage 确认提交的记录水位 | 有序新增日志 |
+| agent.mcl.sync | AgentStorage 确认提交的记录水位 | 有序新增审计 |
+| agent.message.chunk.sync | 推理累积器接受的文本变化 | 同一 generation 的累计文本快照 |
+| agent.message.full.sync | 推理终态或非生成消息真实提交 | 完整消息及对应关联 |
+| model.config.sync | 实际模型配置文件来源监控 | 完整配置原文及读取状态 |
 
-状态类只排入轻量StateKey，writer通过独立Arc读取能力取得最新快照；同对象尚未发送的更新可以合并。这样统一写入口不在每个小输出片段上复制和编码整个任务历史。具体读取及大编码可在有界在途blocking worker执行，每连接最多准备一个快照，期间仍处理入站请求及取消。这个pending表属于每连接原有队列，不是sync中转通道。
+状态来源只入队轻量 StateKey，具体快照读取和编码由受监督 worker 执行；同 key 更新可合并。chunk 和持久记录保持顺序，不做状态覆盖。注册初始化交付当前状态，不重放旧 chunk、日志或审计；完整列表查询不建立订阅。
 
-chunk和记录不采用状态覆盖。新连接获得当前状态源的初始化，不重放历史或旧chunk；开始于生成中途的连接可能从后续sequence加入，最终full及显式历史查询负责完整结果，不承诺缺失前缀重放。
+## 来源生命周期与失败
 
-## 归属、顺序与失败
+Agent 的 Installed 绑定集合观察，SourcesInstalled 绑定实际 UI、存储记录及设置文件来源。SourcesClosing 使旧来源失效，取消监控并等待在途 worker 全部真实退出。设置监控只做通用配置读取验证和诊断，不缓存正文或推断 Driver 字段，也不新增 wire 消息。
 
-注册成功把ClientIdentity原子发布到唯一槽位，World组件引用同一身份。断连先移除槽位，再做World清理；异步线程使用当前身份，不需要World借用。选出sender后连接恰好断开属于正常竞争，Closed不能恢复已结束连接。
+Workspace 初始化只扫描一次管理目录。数据库提交后发布 owned 登记快照，不能使用 SQLite/WAL 文件事件冒充提交，也没有旧 YAML 定义监控。只读资源查询是单次扫描，与上述长期监控独立。
 
-Task在共享更新门提交状态及revision；Agent/Workspace在World同步入口提交实际修改，DTO公共视图在短锁内更新owned值及版本，释放领域锁再通知ClientSender。来源epoch区分Agent重启或资源替换，完整Entity及epoch只作内部归属。准备快照时读取实际版本，旧来源或旧版本不覆盖新状态。读回调只捕获Weak共享数据，避免上下文和发布索引形成Arc环。
+来源 epoch、完整 Entity 和实际运行 instance 防止迟到结果覆盖新实例；读取闭包只持 Weak 能力，避免集合、来源和连接间强引用环。断连先移除唯一 Clients 身份，再做 World 清理；已受理业务继续由实际监督收口。
 
-按固定webui类别筛选：状态、持久记录和推理出口统一交付注册webui客户端；匹配按ConnectionId去重。慢连接队列满或关闭时取消连接，有序增量不静默丢帧。编码/32MiB预算失败明确诊断并关闭受影响同步连接；普通查询沿原res错误返回，不能无条件重试制造忙循环。
+未绑定 Agent 的诊断使用既有 tracing；绑定 Agent 的日志使用实际 AgentStorage 和提交探针。普通回合取消保留同 generation 终态 full，Agent 真正关闭才退休旧生成来源。推理生成消息后来持久化不再发送第二次 full。
 
-## 生命周期与接口边界
+## HTTP 与模型配置
 
-Workspace定义监控覆盖新增、修改、删除和原子替换。自动读取与显式reload、启动前reload使用同一全量校验和发布入口；改文件更新候选定义及workspace.sync，不自动启动、停止、重启或改写运行实例自有定义。列表同路径优先展示有效候选定义，来源删除时用运行实例自有定义补位，展示值不冒充运行实例已换用新执行材料。非法文件保留最后有效集合并报告现有可表达错误；源文件移除的运行实例继续展示并允许停止。
+GET/HEAD `/{workspace}/{path}` 使用编码后的完整 Workspace 节点路径，核对实际组件后读取其 project_root 内普通文件；拒绝越界、链接、目录和特殊文件，GET 返回字节流，HEAD 仅头部。此 HTTP 接口不计入48种 WebSocket 消息，也不建立文件监控。
 
-UI监控在实际Driver来源安装时建立，记录监控在真实AgentStorage初始化时建立，均跟随本次来源取消与真实join。查询只读取既有状态，不创建监控或订阅。重启先使旧来源失效，取消并等待旧worker结束，之后安装新来源；关停等待所有监控与在途快照准备真实结束。
+模型配置 req/res/sync 读取完整 TOML，update 校验后原子替换；实际推理开始时重新加载路由，不用启动快照掩盖损坏文件。来源监控只刷新安全公共投影；凭据不进入 Agent 模型视图。
 
-DTO移除dto_sync_system以及WebSocketMessageSend、ConnState、SyncState的旧投递/轮询结构；普通dto_route_system与abort_control_system保持。业务注册、生命周期、MCL及原oneshot链不改成同步消息；AgentException仍由Agent领域处理，并通过其统一更新入口发布故障。
-
-保持45种既有wire字段契约，不加入VM身份，不引入HTTP Driver资源接口。具体领域类型只依赖自身core及client_core能力；DTO提供具体编码函数，compose注入typed绑定，业务plugin之间不互相依赖。
-
-## 后续独立API调整
-
-共享槽位及同步入口已完成，本轮已实现agent.message.chunk.sync累计快照：上游片段先提交后端唯一累积器，再发送该时刻完整文本。目标删除delta，保留address/turn/generation/sequence，使用顶层必填content、reasoning字符串，空侧为""。前端按更高sequence整体替换，不再累加；full.sync保留原结构用于最后对比、校正和完成标记。推理、协议类型、机器Schema及可执行样例已对齐；旧49c7711构建及未修改的前端/参考客户端仍采用旧增量格式，客户端需另行适配。
-
-## 验证
-
-- 没有活动帧时，磁盘变化、Task输出、Return/错误/移除及turn变化仍可到达WS。
-- 无实际更新时没有ECS同步事件、帧唤醒、SQL调查或自循环。
-- 全部写能力通过唯一入口，无缺少同步上下文的生产构造、可选回调或直接可变字段旁路。
-- 后连接接收当前状态与后续更新，身份筛选实时；旧来源、迟到准备和注册初始化都不能回滚状态。
-- 大输出只有每连接每key一个待发送状态，不堆积多份完整窗口；具体增量按序、不覆盖。
-- 查询不消费脚本输出游标、不隐式订阅，UI修改不重启Lua VM，定义修改不热改运行实例。
-- 取消等待真实文件/SQL/快照worker退出；连接与来源退出后无Arc环、悬挂sender或重复清理。
-
-本轮680项Rust测试及严格workspace Clippy通过。真实WS回归覆盖无World帧的Task输出/Return/移除、Turn/资源更新、COMMIT记录、UI变化及Workspace磁盘新增/错误/恢复/删除。隔离release的四批持久Bash输出均在未查询前收到结束标记；大窗口仍以完整快照发送，高频输出的总编码/流量并未因此消除，不把队列合并等同于节流。
-
-未绑定Agent的日志直接通过既有tracing输出，遵守配置的日志级别和过滤器；不创建独立运行日志数据库、不强制保存运行级报告。绑定Agent的日志沿原AgentStorage及提交探针处理。
-
-显式可选turn契约：start_turn取得并返回当前turn，已有回合返回同一标识；推理和工具显式携带turn时严格校验，省略为None自由调用，不自动继承当前turn。自由调用仍受实际会话、权限、生命周期、取消及原有并发限制；Starting允许初始化所需自由调用，Error/Stopping拒绝。回合中止/收尾只作用于明确绑定该turn的请求，Agent关闭仍监督全部调用。详见本域DESIGN。运行中的旧进程仍需使用新构建。
-
-Workspace文件读取已实现：GET/HEAD /{workspace}/{*path}由本插件提供，workspace为单段编码的完整Workspace Address；通过原World闭包取得实际运行Workspace的project_root，再只读返回根内普通文件。遵守现有ingress和HTTP生命周期，不新增事件、System、注册表、数据库或磁盘目录。
-
-文件读取在Unix使用目录句柄及逐段no-follow打开，拒绝符号链接、目录和特殊文件；GET按已打开文件长度流式返回，HEAD只返对应头，未知类型为application/octet-stream。非Unix目标返回501，不使用不安全路径检查降级。现有45种WS消息不变，不需Agent、turn或WebSocket注册。
-
-推理终态中的assistant及error已由推理通道交付；带request_id的这两类消息写入历史后，记录监控只推进真实提交游标，不再发送第二条full。历史查询保留完整记录；不带推理request_id的独立error和compact历史仍按普通持久记录同步。
-
-models.toml现支持每次推理前有界重读并按id选择，文件损坏/删除或id缺失均失败，不回退启动快照。既有ModelRoutes只服务最近安全公共投影；有效文件改动刷新Agent安全model信息，无效文件清空投影。
-model.config.req/res/sync及model.config.update/update.result已实现，读取/同步原始TOML供编辑，修改完整校验后原子覆盖同一文件并保留权限；外部编辑/原子替换/删除也触发同一来源监控。无需Workspace、Agent或turn，不接收客户端文件路径，不新增持久目录/数据库或领域System/事件。接口遵循原注册、ingress、固定webui目标和id关联规则；前端源码未改。
+当前前端源码与参考客户端由前端开发者另行适配；此领域不修改前端，也不自动迁移用户目录。

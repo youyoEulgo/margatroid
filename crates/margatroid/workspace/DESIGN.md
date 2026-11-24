@@ -36,6 +36,26 @@ WorkspaceUpdateContext：Workspace组件生命周期探针，公开Resource
     notify(&self, world: &mut World, owner: Entity, kind: WorkspaceUpdateKind)
         行为：同步调用注入回调；组件安装、实际状态修改和实体移除均由plugin的统一入口调用，不发送同步事件。
     impl Resource + Clone
+
+WorkspacePendingWork：初始化加载及已受理创建的完成观察，独立Resource
+    shared: Arc<Mutex<WorkspacePendingState>>
+    begin_load(&self) -> Option<WorkspaceWorkToken>
+        行为：只受理一次初始化加载；首次提交前load_completed=false，重复请求返回None。
+    begin_create(&self) -> WorkspaceWorkToken
+        行为：登记一项已认领原reply的创建；不拥有World或数据库连接。
+    load_completed(&self) -> bool
+    is_idle(&self) -> bool
+        行为：加载已完成且创建计数为零时才为true；应用退出必须等待此条件并清理后续安装的Workspace。
+    impl Resource + Clone + Default
+WorkspacePendingState：core私有
+    load_started: bool
+    load_completed: bool
+    creates: usize
+WorkspaceWorkToken：core公开不透明句柄
+    shared: Arc<Mutex<WorkspacePendingState>>
+    load: bool
+    impl Drop
+        行为：load标记加载完成，否则减少创建计数；plugin必须在World确认前序StartWorkspace已处理后释放，不因异步任务完成就提前宣告安装完成。
 ```
 
 公开，定义于workspace_plugin：
@@ -44,7 +64,7 @@ WorkspacePlugin：工作区插件
     root: PathBuf--插件安装时提供的Workspace目录根路径
     impl Plugin for WorkspacePlugin
         build(self, app: &mut App)
-            行为：将root写入独立的WorkspaceConfig资源；在只执行一次的RuntimePlugin::STARTUP安装load_workspace_system，在RuntimePlugin::UPDATE安装create_workspace_system、start_workspace_system、delete_workspace_system、start_agent_system和archive_agent_system。
+            行为：校验root为绝对路径，写入独立的WorkspaceConfig及WorkspacePendingWork资源；在只执行一次的RuntimePlugin::STARTUP安装load_workspace_system，在RuntimePlugin::UPDATE安装create_workspace_system、start_workspace_system、delete_workspace_system、start_agent_system和archive_agent_system。
 ```
 
 # components
@@ -118,26 +138,28 @@ create_workspace_system(world: &mut World)
     接收闭包结果：None
     提交闭包：create_workspace(root: PathBuf, event: CreateWorkspace, events: EventSender) -> Future<Output = ()>
     产出事件：None
-    行为：收到CreateWorkspace后，取得WorkspaceConfig.root及事件发送器，使用AsyncRuntimeHandle::spawn提交create_workspace异步闭包。
+    行为：收到CreateWorkspace后认领唯一reply，取得WorkspaceConfig.root、事件发送器及begin_create操作token，使用AsyncRuntimeHandle::spawn提交create_workspace异步闭包。
+        闭包先发送StartWorkspace或原失败reply，再发送私有WorkspaceWorkCompleted携带token，不能直接在异步任务末尾释放token。
 
 load_workspace_system(world: &mut World)
     处理事件：None
     接收闭包结果：None
     提交闭包：load_workspaces(root: PathBuf, events: EventSender) -> Future<Output = ()>
     产出事件：None
-    行为：在初始化schedule执行一次，取得WorkspaceConfig.root及事件发送器，使用AsyncRuntimeHandle::spawn提交load_workspaces异步闭包。
+    行为：在初始化schedule执行一次，调用WorkspacePendingWork.begin_load取得token，取得root和发送器后提交load_workspaces异步闭包。
+        所有StartWorkspace发出后，无论扫描成功或失败都发送携带token的私有WorkspaceWorkCompleted。
 
 start_workspace_system(world: &mut World)
     处理事件：StartWorkspace
     接收闭包结果：None
     提交闭包：None
     产出事件：None
-    行为：接收StartWorkspace，将事件交给handle_start_workspace。
+    行为：先接收并处理全部StartWorkspace，再接收私有WorkspaceWorkCompleted，take并释放其中token，使完成观察晚于实体装配或明确失败；不新增公开业务事件或额外System。
 
 delete_workspace_system(world: &mut World)
     处理事件：DeleteWorkspace
-    接收闭包结果：Result<WorkspaceCleanupOutput, WorkspaceCleanupError>
-    提交闭包：Future<Output = Result<WorkspaceCleanupOutput, WorkspaceCleanupError>>
+    接收闭包结果：Result<WorkspaceCleanupResult, WorkspaceError>
+    提交闭包：Future<Output = Result<WorkspaceCleanupResult, WorkspaceError>>
     产出事件：None
     行为：接收DeleteWorkspace，校验目标Workspace及其管理目录，目录必须位于WorkspaceConfig.root内，且不包含project_root；仅Running或Error状态可受理删除，记录目录后将状态置为Deleting；Deleting状态拒绝重复删除；受理失败通过原reply直接回复错误。
         状态实际转为Deleting后，通过WorkspaceUpdateContext::notify(Changed)发布变化。
@@ -220,15 +242,16 @@ load_workspaces(root: PathBuf, events: EventSender) -> Future<Output = ()>
 
 私有：
 ```text
-WorkspaceCleanupOutput
-    workspace: Entity--实际完成任务清理的完整实体标识
-    directory: PathBuf--删除受理时已校验并记录的管理目录
-    reply: Arc<Mutex<Option<oneshot::Sender<Result<(), WorkspaceError>>>>>--来自DeleteWorkspace
+WorkspaceWorkCompleted：plugin私有Event
+    token: Arc<Mutex<Option<WorkspaceWorkToken>>>
+    行为：只承载已提交异步工作的World消费确认，不表示Agent或Workspace新增业务状态；克隆事件共享一次take能力。
 
-WorkspaceCleanupError
-    workspace: Entity
-    error: WorkspaceError
-    reply: Arc<Mutex<Option<oneshot::Sender<Result<(), WorkspaceError>>>>>--来自DeleteWorkspace
+WorkspaceCleanupResult
+    workspace: Entity--完整目标身份
+    directory: PathBuf--受理时记录并在结果阶段复核的管理目录
+    reply: Arc<Mutex<Option<oneshot::Sender<Result<(), WorkspaceError>>>>>
+    result: Result<(), WorkspaceError>--清理成功或实际失败，均保留原目标和reply
+
 ```
 
 # types pub

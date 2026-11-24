@@ -1,11 +1,15 @@
 mod handler;
 mod probes;
 mod workspaces;
-pub use probes::{agent_sync_context, model_sync_binding, resource_sync_bindings};
+pub use probes::{
+    ToolObserverFactory, agent_sync_context, model_sync_binding, resource_sync_bindings,
+    sandbox_sync_binding,
+};
 pub use workspaces::{WorkspaceSyncBinding, workspace_sync_binding};
 mod monitor;
 mod projection;
 mod records;
+mod settings;
 mod system;
 mod types;
 mod ui;
@@ -38,14 +42,22 @@ impl Plugin for DtoPlugin {
             .expect("AxumPlugin required")
             .lifetime();
         if !app.world().contains_resource::<WorkspaceSyncBinding>() {
-            let binding = workspace_sync_binding(
+            let bindings = sync_bindings(
                 app.world()
                     .get_resource::<client_core::Clients>()
                     .unwrap()
                     .clone(),
             );
-            app.world_mut().insert_resource(binding.updates.clone());
-            app.world_mut().insert_resource(binding);
+            app.world_mut().insert_resource(bindings.workspace_binding);
+            app.world_mut().insert_resource(bindings.workspace);
+            if !app
+                .world()
+                .contains_resource::<agent_core::AgentUpdateContext>()
+            {
+                app.world_mut().insert_resource(bindings.agent);
+            }
+            app.world_mut()
+                .insert_resource(TaskSyncInstaller(bindings.tasks));
         }
         let agent_context = probes::get_or_create_agent_context(app.world_mut());
         probes::install_resource_bindings(app.world_mut(), agent_context);
@@ -90,34 +102,121 @@ impl Plugin for DtoPlugin {
     }
 }
 
-pub fn task_sync_binding(clients: client_core::Clients) -> tool_core::TaskSyncBinding {
-    use std::sync::Arc;
-    let targets = sync_selectors();
-    tool_core::TaskSyncBinding::new(clients, targets, |snapshot| {
-        let tasks = snapshot
-            .tasks
-            .into_iter()
-            .map(|task| margatroid_protocol::AgentTaskDto {
-                task_id: task.task_id,
-                call_id: task.call_id,
-                alias: task.alias,
-                returned: task.returned,
-                output: task.output,
-                error: task.error.map(|error| {
-                    margatroid_protocol::ProtocolErrorDto::new(
-                        format!("{:?}", error.kind),
-                        error.message,
-                    )
-                }),
-            })
-            .collect();
-        let message = margatroid_protocol::ServerMessage::AgentTaskSync {
-            address: snapshot.address,
-            tasks,
-        };
-        margatroid_protocol::encode_server_message(&message)
-            .map(|text| Arc::new(client_core::ClientFrame::Text(text)))
-            .map_err(|_| client_core::ClientPrepareError::TooLarge)
+pub type TaskObserverBinder =
+    std::sync::Arc<dyn Fn(core_plugin::Entity, String, &tool_core::ToolTasks) + Send + Sync>;
+#[derive(Clone)]
+pub struct TaskSyncInstaller(pub TaskObserverBinder);
+impl core_plugin::Resource for TaskSyncInstaller {}
+pub struct DtoSyncBindings {
+    pub agent: agent_core::AgentUpdateContext,
+    pub workspace: workspace_core::WorkspaceUpdateContext,
+    pub workspace_binding: WorkspaceSyncBinding,
+    pub tasks: TaskObserverBinder,
+    pub tools: ToolObserverFactory,
+    pub models: inference_core::ModelObserverFactory,
+    pub sandboxes: sandbox_resource_core::SandboxObserverFactory,
+}
+pub fn sync_bindings(clients: client_core::Clients) -> DtoSyncBindings {
+    let agent = agent_sync_context(clients.clone());
+    let workspace_binding = workspace_sync_binding(clients.clone());
+    DtoSyncBindings {
+        workspace: workspace_binding.updates.clone(),
+        tools: resource_sync_bindings(agent.clone()),
+        models: model_sync_binding(agent.clone()),
+        sandboxes: sandbox_sync_binding(agent.clone()),
+        agent,
+        workspace_binding,
+        tasks: task_sync_binding(clients),
+    }
+}
+pub fn task_sync_binding(clients: client_core::Clients) -> TaskObserverBinder {
+    use std::sync::{Arc, Mutex};
+    let sources = Arc::new(Mutex::new(std::collections::BTreeMap::<
+        core_plugin::Entity,
+        (
+            tool_core::TaskUpdateContext,
+            client_core::SyncContext<tool_core::AgentTaskSnapshot>,
+        ),
+    >::new()));
+    Arc::new(move |owner, address, tasks| {
+        let mut all = sources.lock().unwrap_or_else(|e| e.into_inner());
+        if all
+            .get(&owner)
+            .is_some_and(|(collection, _)| collection.same_collection(&tasks.update_context()))
+        {
+            return;
+        }
+        if let Some((_, previous)) = all.remove(&owner) {
+            previous.close();
+        }
+        let source = tasks.snapshot_source();
+        let target = address.clone();
+        let sync = client_core::SyncContext::new(
+            clients.clone(),
+            client_core::SyncKey {
+                topic: "agent.task.sync".into(),
+                object: address,
+            },
+            sync_selectors(),
+            move || {
+                let (version, tasks) =
+                    source().ok_or(client_core::ClientPrepareError::SourceClosed)?;
+                Ok((
+                    version,
+                    tool_core::AgentTaskSnapshot {
+                        address: target.clone(),
+                        tasks,
+                    },
+                ))
+            },
+            |snapshot: tool_core::AgentTaskSnapshot| {
+                let tasks = snapshot
+                    .tasks
+                    .into_iter()
+                    .map(|t| margatroid_protocol::AgentTaskDto {
+                        task_id: t.task_id,
+                        call_id: t.call_id,
+                        alias: t.alias,
+                        returned: t.returned,
+                        output: t.output,
+                        error: t.error.map(|e| {
+                            margatroid_protocol::ProtocolErrorDto::new(
+                                format!("{:?}", e.kind),
+                                e.message,
+                            )
+                        }),
+                    })
+                    .collect();
+                margatroid_protocol::encode_server_message(
+                    &margatroid_protocol::ServerMessage::AgentTaskSync {
+                        address: snapshot.address,
+                        tasks,
+                    },
+                )
+                .map(|text| Arc::new(client_core::ClientFrame::Text(text)))
+                .map_err(|_| client_core::ClientPrepareError::TooLarge)
+            },
+        );
+        let changed = sync.clone();
+        let retired = sync.clone();
+        let weak = Arc::downgrade(&sources);
+        let identity = tasks.update_context();
+        tasks.observe(
+            Arc::new(move |version| changed.publish(version)),
+            Box::new(move || {
+                retired.close();
+                if let Some(sources) = weak.upgrade() {
+                    let mut sources = sources.lock().unwrap_or_else(|e| e.into_inner());
+                    if sources
+                        .get(&owner)
+                        .is_some_and(|(collection, _)| collection.same_collection(&identity))
+                    {
+                        sources.remove(&owner);
+                    }
+                }
+            }),
+        );
+        all.insert(owner, (tasks.update_context(), sync));
     })
 }
 

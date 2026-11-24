@@ -1,5 +1,8 @@
 #![cfg(target_os = "linux")]
 
+#[path = "support/lifecycle.rs"]
+mod test_support;
+
 #[path = "support/storage.rs"]
 mod storage_fixture;
 
@@ -34,31 +37,25 @@ impl Fixture {
             .add_plugin(AsyncRuntimePlugin)
             .add_plugin(ClosurePlugin)
             .add_closure_system(RuntimePlugin::UPDATE)
-            .add_plugin(
-                ToolPlugin::new(crate::test_binding())
-                    .with_runner_path(env!("CARGO_BIN_EXE_tool_runner")),
-            );
+            .add_plugin(ToolPlugin::new().with_runner_path(env!("CARGO_BIN_EXE_tool_runner")));
         let workspace = app.world_mut().spawn();
         app.world_mut().insert_component(
             workspace,
-            address::Address::new("workspace:test/unit:dev").unwrap(),
+            address::Address::new("/workspace-test-unit-dev").unwrap(),
         );
         app.world_mut().insert_component(
             workspace,
-            workspace_core::Workspace::new(
+            test_support::workspace(
                 "diagnostics".into(),
                 root.path().join("workspace.yaml"),
                 root.path().to_owned(),
                 WorkspaceState::Running,
-                Default::default(),
-                None,
-                crate::test_workspace_context(),
             ),
         );
         let agent = app.world_mut().spawn();
         app.world_mut().insert_component(
             agent,
-            agent_core::Agent::new(
+            test_support::agent(
                 "diagnostic-agent".into(),
                 workspace,
                 AgentState::Running,
@@ -67,8 +64,11 @@ impl Fixture {
             ),
         );
         storage_fixture::mount(app.world_mut(), agent, root.path());
-        app.world_mut()
-            .insert_component(agent, Tools::new(crate::test_probe()));
+        app.world_mut().insert_component(
+            agent,
+            address::Address::new("/demo/diagnostic-agent").unwrap(),
+        );
+        app.world_mut().insert_component(agent, Tools::new());
         let (sender, mut receiver) = oneshot::channel();
         app.world().emit_event(InitToolTasks {
             agent,
@@ -111,7 +111,7 @@ impl Fixture {
             )
             .unwrap();
         let (sender, receiver) = oneshot::channel();
-        self.app.world().emit_event(ToolExecuteRequest {
+        self.app.world().emit_event(ToolExecuteRequest::Registered {
             id: alias.into(),
             agent: self.agent,
             turn: Some("diagnostic-turn".into()),
@@ -318,12 +318,12 @@ fn tool_rejects_driver_namespace_and_removed_task_aliases_with_tool_source_logs(
 }
 
 #[test]
-fn missing_agent_storage_rejects_tool_before_registering_a_task() {
+fn tool_without_agent_storage_executes_and_drains() {
     let mut f = Fixture::new();
     f.app.world_mut().remove_component::<AgentStorage>(f.agent);
-    let reply = f.execute("missing-storage", "function configure() return {timeout_ms=30000} end function execute() margatroid.task:return_result('unsafe') end");
-    let failure = f.response(reply).unwrap_err();
-    assert!(failure.message.contains("storage") || failure.message.contains("Storage"));
+    let reply = f.execute("missing-storage", "function configure() return {timeout_ms=30000} end function execute() margatroid.task:return_result('ready') end");
+    assert_eq!(f.response(reply).unwrap().content, "ready");
+    f.drained();
     assert!(f
         .app
         .world()
@@ -333,26 +333,6 @@ fn missing_agent_storage_rejects_tool_before_registering_a_task() {
         .is_empty());
 }
 
-fn test_binding() -> tool_core::TaskSyncBinding {
-    tool_core::TaskSyncBinding::new(
-        client_core::Clients::default(),
-        std::sync::Arc::from([]),
-        |snapshot| {
-            serde_json::to_string(&snapshot)
-                .map(|text| std::sync::Arc::new(client_core::ClientFrame::Text(text)))
-                .map_err(|_| client_core::ClientPrepareError::EncodeFailed)
-        },
-    )
-}
-
 fn test_agent_context() -> agent_core::AgentUpdateContext {
     agent_core::AgentUpdateContext::new(|_, _, _| Vec::new(), |_, _| {})
-}
-
-fn test_workspace_context() -> workspace_core::WorkspaceUpdateContext {
-    workspace_core::WorkspaceUpdateContext::new(|_, _| {})
-}
-
-fn test_probe<T>() -> client_core::UpdateProbe<T> {
-    client_core::UpdateProbe::new(|_| {})
 }

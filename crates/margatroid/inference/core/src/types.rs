@@ -35,6 +35,7 @@ pub struct InferenceHandle {
     pub request_id: String,
     pub turn: Option<String>,
     pub cancel: CancellationToken,
+    pub source_alive: Arc<std::sync::atomic::AtomicBool>,
     pub stop_stream: Arc<dyn Fn() + Send + Sync>,
     pub task: Arc<InferenceTaskState>,
 }
@@ -68,6 +69,15 @@ impl InferenceHandle {
         drop(state);
         self.task.changed.notify_waiters();
     }
+    pub fn source_lease(&self) -> Arc<std::sync::atomic::AtomicBool> {
+        self.source_alive.clone()
+    }
+    /// Retire an Agent instance or replaced source, including already queued frames.
+    pub fn retire_source(&self) {
+        self.source_alive
+            .store(false, std::sync::atomic::Ordering::Release);
+    }
+    /// Stop accepting text while preserving the same generation's terminal reply.
     pub fn cancel(&self) {
         (self.stop_stream)();
         self.cancel.cancel();
@@ -120,7 +130,7 @@ impl InferenceHandle {
                         }
                     }
                     InferenceTaskStatus::Finished(result) => {
-                        return Poll::Ready(Some(result.clone()))
+                        return Poll::Ready(Some(result.clone()));
                     }
                 }
                 if changed.as_mut().poll(cx).is_ready() {

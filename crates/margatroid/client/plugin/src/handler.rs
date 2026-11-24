@@ -73,8 +73,11 @@ fn register_client(
     if !valid_client_name(name) {
         return Err(ClientError::InvalidName);
     }
-    let address = Address::new(&format!("client:{}/{name}:{fallback}", request.client_type))
-        .map_err(|_| ClientError::AddressConflict)?;
+    let address = Address::new(&format!(
+        "/clients/{}/{name}/{fallback}",
+        request.client_type
+    ))
+    .map_err(|_| ClientError::AddressConflict)?;
     if world
         .address_exists(address.as_str())
         .map_err(|_| ClientError::AddressConflict)?

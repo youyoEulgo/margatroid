@@ -132,6 +132,7 @@ handle_start_driver_lua_vm(world: &mut World, request: StartDriverLuaVm)
         运行线程归本次VM，不由Workspace组件持有；日志使用注入回调，不在core引用AgentStorage。
         安装新实例和VM通知组件，由lua_runtime_plugin的VmThread::spawn创建受监督线程及其当前线程Tokio Runtime/LocalSet，运行本次run_driver；将共享线程控制存入VmThreads，再提交start_vm启动等待。
         task、workspace、日志、Agent创建等能力均来自LuaServices及宿主回调；本plugin不依赖workspace_core的专属执行线程，不重复创建工具任务。
+        受理时只从真实owner.ToolTasks按实际execution_id匹配当前实例，成功则克隆为RunContext.execution_task；无匹配则为None，不因HostKind、Lua参数或owner拥有其他任务就推定任务归属。
         提交失败撤销本次安装并回复错误，不修改启动事件字段
 
 handle_start_result(world: &mut World, result: Result<StartOutput, StartError>)
@@ -161,10 +162,11 @@ stop_vm(context: StopContext) -> Future<Output = Result<StopOutput, StopError>>
 
 run_driver(context: RunContext) -> LocalFuture
     行为：沿本次VM线程运行execute_lua，捕获诊断；日志只用宿主注入回调，有实际Agent则沿存储提交，无Agent则tracing，不创建独立日志库。
-        执行完成后等待process registry真实cleanup，再经LuaServices.execution_finished关闭实际任务scope并等待创建的全部Agent实际移除，成功后经World complete_cleanup移除任务。Agent清理由公共服务登记的关闭句柄监督完成，不发送StopAgent关闭自身所属任务；独立VM不拥有Agent领域清理逻辑。
-        进程真实清理后通过LuaServices.execution_finished交付本次执行诊断，等待在途创建交接、绑定Agent真实停止及日志提交，再完成ended及DriverLuaVmExited；服务清理失败设置cleanup_result/ended错误且不确认task清理完成；尚未交接启动则短任务正常结束确认成功、失败确认原错误。
+        执行完成后等待process registry真实cleanup；仅RunContext.execution_task为Some时调用LuaServices.execution_finished，等待本次实际任务的创建交接和子Agent关闭。None时独立VM只关闭自身资源、发ended并join线程，不触及owner的其他任务。Agent清理由公共服务登记的关闭句柄监督完成，不发送StopAgent关闭自身所属任务；独立VM不拥有Agent领域清理逻辑。
+        具有实际任务能力时进程清理后通过LuaServices.execution_finished交付执行诊断，等待创建交接、绑定Agent真实停止及日志提交，再完成ended及DriverLuaVmExited；服务清理失败设置cleanup_result/ended错误且不确认task清理完成；尚未交接启动则短任务正常结束确认成功、失败确认原错误。
 execute_lua(context, environment, logger, processes) -> Future<Output = Result<(), LuaRuntimeError>>
     行为：调用共享create_environment，安装取消hook后复用configuration_globals/load_program；configure返回ToolConfiguration，纯阶段能力未启用。
+        从宿主环境execution_context.arguments固定取得原始参数，省略时为空对象；configure与execute均接收该参数及本次可信context，不硬传nil。
         enable_execution加载同一标准库并恢复保存全局，Margatroid.enable安装相同公共方法；读取execute并异步调用，配置超时同时约束CPU及等待。
         source为实际执行Entity/执行instance，目标由方法显式指定；context含workspace/resource_dir/task_id/task_address和独立arguments副本，不预造Agent，不从Lua副本判定Driver身份。
         公共服务回调通过LuaServices，文件/data/text/process沿既有共享安装器；全程不按HostKind裁剪API。
@@ -183,22 +185,23 @@ DriverLogger：私有诊断上下文--可选storage、LuaServices、真实LuaExe
     append：已有存储沿blocking提交，无Agent或来源已关闭时沿既有tracing输出，不维护runtime_logs持久库；故障通过execution_finished完成对应任务诊断。
 VmThreads：lua_runtime_plugin私有Resource
     entries: BTreeMap<String, VmThread>--按start_id定位，取用时复核完整owner Entity
-VmJoinState：Clone
-    Idle | Joining | Joined(Result<(), LuaRuntimeError>)
-VmThread：lua_runtime_plugin私有共享线程监督
-    join: Arc<Mutex<Option<std::thread::JoinHandle<()>>>>
-    joined: Arc<watch::Sender<VmJoinState>>
-    runtime: AsyncRuntimeHandle
-    cancel: CancellationToken
-    done: watch::Receiver<Option<Result<(), LuaRuntimeError>>>
-    spawn(context: RunContext, runtime: AsyncRuntimeHandle) -> Result<Self, LuaRuntimeError>
-        行为：std::thread::Builder创建一次执行线程，线程内构造当前线程Runtime和LocalSet运行run_driver，所有退出路径发送done；线程创建失败返回错误。
+VmThread：lua_runtime_plugin私有共享线程控制
+    joined: watch::Receiver<Option<Result<(), LuaRuntimeError>>>--独立join监督的真实完成结果
+    start_settled: Arc<AtomicBool>--启动reply已交接，允许自然退出自动收口
+    exited: Arc<AtomicBool>--实际退出通知已抵达
+    spawn(context: RunContext, runtime: &AsyncRuntimeHandle) -> Result<Self, LuaRuntimeError>
+        行为：创建本次std::thread，线程内建立当前线程Runtime和LocalSet运行run_driver；ThreadDone在所有退出路径通知真实线程执行已返回。
+            立即通过runtime.spawn登记独立join监督，监督等待ThreadDone后在blocking worker执行JoinHandle::join，并发布joined最终结果；不克隆AsyncRuntimeHandle，不让等待者拥有JoinHandle。
     wait_finished(&self) -> Future<Output = Result<(), LuaRuntimeError>>
-        行为：先等待done，再在共享joined状态中裁决唯一受监督blocking join；其他等待者等同一Joined结果，不能因join句柄已取走而提前成功。
-        取消等待者不取消独立join监督，线程真实完成后才允许移除VM组件，不在World线程join。
+        行为：克隆joined接收端等待最终结果；多个等待者共享同一真实join结果，等待者取消不取消join监督，World线程不join。
     impl Clone
-        行为：只共享同一线程控制和完成状态，不启动新线程。
+        行为：只共享本线程的joined观察与启动/退出标记，不创建新线程。
+ThreadDone：plugin私有线程退出guard
+    done: watch::Sender<bool>
+    impl Drop
+        行为：线程执行返回或panic时将done置true，独立join监督随后取得真实线程结果。
 RunContext：执行上下文--instance、program、environment、wake、ready发送端存储、ended发送端、cancel、RuntimeEventSender、workspace、LuaServices及宿主注入的日志/任务回调
+    execution_task: Option<tool_core::ToolTaskHandle>--plugin捕获并校验的本次真实任务能力，不由Lua提供
 StartOutput：启动成功载荷--instance、原reply
 StartError：启动失败载荷--instance、原reply、LuaRuntimeError、cleanup_completed
 StopOutput：停止成功载荷--instance、可选原reply

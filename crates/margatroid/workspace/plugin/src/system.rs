@@ -1,50 +1,76 @@
-use crate::{handler, types::*};
+use crate::handler;
 use core_plugin::World;
-use workspace_core::{RestartWorkspace, StartWorkspace, StopWorkspace};
-
-pub(crate) fn stop_workspace_system(world: &mut World) {
-    let results: Vec<_> = world
-        .event_reader::<Result<StopOutput, StopError>>()
+use workspace_core::*;
+pub(crate) fn load_workspace_system(w: &mut World) {
+    handler::load_workspaces(w);
+}
+pub(crate) fn create_workspace_system(w: &mut World) {
+    let req: Vec<_> = w
+        .event_reader::<CreateWorkspace>()
         .into_iter()
         .cloned()
         .collect();
-    let requests: Vec<_> = world
-        .event_reader::<StopWorkspace>()
-        .into_iter()
-        .cloned()
-        .collect();
-    for result in results {
-        handler::handle_stop_result(world, result);
-    }
-    for request in requests {
-        handler::handle_stop_workspace(world, request);
+    for r in req {
+        handler::create_workspace(w, r);
     }
 }
-pub(crate) fn restart_workspace_system(world: &mut World) {
-    let requests: Vec<_> = world
-        .event_reader::<RestartWorkspace>()
-        .into_iter()
-        .cloned()
-        .collect();
-    for request in requests {
-        handler::handle_restart_workspace(world, request);
-    }
-}
-pub(crate) fn start_workspace_system(world: &mut World) {
-    let results: Vec<_> = world
-        .event_reader::<Result<StartOutput, StartError>>()
-        .into_iter()
-        .cloned()
-        .collect();
-    let requests: Vec<_> = world
+pub(crate) fn start_workspace_system(w: &mut World) {
+    let req: Vec<_> = w
         .event_reader::<StartWorkspace>()
         .into_iter()
         .cloned()
         .collect();
-    for result in results {
-        handler::handle_start_result(world, result);
+    for r in req {
+        handler::start_workspace(w, r);
     }
-    for request in requests {
-        handler::handle_start_workspace(world, request);
+    let completed: Vec<_> = w
+        .event_reader::<crate::types::WorkspaceWorkCompleted>()
+        .into_iter()
+        .cloned()
+        .collect();
+    for completion in completed {
+        completion
+            .token
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+    }
+}
+pub(crate) fn delete_workspace_system(w: &mut World) {
+    let results: Vec<_> = w
+        .event_reader::<Result<crate::types::WorkspaceCleanupResult, WorkspaceError>>()
+        .into_iter()
+        .cloned()
+        .collect();
+    for r in results.into_iter().flatten() {
+        handler::delete_result(w, r);
+    }
+    let req: Vec<_> = w
+        .event_reader::<DeleteWorkspace>()
+        .into_iter()
+        .cloned()
+        .collect();
+    for r in req {
+        handler::delete_workspace(w, r);
+    }
+}
+pub(crate) fn start_agent_system(w: &mut World) {
+    let req: Vec<_> = w
+        .event_reader::<StartWorkspaceAgent<tool_core::ToolExecuteResponse, tool_core::ToolError>>()
+        .into_iter()
+        .cloned()
+        .collect();
+    for r in req {
+        handler::start_agent(w, r);
+    }
+}
+pub(crate) fn archive_agent_system(w: &mut World) {
+    let req: Vec<_> = w
+        .event_reader::<ArchiveAgent>()
+        .into_iter()
+        .cloned()
+        .collect();
+    for r in req {
+        handler::archive_agent(w, r);
     }
 }

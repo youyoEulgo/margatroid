@@ -1,5 +1,5 @@
 use crate::{handler, projection, types::*};
-use agent_core::{Agent, AgentResources};
+use agent_core::Agent;
 use agent_driver_core::{
     DriverUiBundle, DriverUiError, DriverUiState, open_driver_ui_watch, run_driver_ui_monitor,
 };
@@ -130,13 +130,9 @@ pub(crate) fn query_agent_ui(world: &World, object: Box<dyn Any + Send>) {
         handler::client(world, request.ticket.connection)?;
         let entity = handler::agent(world, &request.input.address)
             .map_err(|_| ProtocolErrorDto::new("AgentMissing", "Agent is not active"))?;
-        let source = world
-            .get_component::<AgentResources>(entity)
-            .ok_or_else(|| ui_error(DriverUiError::Initializing))?;
         let slot = world
             .get_resource::<SyncObservations>()
             .and_then(|state| state.ui.get(&entity))
-            .filter(|slot| slot.ui_path == source.parameters.ui_path)
             .ok_or_else(|| ui_error(DriverUiError::Initializing))?;
         match slot.watch.state() {
             DriverUiState::Initializing => Err(ui_error(DriverUiError::Initializing)),
@@ -149,18 +145,14 @@ pub(crate) fn query_agent_ui(world: &World, object: Box<dyn Any + Send>) {
 pub(crate) fn refresh_ui_watch(
     world: &mut World,
     entity: core_plugin::Entity,
+    ui_path: Option<std::path::PathBuf>,
 ) -> Vec<agent_core::AgentObservationWait> {
     let state = world.get_resource::<DtoState>().unwrap().clone();
     let desired = if state.lifetime.is_cancelled() || world.get_component::<Agent>(entity).is_none()
     {
         None
     } else {
-        world
-            .get_component::<AgentResources>(entity)
-            .and_then(|source| {
-                projection::address(world, entity)
-                    .map(|address| (source.parameters.ui_path.clone(), address))
-            })
+        ui_path.and_then(|path| projection::address(world, entity).map(|address| (path, address)))
     };
     let same = world
         .get_resource::<SyncObservations>()

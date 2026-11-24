@@ -30,7 +30,7 @@ valid_request_id(id: &str) -> bool
     行为：检查非空白、无控制字符及512字节上限。
 
 validate_server_value(value: &serde_json::Value) -> Result<(), ProtocolError>
-    行为：检查当前目录46种严格wire type、回执成功/失败互斥、查询载荷、分页游标presence、nullable字段、记录顺序及完整消息序号关联。
+    行为：检查当前目录48种严格wire type、回执成功/失败互斥、查询载荷、分页游标presence、nullable字段、记录顺序及完整消息序号关联。
         诊断details/context按日志报告处理，不按内部AgentMessage递归解释原错误快照。
         agent.ui.res成功必须出现可空ui，失败省略ui并提供error；agent.ui.sync始终出现ui及error，error非空时ui为null。
 
@@ -60,6 +60,7 @@ ClientMessage：请求入站枚举，每个variant均为type、id和message信�
     ConnectionRegister { id: String, message: RegisterConnectionDto }
     ModelConfigReq { id: String, message: EmptyDto }
     ModelConfigUpdate { id: String, message: ModelConfigUpdateDto }
+    ResourceReq { id: String, message: ResourceQueryDto }
     WorkspaceReq { id: String, message: EmptyDto }
     WorkspaceCreate { id:String,message:WorkspaceCreateDto }
     WorkspaceDelete { id:String,message:WorkspaceTargetDto }
@@ -81,6 +82,7 @@ ServerMessage：响应及同步出站枚举，type之外的字段位于顶层，
     ModelConfigRes { id: String, success: bool, content: Option<String>, error: Option<ProtocolErrorDto> }
     ModelConfigSync { content: Option<String>, error: Option<ProtocolErrorDto> }
     ModelConfigUpdateResult { id: String, success: bool, error: Option<ProtocolErrorDto> }
+    ResourceRes { id: String, success: bool, resources: Option<Vec<ResourceInfoDto>>, error: Option<ProtocolErrorDto> }
     WorkspaceRes { id: String, success: bool, workspaces: Option<Vec<WorkspaceInfoDto>>, error: Option<ProtocolErrorDto> }
     WorkspaceSync { workspaces: Vec<WorkspaceInfoDto> }
     WorkspaceCreateResult { id:String,success:bool,error:Option<ProtocolErrorDto> }
@@ -132,6 +134,20 @@ RegisterConnectionDto
 ClientInfoDto
     address: AddressDto
     client_type: String
+ResourceQueryDto
+    resource_type: Option<String>--wire名type，仅driver/tool/prompt/sandbox
+    scope: Option<String>
+    name: Option<String>
+    行为：省略不限，提供时精确匹配并以AND组合；显式null、空串、非法资源段及scoope等未知字段拒绝，不读取脚本配置，不创建sync。
+ResourceInfoDto
+    address: String--原type:scope/name:tag资源标识，字段须一致
+    resource_type: String--wire名type
+    scope: String
+    name: String
+    tag: String
+    path: String--原资源解析的规范绝对入口，允许根内符号链接的实际目标
+    tool_path: Option<String>--wire必有nullable；tool等于path，driver为可选实际清单，其他null
+    行为：结果按type/scope/name/tag稳定排序；成功必有resources数组，失败省略。协议仅校验纯值，不依赖address或其他业务core。
 WorkspaceTargetDto
     address: AddressDto--完整Workspace节点路径，通过World组件校验类型
 WorkspaceCreateDto

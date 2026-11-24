@@ -1,82 +1,236 @@
-use agent_core::{Agent, AgentState};
+#![allow(dead_code, unused_imports)]
+use address::{Address, WorldAddressExt};
+use agent_core::{Agent, AgentHandle, AgentState, StartAgent, StopAgent, WorldAgentExt};
 use compose::{ApplicationOptions, build_app};
 use core_plugin::{App, Entity};
-use lua_runtime_core::DriverLuaVm;
 use mcl_core::{MclCommand, MclInstruction, MclValue};
-use serde_json::json;
-use std::io::{Read, Write};
-use std::path::Path;
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
-use storage_core::{AgentStorage, StorageOperation, StorageValue};
+use serde_json::{Value, json};
+use std::{
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
+};
+use storage_core::AgentStorage;
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
-use workspace_core::{StartWorkspace, StopWorkspace, Workspace};
+use tool_core::{
+    TaskFinish, ToolError, ToolErrorKind, ToolExecuteResponse, ToolExecutionLimits, ToolTaskHandle,
+    ToolTasks,
+};
+use workspace_core::{
+    CreateWorkspace, Workspace, WorkspaceAgent, WorkspaceDatabase, WorkspaceState,
+};
 
-fn copy_tree(source: &Path, target: &Path) {
-    std::fs::create_dir_all(target).unwrap();
-    for entry in std::fs::read_dir(source).unwrap() {
-        let entry = entry.unwrap();
-        if entry.file_type().unwrap().is_dir() {
-            copy_tree(&entry.path(), &target.join(entry.file_name()));
-        } else {
-            std::fs::copy(entry.path(), target.join(entry.file_name())).unwrap();
-        }
+fn runner() -> PathBuf {
+    let path = std::env::var_os("MARGATROID_TEST_RUNNER")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../target/debug/margatroid")
+        });
+    assert!(
+        path.is_file(),
+        "build the actual runner with cargo build -p margatroid, or set MARGATROID_TEST_RUNNER: {}",
+        path.display()
+    );
+    path.canonicalize().unwrap()
+}
+fn write(root: &Path, name: &str, text: &str) {
+    let path = root.join(name);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(path, text).unwrap();
+}
+fn prepare_root(root: &Path) {
+    write(root, "config.toml", "[server]\nbind='127.0.0.1:0'\n");
+    write(
+        root,
+        "models.toml",
+        "[[models]]\nid='offline'\nmodel='unused'\nprovider='openai'\napi_type='chat_completions'\nbase_url='http://127.0.0.1:1/v1'\napi_key='test'\ncontext_window='128k'\n",
+    );
+    for name in [
+        "tools",
+        "prompts",
+        "sandboxes",
+        "skills",
+        "workspaces",
+        "project",
+    ] {
+        std::fs::create_dir_all(root.join(name)).unwrap();
     }
 }
-
-fn get_static(address: std::net::SocketAddr, path: &str) -> (String, Vec<u8>) {
-    let mut stream = std::net::TcpStream::connect(address).unwrap();
-    stream
-        .set_read_timeout(Some(Duration::from_secs(3)))
-        .unwrap();
-    write!(
-        stream,
-        "GET {path} HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n"
+async fn drive<T>(app: &mut App, rx: &mut oneshot::Receiver<T>) -> T {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        app.tick();
+        match rx.try_recv() {
+            Ok(value) => return value,
+            Err(oneshot::error::TryRecvError::Empty) => {}
+            Err(error) => panic!("reply lost: {error}"),
+        }
+        assert!(Instant::now() < deadline, "lifecycle reply timed out");
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+}
+async fn tick_until(app: &mut App, condition: impl Fn(&App) -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !condition(app) {
+        app.tick();
+        assert!(Instant::now() < deadline, "lifecycle state timed out");
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+}
+async fn fixture() -> (tempfile::TempDir, App, Entity) {
+    let root = tempfile::tempdir().unwrap();
+    prepare_root(root.path());
+    let mut app = build_app(ApplicationOptions {
+        data_root: root.path().into(),
+        runner_path: runner(),
+    })
+    .unwrap();
+    let (tx, mut rx) = oneshot::channel();
+    app.world().emit_event(CreateWorkspace {
+        address: "/demo".into(),
+        alias: "Demo".into(),
+        project_root: root.path().join("project"),
+        reply: Arc::new(Mutex::new(Some(tx))),
+    });
+    let workspace = drive(&mut app, &mut rx).await.unwrap();
+    (root, app, workspace)
+}
+fn create_task(app: &App, parent: Entity, id: &str) -> ToolTaskHandle {
+    let tasks = app
+        .world()
+        .get_component::<ToolTasks>(parent)
+        .unwrap()
+        .clone();
+    let owner = tasks.clone();
+    let task_id = id.to_owned();
+    let runtime = tokio::runtime::Handle::current();
+    let running = Arc::new(tokio::sync::Mutex::new(()));
+    let finish: TaskFinish = Arc::new(move |handle| {
+        let runtime = runtime.clone();
+        let owner = owner.clone();
+        let task_id = task_id.clone();
+        let running = running.clone();
+        let (tx, rx) = oneshot::channel();
+        runtime.spawn(async move {
+            let _run = running.lock().await;
+            let result = if handle.is_cleanup_complete() {
+                Ok(())
+            } else {
+                async {
+                    handle.finish_children().await?;
+                    handle.retry_cleanups().await?;
+                    if !owner.complete_cleanup(&task_id, &handle, None) {
+                        return Err(ToolError::new(
+                            ToolErrorKind::CleanupFailed,
+                            "cleanup did not retire task",
+                        ));
+                    }
+                    Ok(())
+                }
+                .await
+            };
+            let _ = tx.send(result);
+        });
+        Box::pin(async move {
+            rx.await
+                .map_err(|e| ToolError::new(ToolErrorKind::CleanupFailed, e.to_string()))?
+        })
+    });
+    let (tx, _rx) = oneshot::channel();
+    let (handle, _input) = ToolTaskHandle::new(
+        &ToolExecutionLimits::default(),
+        id.into(),
+        "test-driver".into(),
+        tx,
+        tasks.update_context(),
+        None,
+        finish,
     )
     .unwrap();
-    let mut response = Vec::new();
-    stream.read_to_end(&mut response).unwrap();
-    let split = response
-        .windows(4)
-        .position(|bytes| bytes == b"\r\n\r\n")
-        .unwrap()
-        + 4;
-    (
-        String::from_utf8(response[..split].to_vec()).unwrap(),
-        response[split..].to_vec(),
-    )
+    tasks.register(id.into(), handle.clone()).unwrap();
+    handle
 }
-
-fn command(
+async fn mount(
     app: &mut App,
-    agent: Entity,
-    text: &str,
-    arguments: Vec<serde_json::Value>,
-) -> MclValue {
-    let execution = app
+    workspace: Entity,
+    node: &str,
+    task_id: &str,
+) -> (AgentHandle, WorkspaceAgent) {
+    let database = app
         .world()
-        .query_with::<lua_runtime_core::WorkspaceLuaTask>()
-        .result()[0];
-    let instance = app
-        .world()
-        .get_component::<DriverLuaVm>(execution)
+        .get_component::<Workspace>(workspace)
         .unwrap()
-        .instance
-        .start_id
+        .database
         .clone();
+    let operation = database.try_operation(node).unwrap();
+    let candidate = database
+        .prepare_agent(
+            &operation,
+            "/demo".into(),
+            Some(node.into()),
+            Some("Agent".into()),
+            "/test/driver/tool.toml".into(),
+            json!({"node_name":node}),
+        )
+        .unwrap();
+    let directory = database.agent_directory(&candidate).unwrap();
+    std::fs::create_dir_all(&directory).unwrap();
+    let storage = storage_core::open_storage(
+        &directory.join("state.sqlite"),
+        &directory.join("setting.toml"),
+        "",
+    )
+    .unwrap();
+    let record = database.commit_agent(&operation, candidate).unwrap();
+    create_task(app, workspace, task_id);
+    let (tx, mut rx) = oneshot::channel();
+    app.world().emit_event(StartAgent {
+        workspace,
+        parent: workspace,
+        task_id: task_id.into(),
+        address: format!("/demo/{node}"),
+        project_root: app
+            .world()
+            .get_component::<Workspace>(workspace)
+            .unwrap()
+            .project_root
+            .clone(),
+        ui_path: directory.join("ui"),
+        persistence: storage,
+        reply: Arc::new(Mutex::new(Some(tx))),
+    });
+    let handle = drive(app, &mut rx).await.unwrap();
+    drop(operation);
+    (handle, record)
+}
+async fn stop(app: &mut App, address: &str) {
+    let (tx, mut rx) = oneshot::channel();
+    app.world().emit_event(StopAgent {
+        address: address.into(),
+        reply: Arc::new(Mutex::new(Some(tx))),
+    });
+    drive(app, &mut rx).await.unwrap();
+}
+async fn command(
+    app: &mut App,
+    source: Entity,
+    target: Entity,
+    text: &str,
+    arguments: Vec<Value>,
+) -> MclValue {
     let (tx, mut rx) = oneshot::channel();
     app.world().emit_event(MclCommand {
-        id: format!("test:{text}"),
-        source: execution,
+        id: format!("command:{text}"),
+        source,
         source_address: app
             .world()
-            .get_component::<address::Address>(execution)
+            .get_component::<Address>(source)
             .unwrap()
             .as_str()
-            .to_owned(),
-        source_instance: Some(instance),
-        target: agent,
+            .into(),
+        source_instance: None,
+        target,
         instruction: MclInstruction {
             text: text.into(),
             arguments,
@@ -84,224 +238,116 @@ fn command(
         cancel: CancellationToken::new(),
         reply: Arc::new(Mutex::new(Some(tx))),
     });
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        app.tick();
-        if let Ok(value) = rx.try_recv() {
-            return value.unwrap();
-        }
-        assert!(Instant::now() < deadline, "MCL did not finish: {text}");
-        std::thread::sleep(Duration::from_millis(2));
-    }
+    drive(app, &mut rx).await.unwrap()
+}
+async fn shutdown(app: &mut App) {
+    tokio::time::timeout(Duration::from_secs(10), compose::shutdown_app(app))
+        .await
+        .expect("application shutdown timed out")
+        .unwrap();
 }
 
-#[test]
-fn bundled_driver_runs_real_mcl_storage_and_http_then_stops_its_workspace() {
-    let root = tempfile::tempdir().unwrap();
-    let resources = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../resources");
-    copy_tree(&resources, root.path());
-    let project = root.path().join("project");
-    std::fs::create_dir_all(&project).unwrap();
-    let directory = root.path().join("workspaces/margatroid/demo/dev");
-    std::fs::create_dir_all(&directory).unwrap();
-    let definition = directory.join("workspace.yaml");
-    std::fs::write(&definition, format!("project_root: {}\nmembers:\n  - name: coder\n    driver: driver:margatroid/coder:dev\n    home_root: {}\n", project.display(), root.path().display())).unwrap();
-    std::fs::write(
-        root.path().join("config.toml"),
-        "[server]\nbind='127.0.0.1:0'\n",
-    )
-    .unwrap();
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let endpoint = listener.local_addr().unwrap();
-    let (request_tx, request_rx) = std::sync::mpsc::channel();
-    let provider = std::thread::spawn(move || {
-        let (mut connection, _) = listener.accept().unwrap();
-        connection
-            .set_read_timeout(Some(Duration::from_secs(10)))
-            .unwrap();
-        let mut request = Vec::new();
-        let mut chunk = [0u8; 8192];
-        let header_end = loop {
-            let read = connection.read(&mut chunk).unwrap();
-            assert!(read > 0);
-            request.extend_from_slice(&chunk[..read]);
-            if let Some(index) = request.windows(4).position(|w| w == b"\r\n\r\n") {
-                break index + 4;
-            }
-        };
-        let headers = String::from_utf8_lossy(&request[..header_end]);
-        let length: usize = headers
-            .lines()
-            .find_map(|line| {
-                line.to_lowercase()
-                    .strip_prefix("content-length:")
-                    .map(|v| v.trim().parse::<usize>().unwrap())
-            })
-            .unwrap();
-        while request.len() < header_end + length {
-            let read = connection.read(&mut chunk).unwrap();
-            assert!(read > 0);
-            request.extend_from_slice(&chunk[..read]);
+const DRIVER: &str = r#"
+function configure() return {timeout_ms=0} end
+function execute(args,context)
+ local agent=margatroid.agent:create({node_name=args.node_name,alias=args.alias,project_root=context.project_root,config_path=context.resource_dir..'/setting.toml',ui_path=context.resource_dir..'/ui'})
+ local ready=margatroid.mcl:execute(agent.address,'EFFECT ready')
+ if ready.Error then error(ready.Error.message) end
+ margatroid.task:return_result(agent.address)
+ margatroid.task:receive()
+end
+"#;
+fn driver(root: &Path) -> PathBuf {
+    let dir = root.join("tools/probe/driver/dev");
+    write(
+        &dir,
+        "tool.toml",
+        "schema_version=1\nname='driver'\ndescription='Create a persistent test Agent'\n",
+    );
+    write(
+        &dir,
+        "input.schema.json",
+        r#"{"type":"object","properties":{"node_name":{"type":"string"},"alias":{"type":"string"}},"required":["node_name"],"additionalProperties":false}"#,
+    );
+    write(&dir, "main.lua", DRIVER);
+    write(&dir, "setting.toml", "");
+    write(&dir, "ui/index.html", "<html>Agent</html>");
+    dir.join("tool.toml")
+}
+async fn launch(app: &mut App, workspace: Entity, path: Option<PathBuf>) -> ToolExecuteResponse {
+    let (tx, mut rx) = oneshot::channel::<Result<ToolExecuteResponse, ToolError>>();
+    let reply = Arc::new(Mutex::new(Some(tx)));
+    let request = if let Some(tool_path) = path {
+        workspace_core::StartWorkspaceAgent::New {
+            workspace,
+            tool_path,
+            arguments: json!({"node_name":"coder","alias":"Coder"}),
+            reply,
         }
-        request_tx
-            .send(
-                serde_json::from_slice::<serde_json::Value>(
-                    &request[header_end..header_end + length],
-                )
-                .unwrap(),
-            )
-            .unwrap();
-        let body = "data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"Finished through the new stack.\"},\"finish_reason\":null}]}\n\ndata: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
-        write!(connection, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
-        connection.flush().unwrap();
-    });
-    let driver_settings = agent_driver_core::read_initial_settings(
-        &root
-            .path()
-            .join("agent-drivers/margatroid/coder/dev/setting.toml"),
-        agent_driver_core::AgentDriverReadLimits::default().settings_bytes,
-    )
-    .unwrap();
-    let settings: toml::Value = toml::from_str(&driver_settings).unwrap();
-    let driver_model = settings["inference"]["model"].as_str().unwrap();
-    std::fs::write(root.path().join("models.toml"), format!("[[models]]\nid={driver_model:?}\nmodel='offline-model'\nbase_url='http://{endpoint}/v1'\napi_key='local-test'\nprovider='openai'\napi_type='chat_completions'\ncontext_window='128k'\n")).unwrap();
-    let mut app = build_app(ApplicationOptions {
-        data_root: root.path().to_owned(),
-        runner_path: std::env::current_exe().unwrap(),
-    })
-    .unwrap();
-    assert!(app.world().query_with::<Workspace>().result().is_empty());
-    let (start_sender, mut start_receiver) = oneshot::channel();
-    app.world().emit_event(StartWorkspace {
-        id: "start".into(),
-        reply: Arc::new(Mutex::new(Some(start_sender))),
-        path: definition,
-    });
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let workspace = loop {
-        app.tick();
-        if let Ok(result) = start_receiver.try_recv() {
-            let result = result.unwrap();
-            assert!(
-                result.member_errors.is_empty(),
-                "{:?}",
-                result.member_errors
-            );
-            break result.workspace;
+    } else {
+        workspace_core::StartWorkspaceAgent::Existing {
+            workspace,
+            node_name: "coder".into(),
+            reply,
         }
-        assert!(Instant::now() < deadline, "workspace did not start");
-        std::thread::sleep(Duration::from_millis(2));
     };
-    let address = app
-        .world()
-        .get_resource::<axum_plugin::AxumHandle>()
-        .unwrap()
-        .local_address()
-        .unwrap();
-    let (headers, index) = get_static(address, "/");
-    assert!(headers.starts_with("HTTP/1.1 200"), "{headers}");
-    assert!(
-        headers
-            .to_ascii_lowercase()
-            .contains("content-type: text/html")
-    );
-    let index = String::from_utf8(index).unwrap();
-    assert!(index.contains("<div id=\"app\"></div>"));
-    let script = index
-        .split("src=\"")
-        .nth(1)
-        .unwrap()
-        .split('"')
-        .next()
-        .unwrap();
-    let (headers, script) = get_static(address, script);
-    assert!(headers.starts_with("HTTP/1.1 200"), "{headers}");
-    assert!(
-        headers
-            .to_ascii_lowercase()
-            .contains("content-type: text/javascript")
-    );
-    assert!(!script.is_empty());
-    let agent = *app
+    app.world().emit_event(request);
+    drive(app, &mut rx).await.unwrap()
+}
+#[tokio::test]
+async fn driver_tool_auto_registers_stops_restarts_and_archives_actual_agent() {
+    let (root, mut app, workspace) = fixture().await;
+    let path = driver(root.path());
+    let result = launch(&mut app, workspace, Some(path.clone())).await;
+    assert!(!result.failed, "{}", result.content);
+    assert_eq!(result.content, "/demo/coder");
+    let first = app.world().entity_by_address("/demo/coder").unwrap();
+    let database = app
         .world()
         .get_component::<Workspace>(workspace)
         .unwrap()
-        .agents
-        .first()
-        .unwrap();
+        .database
+        .clone();
+    let record = database.agent_by_node("coder").unwrap();
+    assert_eq!(record.tool_path, path.canonicalize().unwrap());
     assert_eq!(
-        app.world().get_component::<Agent>(agent).unwrap().state(),
+        record.tool_arguments,
+        json!({"node_name":"coder","alias":"Coder"})
+    );
+    assert_eq!(
+        app.world().get_component::<Agent>(first).unwrap().state(),
         AgentState::Running
     );
-    command(
-        &mut app,
-        agent,
-        "INJECT ? TO entry.pending[-1]",
-        vec![json!([{"type":"user","content":"Exercise the new stack."}])],
-    );
-    command(&mut app, agent, "EFFECT wake", vec![]);
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        app.tick();
-        let storage = app.world().get_component::<AgentStorage>(agent).unwrap();
-        let StorageValue::HistoryEntries(records) =
-            storage_core::execute_storage(storage, StorageOperation::ReadHistoryEntries).unwrap()
-        else {
-            panic!()
-        };
-        if records.iter().any(|r| {
-            r.record.payload.get("content").and_then(|v| v.as_str())
-                == Some("Finished through the new stack.")
-        }) && app.world().get_component::<Agent>(agent).unwrap().state() == AgentState::Running
-        {
-            assert!(
-                records
-                    .iter()
-                    .filter(|r| r.record.kind == "message")
-                    .all(|r| r.sequence > 0 && r.record.created_at_ms.is_some())
-            );
-            let assistant = records
-                .iter()
-                .find(|r| {
-                    r.record.payload.get("type").and_then(|v| v.as_str()) == Some("assistant")
-                })
-                .unwrap();
-            assert!(assistant.record.payload["request_id"].as_str().is_some());
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "driver did not finish inference and history"
-        );
-        std::thread::sleep(Duration::from_millis(2));
-    }
-    let request = request_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+    stop(&mut app, "/demo/coder").await;
+    assert!(!app.world().is_alive(first));
     assert!(
-        request["tools"]
-            .as_array()
+        database
+            .agent_directory(&record)
             .unwrap()
-            .iter()
-            .any(|v| v["function"]["name"] == "task_read")
+            .join("state.sqlite")
+            .is_file()
     );
-    provider.join().unwrap();
-    let (stop_sender, mut stop_receiver) = oneshot::channel();
-    app.world().emit_event(StopWorkspace {
-        id: "stop".into(),
-        reply: Arc::new(Mutex::new(Some(stop_sender))),
+    let result = launch(&mut app, workspace, None).await;
+    assert!(!result.failed, "{}", result.content);
+    let second = app.world().entity_by_address("/demo/coder").unwrap();
+    assert_ne!(first, second);
+    assert_eq!(database.agent_by_node("coder").unwrap().id, record.id);
+    let (tx, mut rx) = oneshot::channel();
+    app.world().emit_event(workspace_core::ArchiveAgent {
         workspace,
+        node_name: "coder".into(),
+        reply: Arc::new(Mutex::new(Some(tx))),
     });
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        app.tick();
-        if let Ok(result) = stop_receiver.try_recv() {
-            result.unwrap();
-            break;
-        }
-        assert!(Instant::now() < deadline, "workspace did not stop");
-        std::thread::sleep(Duration::from_millis(2));
-    }
-    assert!(!app.world().is_alive(agent));
-    assert!(!app.world().is_alive(workspace));
-    assert!(directory.join("agents/coder/state.sqlite").is_file());
-    assert!(directory.join("agents/coder/setting.toml").is_file());
+    drive(&mut app, &mut rx).await.unwrap();
+    assert!(!app.world().is_alive(second));
+    let archived = database.agent_by_id(&record.id).unwrap();
+    assert_eq!(archived.category, workspace_core::AgentCategory::Archived);
+    assert!(
+        database
+            .agent_directory(&archived)
+            .unwrap()
+            .join("state.sqlite")
+            .is_file()
+    );
+    shutdown(&mut app).await;
 }

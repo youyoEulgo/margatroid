@@ -28,8 +28,9 @@ pub(crate) fn prepare(options: &ApplicationOptions) -> Result<ApplicationParts, 
         .map_err(|e| ComposeError::new("config", &config_path, e.to_string()))?;
     let inference = inference_plugin::InferencePlugin::open(&models_path)
         .map_err(|e| ComposeError::new("inference", &models_path, e.to_string()))?;
-    let workspace = workspace_plugin::WorkspacePlugin::open(&workspace_path)
-        .map_err(|e| ComposeError::new("workspace", &workspace_path, e.to_string()))?;
+    let workspace = workspace_plugin::WorkspacePlugin {
+        root: workspace_path,
+    };
     Ok(ApplicationParts {
         options: ApplicationOptions {
             data_root,
@@ -49,20 +50,19 @@ pub(crate) fn install(app: &mut App, parts: ApplicationParts) -> Result<(), Comp
         inference,
         workspace,
     } = parts;
+    app.world_mut()
+        .insert_resource(address::ResourceRoots::new(&options.data_root));
     let clients = client_core::Clients::default();
-    let workspace_sync = dto_plugin::workspace_sync_binding(clients.clone());
+    let bindings = dto_plugin::sync_bindings(clients.clone());
+    let agent_sync = bindings.agent.clone();
+    let task_sync = bindings.tasks.clone();
+    app.world_mut().insert_resource(bindings.workspace);
+    app.world_mut().insert_resource(bindings.workspace_binding);
+    app.world_mut().insert_resource(bindings.agent);
+    app.world_mut().insert_resource(bindings.models);
+    app.world_mut().insert_resource(bindings.sandboxes);
     app.world_mut()
-        .insert_resource(workspace_sync.updates.clone());
-    app.world_mut().insert_resource(workspace_sync);
-    let agent_sync = dto_plugin::agent_sync_context(clients.clone());
-    app.world_mut().insert_resource(agent_sync.clone());
-    app.world_mut()
-        .insert_resource(dto_plugin::model_sync_binding(agent_sync.clone()));
-    let (tools, sandboxes, selection) = dto_plugin::resource_sync_bindings(agent_sync.clone());
-    app.world_mut().insert_resource(tools);
-    app.world_mut().insert_resource(sandboxes);
-    app.world_mut().insert_resource(selection);
-    let task_sync = dto_plugin::task_sync_binding(clients.clone());
+        .insert_resource(dto_plugin::TaskSyncInstaller(task_sync.clone()));
     app.world_mut().insert_resource(clients);
     let bind = config.config().server_bind();
     let level = match config.config().log_level() {
@@ -96,7 +96,8 @@ pub(crate) fn install(app: &mut App, parts: ApplicationParts) -> Result<(), Comp
         .add_plugin(sandbox_resource_plugin::SandboxResourcePlugin::new())
         .add_plugin(inference)
         .add_plugin(
-            tool_plugin::ToolPlugin::new(task_sync)
+            tool_plugin::ToolPlugin::new()
+                .with_task_observer(task_sync)
                 .with_runner_path(options.runner_path)
                 .with_limits(tool_limits),
         )
@@ -111,72 +112,115 @@ pub(crate) fn install(app: &mut App, parts: ApplicationParts) -> Result<(), Comp
 }
 
 pub(crate) async fn shutdown_application(app: &mut App) -> Result<(), ComposeError> {
-    use app_runtime_plugin::WorldEventExt;
-    use std::collections::BTreeMap;
-    use workspace_core::{StopWorkspace, Workspace, WorkspaceState};
-
+    use workspace_core::{Workspace, WorkspaceState, WorkspaceUpdateContext, WorkspaceUpdateKind};
     let server = app
         .world()
         .get_resource::<axum_plugin::AxumHandle>()
-        .ok_or_else(|| ComposeError::new("axum", "", "Axum service is missing"))?
+        .ok_or_else(|| ComposeError::new("axum", "", "Axum service missing"))?
         .clone();
     server.request_shutdown();
-    let mut pending: BTreeMap<
-        core_plugin::Entity,
-        (
-            std::path::PathBuf,
-            tokio::sync::oneshot::Receiver<
-                Result<workspace_core::WorkspaceOperationOutput, workspace_core::WorkspaceError>,
-            >,
-        ),
-    > = BTreeMap::new();
-    let mut next = 0u64;
+    type DrainReply =
+        tokio::sync::oneshot::Receiver<Result<workspace_core::WorkspaceDatabase, String>>;
+    let mut pending: Vec<(core_plugin::Entity, std::path::PathBuf, DrainReply)> = Vec::new();
     loop {
         app.tick();
-        let mut finished = Vec::new();
-        for (entity, (path, receiver)) in &mut pending {
-            match receiver.try_recv() {
-                Ok(Ok(_)) => finished.push(*entity),
-                Ok(Err(error)) => {
-                    return Err(ComposeError::new(
-                        "workspace",
-                        path.clone(),
-                        error.to_string(),
-                    ));
-                }
-                Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
-                    return Err(ComposeError::new(
-                        "workspace",
-                        path.clone(),
-                        "stop reply lost",
-                    ));
-                }
-                Err(tokio::sync::oneshot::error::TryRecvError::Empty) => (),
+        for entity in app.world().query_with::<Workspace>().result() {
+            if pending.iter().any(|(current, _, _)| *current == entity) {
+                continue;
             }
-        }
-        for entity in finished {
-            pending.remove(&entity);
-        }
-        let workspaces = app.world().query_with::<Workspace>().result();
-        for entity in &workspaces {
-            let workspace = app.world().get_component::<Workspace>(*entity).unwrap();
-            if workspace.state != WorkspaceState::Stopping && !pending.contains_key(entity) {
-                next += 1;
-                let id = format!("application-shutdown-{next}");
-                let (sender, receiver) = tokio::sync::oneshot::channel();
-                pending.insert(*entity, (workspace.definition_path.clone(), receiver));
-                app.world().send_event(StopWorkspace {
-                    id,
-                    workspace: *entity,
-                    reply: std::sync::Arc::new(std::sync::Mutex::new(Some(sender))),
+            let workspace = app.world().get_component::<Workspace>(entity).unwrap();
+            if workspace.state == WorkspaceState::Deleting
+                && !app
+                    .world()
+                    .contains_component::<crate::types::ApplicationDraining>(entity)
+            {
+                continue;
+            }
+            let database = workspace.database.clone();
+            database.close_admission();
+            let tasks = app
+                .world()
+                .get_component::<tool_core::ToolTasks>(entity)
+                .cloned();
+            if let Some(tasks) = &tasks {
+                tasks.close_admission();
+                for (_, task) in tasks.list() {
+                    task.cancel();
+                }
+            }
+            app.world_mut()
+                .get_component_mut::<Workspace>(entity)
+                .unwrap()
+                .set_state(WorkspaceState::Deleting);
+            app.world_mut()
+                .insert_component(entity, crate::types::ApplicationDraining);
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let path = database.path().to_path_buf();
+            app.world()
+                .get_resource::<async_runtime_plugin::AsyncRuntimeHandle>()
+                .unwrap()
+                .spawn(async move {
+                    let mut failure = None;
+                    if let Some(tasks) = tasks {
+                        for (_, task) in tasks.list() {
+                            if let Err(e) = task.finish().await {
+                                failure = Some(e.to_string());
+                            }
+                        }
+                    }
+                    if failure.is_none() {
+                        database.wait_idle().await;
+                    }
+                    let _ = tx.send(failure.map_or(Ok(database), Err));
                 });
+            pending.push((entity, path, rx));
+        }
+        let mut next = Vec::new();
+        for (entity, path, mut receiver) in pending {
+            match receiver.try_recv() {
+                Ok(Ok(database)) => {
+                    if let Some(context) = app
+                        .world()
+                        .get_resource::<WorkspaceUpdateContext>()
+                        .cloned()
+                    {
+                        context.notify(app.world_mut(), entity, WorkspaceUpdateKind::Closing);
+                    }
+                    database
+                        .close()
+                        .map_err(|e| ComposeError::new("workspace", &path, e.to_string()))?;
+                    app.world_mut().despawn(entity);
+                    if let Some(context) = app
+                        .world()
+                        .get_resource::<WorkspaceUpdateContext>()
+                        .cloned()
+                    {
+                        context.notify(app.world_mut(), entity, WorkspaceUpdateKind::Removed);
+                    }
+                }
+                Ok(Err(e)) => return Err(ComposeError::new("workspace", path, e)),
+                Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                    return Err(ComposeError::new("workspace", path, "shutdown reply lost"));
+                }
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {
+                    next.push((entity, path, receiver))
+                }
             }
         }
-        if workspaces.is_empty() && pending.is_empty() && server.is_stopped() {
+        pending = next;
+        let producers_idle = app
+            .world()
+            .get_resource::<workspace_core::WorkspacePendingWork>()
+            .is_none_or(|work| work.is_idle());
+        if pending.is_empty()
+            && app.world().query_with::<Workspace>().result().is_empty()
+            && producers_idle
+            && server.is_stopped()
+        {
             return server
                 .result()
                 .unwrap_or(Ok(()))
-                .map_err(|error| ComposeError::new("axum", "", error.to_string()));
+                .map_err(|e| ComposeError::new("axum", "", e.to_string()));
         }
         tokio::time::sleep(std::time::Duration::from_millis(1)).await;
     }

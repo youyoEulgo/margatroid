@@ -106,9 +106,10 @@ pub(crate) fn handle_import_result(world: &mut World, result: Result<ImportOutpu
                     context.owner,
                     Sandboxes::new(
                         world
-                            .get_resource::<sandbox_resource_core::SandboxSyncBinding>()
+                            .get_resource::<sandbox_resource_core::SandboxObserverFactory>()
                             .expect("resource sync binding required")
-                            .for_owner(context.owner),
+                            .for_owner(context.owner)
+                            .0,
                     ),
                 );
             }
@@ -125,6 +126,7 @@ pub(crate) fn handle_import_result(world: &mut World, result: Result<ImportOutpu
     let _ = reply.send(result);
 }
 
+#[allow(clippy::result_large_err)] // Preserve the owned request and its original reply on failure.
 async fn validate_import(context: ImportContext) -> Result<ImportOutput, ImportError> {
     let path = context.path.clone();
     let cancel = context.cancel.clone();

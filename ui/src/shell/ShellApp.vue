@@ -10,16 +10,16 @@ import {
   PanelRight,
   Plus,
   Settings2,
-  Trash2,
   UsersRound,
   X,
 } from 'lucide-vue-next';
 import SidebarTree from '@/components/SidebarTree.vue';
+import FormSelect from '@/components/FormSelect.vue';
 import ModelConfigPanel from '@/components/ModelConfigPanel.vue';
 import { useWorkbenchStore } from '@/stores/workbench';
 import { buildDriverDocument } from '@/lib/driverUi';
 import InfoPanel from './InfoPanel.vue';
-import type { AgentDefinition } from '@/types/protocol';
+import type { ResourceItem } from '@/types/protocol';
 import { formatRecordTime } from '@/lib/time';
 
 const store = useWorkbenchStore();
@@ -58,18 +58,33 @@ const formError = ref('');
 const driverDocument = ref('');
 const driverDocumentError = ref('');
 const iframeKey = ref('');
-const workspaceEditorOpen = ref(false);
-const workspaceEditorPath = ref('');
-const workspaceEditorAddress = ref('');
-const workspaceEditorName = ref('');
-const editProjectRoot = ref('');
-const editAgents = ref<AgentDefinition[]>([]);
-const renameAddress = ref('');
-const editTab = ref<'definition' | 'rename' | 'delete'>('definition');
-const editNotice = ref('');
-const editError = ref('');
-const editBusy = ref(false);
-const deleteArmed = ref(false);
+const createOpen = ref(false);
+const createName = ref('');
+const createAlias = ref('');
+const createRoot = ref('');
+const createBusy = ref(false);
+const createError = ref('');
+const createAdvanced = ref(false);
+const createNameTouched = ref(false);
+const createAliasTouched = ref(false);
+const resources = ref<ResourceItem[]>([]);
+const newAgentNode = ref('');
+const newAgentAlias = ref('');
+const newAgentPath = ref('.');
+const newAgentTool = ref('');
+const addAgentOpen = ref(false);
+const addAgentWorkspace = ref('');
+const addAgentAdvanced = ref(false);
+const addAgentBusy = ref(false);
+const addAgentError = ref('');
+const addAgentTemporary = ref(false);
+const addAgentNodeTouched = ref(false);
+const addAgentAliasTouched = ref(false);
+const driverOptions = computed(() =>
+  resources.value
+    .filter((resource) => resource.tool_path)
+    .map((resource) => ({ value: resource.tool_path!, label: resource.address })),
+);
 
 const connectionLabel = computed(() => {
   if (connectionStatus.value === 'online') return 'Connected';
@@ -94,7 +109,6 @@ const uiState = computed(() => {
   if (!agentUiBundle.value) return 'No Driver UI.';
   return '';
 });
-
 function renderDriver() {
   driverDocumentError.value = '';
   if (!agentUiBundle.value || !selectedAgent.value) {
@@ -115,17 +129,14 @@ function renderDriver() {
 watch([agentUiBundle, selectedAgent, endpoint], renderDriver, {
   immediate: true,
 });
-
 watch([activityOpen, activityTab, selectedAgent], () => {
   if (activityOpen.value && selectedAgentReady.value && activityTab.value === 'mcl')
     store.queryRecords('mcl');
 });
-
 watch(viewMode, (mode) => {
   const hash = mode === 'info' ? '#info' : '#driver';
   if (window.location.hash !== hash) history.replaceState(null, '', hash);
 });
-
 function toggleSidebar() {
   if (window.innerWidth <= 760) {
     sidebarOpen.value = !sidebarOpen.value;
@@ -143,140 +154,165 @@ function selectMember(agent: string | null, path?: string) {
   store.selectAgent(agent, path);
   sidebarOpen.value = false;
 }
-function startWorkspace(path: string) {
-  void store.startWorkspace(path);
+function directoryBaseName(value: string): string {
+  const base = value.trim().split(/[\\/]/u).filter(Boolean).pop() ?? '';
+  return base.replace(/[\\/:\x00-\x1f\x7f]+/gu, '-').trim() || 'workspace';
 }
-function restartWorkspace(path: string) {
-  void store.restartWorkspace(path);
+function uniqueWorkspaceNode(base: string): string {
+  const used = new Set(
+    workspaceSnapshots.value.map(
+      (workspace) => workspace.address.split('/').filter(Boolean).pop() ?? '',
+    ),
+  );
+  if (!used.has(base)) return base;
+  let index = 2;
+  while (used.has(`${base}-${index}`)) index += 1;
+  return `${base}-${index}`;
 }
-function stopWorkspace(address: string) {
-  void store.stopWorkspace(address);
+function refreshCreateDefaults() {
+  if (!createRoot.value.trim()) return;
+  const base = directoryBaseName(createRoot.value);
+  if (!createNameTouched.value) createName.value = uniqueWorkspaceNode(base);
+  if (!createAliasTouched.value) createAlias.value = createName.value;
 }
-function openWorkspaceEditor(path: string) {
-  const snapshot = workspaceSnapshots.value.find((workspace) => workspace.path === path);
-  if (!snapshot) return;
-  workspaceEditorPath.value = path;
-  workspaceEditorAddress.value = snapshot.address ?? store.workspaceAddress(path) ?? '';
-  workspaceEditorName.value =
-    store.sidebarTree.workspaces.find((workspace) => workspace.path === path)?.name ?? path;
-  editProjectRoot.value = snapshot.definition.project_root;
-  editAgents.value = snapshot.definition.agents.map((agent) => ({ ...agent }));
-  renameAddress.value = workspaceEditorAddress.value;
-  editTab.value = 'definition';
-  editNotice.value = '';
-  editError.value = '';
-  editBusy.value = false;
-  deleteArmed.value = false;
-  workspaceEditorOpen.value = true;
+function openCreateWorkspace() {
+  createName.value = '';
+  createAlias.value = '';
+  createRoot.value = '';
+  createError.value = '';
+  createAdvanced.value = false;
+  createNameTouched.value = false;
+  createAliasTouched.value = false;
+  createOpen.value = true;
 }
-function closeWorkspaceEditor() {
-  if (editBusy.value) return;
-  workspaceEditorOpen.value = false;
+async function createManagedWorkspace() {
+  if (createBusy.value) return;
+  refreshCreateDefaults();
+  if (!createName.value.trim()) {
+    createError.value = 'Node name is required';
+    return;
+  }
+  if (createName.value.includes('/') || createName.value.includes('\\')) {
+    createError.value = 'Node name must be a single path segment';
+    return;
+  }
+  if (!createRoot.value.trim().startsWith('/')) {
+    createError.value = 'Workspace directory must be an absolute server path';
+    return;
+  }
+  createBusy.value = true;
+  createError.value = '';
+  try {
+    await store.createWorkspace({
+      address: `/${createName.value.trim()}`,
+      alias: createAlias.value.trim() || createName.value.trim(),
+      project_root: createRoot.value.trim(),
+    });
+    createOpen.value = false;
+  } catch (error) {
+    createError.value = error instanceof Error ? error.message : 'Create failed';
+  } finally {
+    createBusy.value = false;
+  }
 }
-function addEditAgent() {
-  editAgents.value.push({
-    name: '',
-    driver: '',
-    home_root: editProjectRoot.value,
+async function loadResources() {
+  try {
+    const result = (await store.queryResources({ type: 'driver' })) as ResourceItem[] | null;
+    resources.value = Array.isArray(result) ? result : [];
+    if (!newAgentTool.value && resources.value[0]?.tool_path)
+      newAgentTool.value = resources.value[0].tool_path;
+  } catch {
+    resources.value = [];
+  }
+}
+function startSidebarAgent(workspace: string, nodeName: string) {
+  void store.startAgentExisting(workspace, nodeName).catch(() => {
+    workspaceNotice.value = 'Agent start failed';
   });
 }
-function removeEditAgent(index: number) {
-  editAgents.value.splice(index, 1);
+function stopSidebarAgent(address: string) {
+  void store.stopAgent(address).catch(() => {
+    workspaceNotice.value = 'Agent stop failed';
+  });
 }
-async function saveWorkspaceDefinition() {
-  if (!workspaceEditorAddress.value) {
-    editError.value = 'This workspace has no address';
-    return;
-  }
-  if (!editProjectRoot.value.trim()) {
-    editError.value = 'Project root is required';
-    return;
-  }
-  if (!editAgents.value.length) {
-    editError.value = 'At least one member is required';
-    return;
-  }
-  if (
-    editAgents.value.some(
-      (agent) => !agent.name.trim() || !agent.driver.trim() || !agent.home_root.trim(),
-    )
-  ) {
-    editError.value = 'Each member needs name, driver and home root';
-    return;
-  }
-  editBusy.value = true;
-  editError.value = '';
-  editNotice.value = '';
-  try {
-    await store.updateWorkspace(workspaceEditorAddress.value, {
-      project_root: editProjectRoot.value.trim(),
-      agents: editAgents.value.map((agent) => ({
-        name: agent.name.trim(),
-        driver: agent.driver.trim(),
-        home_root: agent.home_root.trim(),
-      })),
-    });
-    editNotice.value = 'Workspace definition saved.';
-  } catch {
-    editError.value = 'Workspace update failed';
-  } finally {
-    editBusy.value = false;
-  }
+function renameSidebarAgent(address: string, alias: string) {
+  void store.renameAgentAlias(address, alias).catch(() => {
+    workspaceNotice.value = 'Agent rename failed';
+  });
 }
-async function renameWorkspace() {
-  if (!workspaceEditorAddress.value) {
-    editError.value = 'This workspace has no address';
-    return;
-  }
-  const next = renameAddress.value.trim();
-  if (!/^workspace:[^/\s:]+\/[^/\s:]+:[^/\s:]+$/u.test(next)) {
-    editError.value = 'Address must be workspace:scope/name:tag';
-    return;
-  }
-  if (next === workspaceEditorAddress.value) {
-    editError.value = 'New address is unchanged';
-    return;
-  }
-  editBusy.value = true;
-  editError.value = '';
-  editNotice.value = '';
-  try {
-    const old = workspaceEditorAddress.value;
-    await store.renameWorkspace(old, next);
-    workspaceEditorAddress.value = next;
-    renameAddress.value = next;
-    workspaceEditorPath.value = workspaceEditorPath.value.replace(old, next);
-    editNotice.value = 'Workspace renamed.';
-  } catch {
-    editError.value = 'Workspace rename failed';
-  } finally {
-    editBusy.value = false;
-  }
+function archiveSidebarAgent(workspace: string, nodeName: string) {
+  void store.archiveAgent(workspace, nodeName).catch(() => {
+    workspaceNotice.value = 'Agent archive failed';
+  });
 }
-async function deleteWorkspace() {
-  if (!workspaceEditorAddress.value) {
-    editError.value = 'This workspace has no address';
-    return;
-  }
-  if (!deleteArmed.value) {
-    deleteArmed.value = true;
-    return;
-  }
-  editBusy.value = true;
-  editError.value = '';
+function renameWorkspaceAlias(address: string, alias: string) {
+  void store.renameWorkspaceAlias(address, alias).catch(() => {
+    workspaceNotice.value = 'Workspace rename failed';
+  });
+}
+function deleteWorkspace(address: string) {
+  void store.deleteWorkspace(address).catch(() => {
+    workspaceNotice.value = 'Workspace delete failed';
+  });
+}
+function uniqueNodeForWorkspace(workspace: string, base: string): string {
+  const snapshot = workspaceSnapshots.value.find((item) => item.address === workspace);
+  const used = new Set(
+    (snapshot?.agents ?? [])
+      .filter((agent) => agent.category !== 'archived')
+      .map((agent) => agent.node_name)
+      .filter((name): name is string => typeof name === 'string'),
+  );
+  if (!used.has(base)) return base;
+  let index = 2;
+  while (used.has(`${base}-${index}`)) index += 1;
+  return `${base}-${index}`;
+}
+function openAgentDialog(workspaceAddress: string) {
+  addAgentWorkspace.value = workspaceAddress;
+  addAgentOpen.value = true;
+  addAgentAdvanced.value = false;
+  addAgentBusy.value = false;
+  addAgentError.value = '';
+  addAgentTemporary.value = false;
+  addAgentNodeTouched.value = false;
+  addAgentAliasTouched.value = false;
+  newAgentNode.value = '';
+  newAgentAlias.value = '';
+  newAgentPath.value = '.';
+  newAgentTool.value = '';
+  void loadResources().then(() => applyAgentDefaults());
+}
+function applyAgentDefaults() {
+  const resource = resources.value.find((item) => item.tool_path === newAgentTool.value);
+  if (!resource) return;
+  const base = resource.name;
+  if (!addAgentNodeTouched.value)
+    newAgentNode.value = uniqueNodeForWorkspace(addAgentWorkspace.value, base);
+  if (!addAgentAliasTouched.value) newAgentAlias.value = newAgentNode.value;
+}
+async function startNewAgentFromDialog() {
+  if (!newAgentTool.value || addAgentBusy.value) return;
+  addAgentBusy.value = true;
+  addAgentError.value = '';
   try {
-    await store.deleteWorkspace(workspaceEditorAddress.value);
-    workspaceEditorOpen.value = false;
-  } catch {
-    editError.value = 'Workspace delete failed';
+    const args: Record<string, unknown> = {
+      path: newAgentPath.value.trim() || '.',
+      ...(newAgentAlias.value.trim() ? { alias: newAgentAlias.value.trim() } : {}),
+    };
+    if (!addAgentTemporary.value) args.node_name = newAgentNode.value.trim();
+    await store.startAgentNew(addAgentWorkspace.value, newAgentTool.value, args);
+    addAgentOpen.value = false;
+  } catch (error) {
+    addAgentError.value = error instanceof Error ? error.message : 'Agent start failed';
   } finally {
-    editBusy.value = false;
+    addAgentBusy.value = false;
   }
 }
 function closeOverlaysOnEscape(event: KeyboardEvent) {
   if (event.key !== 'Escape') return;
-  if (workspaceEditorOpen.value) {
-    closeWorkspaceEditor();
+  if (createOpen.value) {
+    createOpen.value = false;
     return;
   }
   settingsOpen.value = false;
@@ -374,6 +410,9 @@ onBeforeUnmount(() => {
       >
         <div class="sidebar-heading shell-sidebar-heading">
           <span>Workspaces</span>
+          <button class="icon-button" title="Create workspace" @click="openCreateWorkspace">
+            <Plus :size="15" />
+          </button>
         </div>
         <nav class="sidebar-scroll" aria-label="Workspaces">
           <SidebarTree
@@ -383,10 +422,13 @@ onBeforeUnmount(() => {
             @select-workspace="selectWorkspace"
             @toggle-workspace="store.toggleWorkspace"
             @select-agent="selectMember"
-            @start-workspace="startWorkspace"
-            @restart-workspace="restartWorkspace"
-            @stop-workspace="stopWorkspace"
-            @edit-workspace="openWorkspaceEditor"
+            @add-agent="openAgentDialog"
+            @rename-workspace="renameWorkspaceAlias"
+            @delete-workspace="deleteWorkspace"
+            @start-agent="startSidebarAgent"
+            @stop-agent="stopSidebarAgent"
+            @rename-agent="renameSidebarAgent"
+            @archive-agent="archiveSidebarAgent"
           />
         </nav>
         <div v-if="workspaceNotice" class="sidebar-footnote" role="status">
@@ -503,165 +545,156 @@ onBeforeUnmount(() => {
       </aside>
     </div>
 
-    <div v-if="workspaceEditorOpen" class="dialog-backdrop" @click.self="closeWorkspaceEditor">
-      <section
-        class="dialog workspace-editor-dialog"
-        role="dialog"
-        aria-modal="true"
-        aria-labelledby="workspace-editor-title"
-      >
+    <div v-if="createOpen" class="dialog-backdrop" @click.self="createOpen = false">
+      <section class="dialog workspace-create-dialog" role="dialog" aria-modal="true">
         <div class="dialog-header">
           <div>
             <span class="eyebrow">Workspace</span>
-            <h2 id="workspace-editor-title">{{ workspaceEditorName }}</h2>
-            <span class="workspace-edit-address">{{ workspaceEditorAddress }}</span>
+            <h2>New Workspace</h2>
           </div>
-          <button class="icon-button" title="Close" @click="closeWorkspaceEditor">
+          <button class="icon-button" title="Close" @click="createOpen = false">
             <X :size="17" />
           </button>
         </div>
-
-        <div class="settings-tabs" role="tablist" aria-label="Workspace actions">
-          <button
-            type="button"
-            :class="{ active: editTab === 'definition' }"
-            :aria-selected="editTab === 'definition'"
-            @click="editTab = 'definition'"
-          >
-            Definition
-          </button>
-          <button
-            type="button"
-            :class="{ active: editTab === 'rename' }"
-            :aria-selected="editTab === 'rename'"
-            @click="editTab = 'rename'"
-          >
-            Rename
-          </button>
-          <button
-            type="button"
-            :class="{ active: editTab === 'delete' }"
-            :aria-selected="editTab === 'delete'"
-            @click="
-              editTab = 'delete';
-              deleteArmed = false;
+        <label class="field-label" for="create-workspace-root">Workspace directory</label>
+        <input
+          id="create-workspace-root"
+          v-model="createRoot"
+          class="field-input"
+          placeholder="/absolute/project/directory"
+          :disabled="createBusy"
+          @input="refreshCreateDefaults"
+        />
+        <div class="workspace-create-auto">
+          <div>
+            <span>Node name</span><code>{{ createName || 'auto from directory' }}</code>
+          </div>
+          <div>
+            <span>Alias</span><code>{{ createAlias || 'same as node name' }}</code>
+          </div>
+        </div>
+        <button
+          class="workspace-create-advanced-toggle"
+          type="button"
+          @click="createAdvanced = !createAdvanced"
+        >
+          {{ createAdvanced ? 'Hide advanced options' : 'Advanced options' }}
+        </button>
+        <div v-if="createAdvanced" class="workspace-create-advanced">
+          <label class="field-label" for="create-workspace-name">Node name</label>
+          <input
+            id="create-workspace-name"
+            v-model="createName"
+            class="field-input"
+            :disabled="createBusy"
+            @input="
+              createNameTouched = true;
+              if (!createAliasTouched) createAlias = createName;
             "
-          >
-            Delete
+          />
+          <label class="field-label" for="create-workspace-alias">Alias</label>
+          <input
+            id="create-workspace-alias"
+            v-model="createAlias"
+            class="field-input"
+            :disabled="createBusy"
+            @input="createAliasTouched = true"
+          />
+        </div>
+        <p v-if="createError" class="form-error">{{ createError }}</p>
+        <div class="dialog-actions">
+          <button class="secondary-button" :disabled="createBusy" @click="createOpen = false">
+            Cancel</button
+          ><button class="primary-button" :disabled="createBusy" @click="createManagedWorkspace">
+            {{ createBusy ? 'Creating…' : 'Create' }}
           </button>
         </div>
-
-        <template v-if="editTab === 'definition'">
-          <label class="field-label" for="workspace-project-root">Project root</label>
-          <input
-            id="workspace-project-root"
-            v-model="editProjectRoot"
-            class="field-input"
-            placeholder="/absolute/project/root"
-            :disabled="editBusy"
-          />
-          <div class="workspace-agent-editor-heading">
-            <span>Members</span>
-            <button
-              class="secondary-button"
-              type="button"
-              :disabled="editBusy"
-              @click="addEditAgent"
-            >
-              <Plus :size="14" /> Add member
-            </button>
-          </div>
-          <div class="workspace-agent-editor">
-            <div v-for="(agent, index) in editAgents" :key="index" class="workspace-agent-edit-row">
-              <label>
-                <span>Name</span>
-                <input v-model="agent.name" class="field-input" :disabled="editBusy" />
-              </label>
-              <label>
-                <span>Driver</span>
-                <input
-                  v-model="agent.driver"
-                  class="field-input"
-                  placeholder="driver:margatroid/coder:dev"
-                  :disabled="editBusy"
-                />
-              </label>
-              <label>
-                <span>Home root</span>
-                <input v-model="agent.home_root" class="field-input" :disabled="editBusy" />
-              </label>
-              <button
-                class="icon-button workspace-agent-remove"
-                type="button"
-                title="Remove member"
-                :disabled="editBusy || editAgents.length <= 1"
-                @click="removeEditAgent(index)"
-              >
-                <Trash2 :size="15" />
-              </button>
-            </div>
-            <p v-if="!editAgents.length" class="field-hint">No members configured.</p>
-          </div>
-          <p v-if="editError" class="form-error">{{ editError }}</p>
-          <p v-if="editNotice" class="field-hint">{{ editNotice }}</p>
-          <div class="dialog-actions">
-            <button class="secondary-button" :disabled="editBusy" @click="closeWorkspaceEditor">
-              Close
-            </button>
-            <button class="primary-button" :disabled="editBusy" @click="saveWorkspaceDefinition">
-              {{ editBusy ? 'Saving…' : 'Save changes' }}
-            </button>
-          </div>
-        </template>
-
-        <template v-else-if="editTab === 'rename'">
-          <p class="field-hint">
-            Workspace must be fully stopped. Renaming moves its Agent configuration, history and
-            snapshots, but not the project directory.
-          </p>
-          <label class="field-label" for="workspace-rename-address">New address</label>
-          <input
-            id="workspace-rename-address"
-            v-model="renameAddress"
-            class="field-input"
-            placeholder="workspace:margatroid/renamed:dev"
-            :disabled="editBusy"
-          />
-          <p v-if="editError" class="form-error">{{ editError }}</p>
-          <p v-if="editNotice" class="field-hint">{{ editNotice }}</p>
-          <div class="dialog-actions">
-            <button class="secondary-button" :disabled="editBusy" @click="closeWorkspaceEditor">
-              Close
-            </button>
-            <button class="primary-button" :disabled="editBusy" @click="renameWorkspace">
-              {{ editBusy ? 'Renaming…' : 'Rename workspace' }}
-            </button>
-          </div>
-        </template>
-
-        <template v-else>
-          <p class="workspace-edit-warning">
-            Deleting the Workspace removes its managed definition, Agent configuration, history and
-            snapshots. The project root directory is not deleted.
-          </p>
-          <p v-if="editError" class="form-error">{{ editError }}</p>
-          <div class="dialog-actions">
-            <button class="secondary-button" :disabled="editBusy" @click="closeWorkspaceEditor">
-              Cancel
-            </button>
-            <button
-              class="primary-button workspace-delete-button"
-              :disabled="editBusy"
-              @click="deleteWorkspace"
-            >
-              <Trash2 :size="15" />
-              {{ deleteArmed ? 'Confirm delete' : 'Delete workspace' }}
-            </button>
-          </div>
-        </template>
       </section>
     </div>
-
+    <div v-if="addAgentOpen" class="dialog-backdrop" @click.self="addAgentOpen = false">
+      <section class="dialog add-agent-dialog" role="dialog" aria-modal="true">
+        <div class="dialog-header">
+          <div>
+            <span class="eyebrow">Agent</span>
+            <h2>Add Agent</h2>
+            <span class="workspace-edit-address">{{ addAgentWorkspace }}</span>
+          </div>
+          <button class="icon-button" title="Close" @click="addAgentOpen = false">
+            <X :size="17" />
+          </button>
+        </div>
+        <label class="field-label">Driver</label>
+        <FormSelect
+          v-model="newAgentTool"
+          :options="driverOptions"
+          :disabled="addAgentBusy"
+          @change="applyAgentDefaults"
+        />
+        <div class="workspace-create-auto">
+          <div>
+            <span>Node name</span
+            ><code>{{
+              addAgentTemporary ? 'temporary (no node name)' : newAgentNode || 'auto from Driver'
+            }}</code>
+          </div>
+          <div>
+            <span>Alias</span><code>{{ newAgentAlias || 'same as node name' }}</code>
+          </div>
+        </div>
+        <button
+          class="workspace-create-advanced-toggle"
+          type="button"
+          @click="addAgentAdvanced = !addAgentAdvanced"
+        >
+          {{ addAgentAdvanced ? 'Hide advanced options' : 'Advanced options' }}
+        </button>
+        <div v-if="addAgentAdvanced" class="workspace-create-advanced">
+          <label class="field-label add-agent-node-label">
+            <span>Node name</span>
+            <span class="add-agent-temporary"
+              ><input v-model="addAgentTemporary" type="checkbox" @change="applyAgentDefaults" />
+              Temporary agent</span
+            >
+          </label>
+          <input
+            v-model="newAgentNode"
+            class="field-input"
+            :disabled="addAgentBusy || addAgentTemporary"
+            @input="
+              addAgentNodeTouched = true;
+              if (!addAgentAliasTouched) newAgentAlias = newAgentNode;
+            "
+          />
+          <label class="field-label">Alias</label>
+          <input
+            v-model="newAgentAlias"
+            class="field-input"
+            :disabled="addAgentBusy"
+            @input="addAgentAliasTouched = true"
+          />
+          <label class="field-label">Sub working directory</label>
+          <input
+            v-model="newAgentPath"
+            class="field-input"
+            placeholder="."
+            :disabled="addAgentBusy"
+          />
+        </div>
+        <p v-if="addAgentError" class="form-error">{{ addAgentError }}</p>
+        <div class="dialog-actions">
+          <button class="secondary-button" :disabled="addAgentBusy" @click="addAgentOpen = false">
+            Cancel
+          </button>
+          <button
+            class="primary-button"
+            :disabled="addAgentBusy || !newAgentTool"
+            @click="startNewAgentFromDialog"
+          >
+            {{ addAgentBusy ? 'Starting…' : 'Start Agent' }}
+          </button>
+        </div>
+      </section>
+    </div>
     <div v-if="settingsOpen" class="dialog-backdrop" @click.self="settingsOpen = false">
       <section
         class="dialog"

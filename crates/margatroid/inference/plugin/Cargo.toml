@@ -7,7 +7,6 @@ edition = "2021"
 tempfile = "3"
 inference_core = { path = "../core" }
 agent_core = { path = "../../agent/core" }
-lua_runtime_core = { path = "../../lua_runtime/core" }
 client_core = { path = "../../client/core" }
 address = { path = "../../address" }
 tool_resource_core = { path = "../../tool_resource/core" }
@@ -28,6 +27,7 @@ tracing = "0.1"
 toml = "0.8"
 
 [dev-dependencies]
+lua_runtime_core = { path = "../../lua_runtime/core" }
 tempfile = "3"
 config_core = { path = "../../config/core" }
 workspace_core = { path = "../../workspace/core" }

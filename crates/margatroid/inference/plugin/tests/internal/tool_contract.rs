@@ -25,16 +25,15 @@ fn fixture(url: String, format: &str) -> (App, Entity) {
     let agent = app.world_mut().spawn();
     app.world_mut().insert_component(
         agent,
-        agent_core::Agent::new(
-            "test".into(),
-            agent,
-            AgentState::Running,
-            Some("turn".into()),
-            test_agent_context(),
-        ),
+        agent_core::Agent::new(agent, agent, "driver-task".into(), std::env::temp_dir()),
     );
+    use agent_core::WorldAgentExt;
+    app.world_mut().agent_ready(agent).unwrap();
     app.world_mut()
-        .insert_component(agent, Address::new("agent:test/agent:dev").unwrap());
+        .agent_set_turn(agent, Some("turn".into()))
+        .unwrap();
+    app.world_mut()
+        .insert_component(agent, Address::new("/test/agent").unwrap());
     app.world_mut().insert_component(
         agent,
         DriverLuaVm {
@@ -168,7 +167,7 @@ async fn real_http_uses_all_current_entries_at_acceptance_and_refreshes_each_req
     for format in ["chat_completions", "messages", "responses"] {
         let (url, chunks, server, captured) = http_server_with_request().await;
         let (mut app, agent) = fixture(url, format);
-        let mut tools = Tools::new(test_probe());
+        let mut tools = Tools::new();
         tools
             .insert("baseline".into(), entry("baseline", None))
             .unwrap();
@@ -217,7 +216,7 @@ async fn real_http_preserves_large_catalogs_and_long_descriptions_in_every_forma
     for format in ["chat_completions", "messages", "responses"] {
         let (url, chunks, server, captured) = http_server_with_request().await;
         let (mut app, agent) = fixture(url, format);
-        let mut tools = Tools::new(test_probe());
+        let mut tools = Tools::new();
         for index in 0..1024 {
             let alias = format!("catalog_{index:04}");
             let mut item = entry(&alias, Some("large-catalog-owner"));
@@ -255,12 +254,4 @@ async fn real_http_preserves_large_catalogs_and_long_descriptions_in_every_forma
         }
         server.await.unwrap();
     }
-}
-
-fn test_agent_context() -> agent_core::AgentUpdateContext {
-    agent_core::AgentUpdateContext::new(|_, _, _| Vec::new(), |_, _| {})
-}
-
-fn test_probe<T>() -> client_core::UpdateProbe<T> {
-    client_core::UpdateProbe::new(|_| {})
 }

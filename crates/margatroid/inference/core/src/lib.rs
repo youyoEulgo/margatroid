@@ -37,7 +37,22 @@ impl ModelRoutes {
 impl Resource for ModelRoutes {}
 
 pub use components::PublicModelInfo;
-pub type ModelSyncBinding = client_core::ProbeFactory<Option<PublicModelInfo>>;
+pub type ModelChanged = std::sync::Arc<dyn Fn(Option<PublicModelInfo>) + Send + Sync>;
+#[derive(Clone)]
+pub struct ModelObserverFactory {
+    bind: std::sync::Arc<dyn Fn(core_plugin::Entity) -> ModelChanged + Send + Sync>,
+}
+impl ModelObserverFactory {
+    pub fn new(bind: impl Fn(core_plugin::Entity) -> ModelChanged + Send + Sync + 'static) -> Self {
+        Self {
+            bind: std::sync::Arc::new(bind),
+        }
+    }
+    pub fn for_owner(&self, owner: core_plugin::Entity) -> ModelChanged {
+        (self.bind)(owner)
+    }
+}
+impl Resource for ModelObserverFactory {}
 
 /// File operations supplied by the inference plugin; this resource never caches file contents.
 #[derive(Clone)]

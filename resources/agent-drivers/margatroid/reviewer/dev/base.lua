@@ -3,7 +3,7 @@ function configure()
 end
 
 function execute(arguments, context)
-    local subdriver = context.kind == "tool"
+    local subdriver = arguments.instructions ~= nil
     local function execute_command(address, text, parameters)
         local result = margatroid.mcl:execute(address, text, parameters)
         if result.Error then
@@ -11,10 +11,19 @@ function execute(arguments, context)
         end
         return result
     end
-    local child_name = subdriver and ("subagent-" .. context.task_id:gsub("[^%w_-]", "-")) or context.name
+    local relative_work = arguments.path or "."
+    assert(type(relative_work) == "string" and relative_work ~= "" and relative_work:sub(1, 1) ~= "/", "path must be relative")
+    for part in relative_work:gmatch("[^/]+") do
+        assert(part ~= "..", "path must remain inside the creator work directory")
+    end
+    local work_root = context.project_root
+    assert(type(work_root) == "string" and work_root:sub(1, 1) == "/", "creator project_root must be absolute")
+    if relative_work ~= "." then work_root = work_root:gsub("/+$", "") .. "/" .. relative_work end
     local config_path = context.resource_dir .. "/setting.toml"
     local agent = margatroid.agent:create({
-        name = child_name,
+        node_name = arguments.node_name,
+        alias = arguments.alias,
+        project_root = work_root,
         config_path = config_path,
         ui_path = context.resource_dir .. (subdriver and "/subagent-ui" or "/ui"),
     })
@@ -116,36 +125,30 @@ function execute(arguments, context)
         local config = settings()
         active_model = command("EFFECT model_set ?", {config.inference}).Config
         local initialization = config.initialization or {}
-        local defaults = initialization.default
-        if not defaults then
-            local initial = margatroid.data:decode("toml", margatroid.files:read(context.resource_dir .. "/setting.toml"))
-            defaults = initial.initialization.default
-            if not config.initialization then initialization = initial.initialization end
-        end
-        for _, instruction in ipairs(defaults) do command(instruction.command, instruction.arguments) end
+        for _, instruction in ipairs(initialization.default or {}) do command(instruction.command, instruction.arguments) end
         for _, instruction in ipairs(initialization.custom or {}) do command(instruction.command, instruction.arguments) end
         command("EFFECT sandbox_use ?", {config.sandbox})
-        command("CONFIG SET ? ?", {"driver_task", {agent = subdriver and context.agent_info.address or context.task_address, task_id = context.task_id}})
+        command("CONFIG SET ? ?", {"driver_task", {agent = context.agent_info and context.agent_info.address or assert(context.workspace.address), task_id = context.task_id}})
         if not subdriver then
+            local subagent_schema = margatroid.data:decode("json", margatroid.files:read(context.resource_dir .. "/subagent.schema.json"))
             margatroid.tools:register({agent = agent.address, tools = {{
                 alias = "subagent",
                 description = margatroid.files:read(context.resource_dir .. "/description.md"),
-                input_schema = margatroid.data:decode("json", margatroid.files:read(context.resource_dir .. "/input.schema.json")),
+                input_schema = subagent_schema,
             }}})
         end
         command("EFFECT ready")
     end
 
     initialize()
+    margatroid.task:return_result({address = agent.address, task_id = context.task_id})
     if subdriver then
-        margatroid.task:return_result({task_id = context.task_id})
         command("INJECT ? TO entry.pending[-1]", {{{type = "user", content = assert(context.arguments.instructions)}}})
     end
 
     local function finish_turn()
         command("EFFECT finish_turn")
         if subdriver then
-            margatroid.agent:stop(agent.address)
             subdriver_finished = true
         end
     end

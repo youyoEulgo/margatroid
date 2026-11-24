@@ -32,20 +32,20 @@ DtoPlugin：无字段，Default
                 注册GET /ws及GET/HEAD /{workspace}/{*path}；文件handler复用既有ingress、AxumLifetime及WorldClosureSender，不新增业务System或公共事件。
                 只安装PRE_UPDATE的abort_control_system和UPDATE的dto_route_system，不安装同步System。
 sync_bindings(clients: Clients) -> DtoSyncBindings
-    行为：一次创建共享AgentViews、WorkspaceViews和SyncObservations，再从同一个DtoSyncState衍生全部探针；不能分别以Clients构造互不共享的Agent投影。
-    Agent和Workspace生命周期回调捕获同一state；工具、任务、沙箱及模型回调只持其中对应视图Weak及实例来源标记，所有发送使用同一个Clients。
-task_sync_binding(state: Arc<DtoSyncState>) -> TaskObserverBinder
-    行为：按完整Entity及TaskUpdateContext.same_collection幂等绑定；旧来源先退休，snapshot_source只持集合Weak，observe变更后更新同一版本化任务来源。
-agent_sync_context(state: Arc<DtoSyncState>) -> agent_core::AgentUpdateContext
-    行为：构造AgentUpdateKind回调，Installed绑定Agent/turn和集合；SourcesInstalled安装实际监控，SourcesClosing返回真实结束等待，Removed退休来源。
-resource_sync_bindings(state: Arc<DtoSyncState>) -> ToolObserverBinder
-    行为：通过Tools.observe将完整工具记录提交同一AgentViews；按Entity及Agent.instance核对来源，不从闭包持有World或Tools强引用。
-model_sync_binding(state: Arc<DtoSyncState>) -> inference_core::ModelObserverFactory
-    行为：创建每对象的ModelChanged回调，映射安全公共字段到同一AgentViews，不包含端点和凭据。
-sandbox_sync_binding(state: Arc<DtoSyncState>) -> sandbox_resource_core::SandboxObserverFactory
-    行为：构造列表与选择的通用回调，更新同一AgentViews；来源退休后旧回调失效。
-workspace_sync_binding(state: Arc<DtoSyncState>) -> workspace_core::WorkspaceUpdateContext
-    行为：Installed发布运行字段并订阅数据库确认快照；Changed只改运行字段，Closing取消来源，Removed移除视图；登记类别与运行状态不混为一份字段。
+    行为：一次构造AgentUpdateContext及WorkspaceSyncBinding，资源工厂均从同一个AgentUpdateContext派生；任务绑定复用同一Clients但持独立集合来源表，不维护另一份聚合状态结构。
+task_sync_binding(clients: Clients) -> TaskObserverBinder
+    行为：捕获Arc<Mutex<BTreeMap<Entity, (TaskUpdateContext, SyncContext<AgentTaskSnapshot>)>>>；same_collection去重，替换旧来源时close，snapshot_source仅持集合Weak。
+        observe的changed/retired回调发布或关闭来源；retired回调只持来源表Weak，实体编号复用不移除新的集合来源。
+agent_sync_context(clients: Clients) -> AgentUpdateContext
+    行为：创建AgentViews；AgentUpdateContext::new的World发布回调与public纯值回调共享同一AgentViews Arc。
+        World回调更新Agent及turn快照；Installed安装任务和Tools观察，SourcesInstalled创建UI/记录/设置监控，SourcesClosing/Removed停止监控并返回完成等待。
+resource_sync_bindings(context: AgentUpdateContext) -> ToolObserverFactory
+    行为：for_owner取得context.scoped(owner)，将ToolEntry映射为AgentPublicUpdate::Tools交给同一public回调。
+model_sync_binding(context: AgentUpdateContext) -> inference_core::ModelObserverFactory
+sandbox_sync_binding(context: AgentUpdateContext) -> sandbox_resource_core::SandboxObserverFactory
+    行为：按owner衍生scope，模型/列表/选择提交同一公共视图；来源关闭后旧scope回调失效。
+workspace_sync_binding(clients: Clients) -> WorkspaceSyncBinding
+    行为：创建独立WorkspaceViews；生命周期回调更新rows，Installed按database.same_connection去重并订阅changes；Closing移除watch并取消，Removed移除rows。
 sync_selectors() -> Arc<[ClientSelector]>
     行为：返回仅含ClientSelector::Type("webui")的固定Arc数组；状态、任务、资源和持久记录与推理出口统一，不从配置或任意wire消息推导投递范围。
 
@@ -103,7 +103,7 @@ ws_handler(State(state): State<DtoState>, ConnectInfo(peer): ConnectInfo<SocketA
     行为：评估入口策略和退出状态，通过state.clients.allocate取得真实连接、唯一ClientReceiver及取消能力；升级任务持有AxumWorkGuard。
 
 handle_dto_request(world: &mut World, request: DtoRequest)
-    行为：取出具体owned对象，按route转换领域请求或只读查询；原reply继续沿领域执行链回复；不分派Agent start/stop/restart网络请求。
+    行为：取出具体owned对象，resource.req交给resources进行异步只读查询，其余按route转换领域请求或只读查询；原reply继续沿领域执行链回复；agent.start/stop/archive按新事件分派，不接受restart旧接口。
 
 handle_abort_control(world: &mut World, event: AbortTurnControl)
     行为：认领原请求，校验真实Client、Agent及turn，调用WorldAgentExt的统一turn入口及相关领域取消能力；原oneshot回复。
@@ -156,16 +156,19 @@ ModelConfigView::refresh_locked(&self) -> Future<Output=Result<String,ProtocolEr
     行为：operations锁统一串行监控/查询/修改；调用inference的read/load能力取得原文与最近校验路由，通过既有WorldClosureSender将ModelRoutes::replace和AgentInferenceConfig安全投影提交回World；无效来源清空路由投影，不回退旧模型。
         原文读取成功即可供编辑，不要求当前文本语义有效；读取失败发布content=None及error。视图实际变化经update直接提交SyncContext，初始None/None表示尚未读取。
         replace先await inference的完整校验和原子写入能力，成功后refresh_locked，再完成请求；校验/写入失败返回原错误，不伪造成功。
+resources(world: &World, object: Box<dyn Any + Send>)
+    行为：认领Prepared<ResourceQueryDto, Vec<ResourceInfoDto>>，校验真实已注册Client，克隆address::ResourceRoots及AxumWorkGuard。
+        以AsyncRuntimeHandle::spawn提交闭包，再用spawn_blocking调用address::query_resources；将owned条目转为协议字段，显式提供nullable tool_path。
+        目录读取、worker或UTF-8路径转换失败通过原reply返回ResourceReadFailed并省略resources；成功返回完整列表，没有匹配为[]。
+        World只克隆值，不进行扫描；闭包不借用World、不创建任务或订阅，网络回复不需要另一次World帧。
 model_config(world: &World, object: Box<dyn Any+Send>, write:bool)
     行为：按req/update取Prepared，校验真实注册Client，克隆ModelConfigView并在持AxumWorkGuard的普通异步闭包执行read/replace，原oneshot回复；不创建Workspace/Agent/turn或新领域事件。
-install_workspace_monitor(world: &mut World, owner: Entity)
-    行为：仅Workspace Installed时取得实际Workspace.database，调用subscribe_changes，先登记来源再提交其当前确认快照；同数据库共享身份已有观察则不重复安装。
-        克隆watch接收端、只持Weak公共视图的发布闭包及取消能力交给watch_workspace_records，不将World放入异步任务；持AxumWorkGuard直到真实结束。
-watch_workspace_records(context: WorkspaceRecordMonitorContext) -> Future<Output = ()>
-    行为：等待数据库watch变化，将最近确认WorkspaceRecordsSnapshot投影进该Workspace视图；保留同步探针提交的当前运行字段，按相同来源和递增revision提交，拒绝旧版本或已退休来源。
-        同值不发布；版本可合并，内容始终是完整已提交列表。不监听SQLite/WAL文件，不轮询数据库，不因来源完成再次扫描Workspace目录。
-        watch为None、关闭或取消时结束；当前投影worker结束后释放guard并标记MonitorCompletion。
-watch_agent_settings(context: AgentSettingsMonitorContext) -> Future<Output = ()>
+install_workspace_monitor(world: &mut World)
+    行为：DTO首次安装时，对已有Workspace调用Installed并发布当前rows；后续依赖领域探针，不按帧扫描。
+Workspace Installed回调中的spawn异步闭包
+    行为：subscribe_changes后先borrow_and_update当前确认快照，再等待changes.changed/cancel/lifetime；只更新当前owner的登记列表并publish，不修改运行状态字段。
+        WorkspaceWatch保存实际database、active及cancel；Closing/Removed移除watch时先失效active再cancel。工作Future持AxumWorkGuard，退出后释放。
+run_settings_watch(context: SettingsContext) -> Future<Output = ()>
     行为：绑定实际AgentStorage的settings_path，目录不存在时观察可用的父来源并报告读取状态；观察父目录以覆盖原子替换、删除及恢复；先订阅再读取，过滤Access与无关路径，读取在blocking worker执行。
         配置内容是Driver自定义值，仅通过storage_core既有CONFIG读取入口做通用语法验证和发布；不推断alias、模型、归档或启动规则，不代替Driver热更新执行。
         当前消息目录没有配置正文sync，本监控只记录来源读状态及去重的tracing诊断，不新增网络消息或持久配置缓存；CONFIG查询读取当前真实来源，不靠监控缓存代替。
@@ -204,8 +207,6 @@ query<T, R>(world: &World, object: Box<dyn Any + Send>, read: impl FnOnce(&World
     行为：校验真实Client及目标后只读并完成原reply。
 records(world: &World, route: &str, object: Box<dyn Any + Send>)
     行为：克隆实际AgentStorage，由worker调用对应分页core函数，通过原reply返回，不建立监控。
-workspace_modify(world: &mut World, object: Box<dyn Any + Send>)
-    行为：对CreateWorkspaceDto和DeleteWorkspaceDto分别校验真实Client及输入，转交原oneshot领域事件；不在DTO执行文件修改，不投递额外完成事件。
 
 query_agent_ui(world: &World, object: Box<dyn Any + Send>)
     行为：按实际Agent实体读取SourcesInstalled绑定的UI来源已有观察状态；未就绪返回AgentUiNotReady，不依赖旧AgentResources组件，不创建监控。
@@ -242,19 +243,23 @@ clean_internal(value: &mut Value)
 公开：
 ```text
 TaskObserverBinder = Arc<dyn Fn(Entity, String, &tool_core::ToolTasks) + Send + Sync>
-ToolObserverBinder = Arc<dyn Fn(Entity, String, &mut tool_resource_core::Tools) + Send + Sync>
-DtoSyncBindings：装配方取得的通用绑定包
-    agent: agent_core::AgentUpdateContext
+TaskSyncInstaller(TaskObserverBinder)：Resource + Clone
+ToolChangeObserver = Arc<dyn Fn(Vec<(String, tool_resource_core::ToolEntry)>) + Send + Sync>
+ToolObserverFactory：Clone，非Resource
+    bind: Arc<dyn Fn(Entity) -> ToolChangeObserver + Send + Sync>
+    for_owner(&self, owner: Entity) -> ToolChangeObserver
+DtoSyncBindings
+    agent: AgentUpdateContext
     workspace: workspace_core::WorkspaceUpdateContext
+    workspace_binding: WorkspaceSyncBinding
     tasks: TaskObserverBinder
-    tools: ToolObserverBinder
+    tools: ToolObserverFactory
     models: inference_core::ModelObserverFactory
     sandboxes: sandbox_resource_core::SandboxObserverFactory
-DtoSyncState：DTO内部共享状态
-    clients: Clients
-    agents: Arc<AgentViews>
-    workspaces: Arc<WorkspaceViews>
-    observations: Arc<Mutex<SyncObservations>>
+WorkspaceSyncBinding：Resource + Clone
+    updates: workspace_core::WorkspaceUpdateContext
+    views: Arc<WorkspaceViews>
+
 ```
 
 私有：
@@ -295,7 +300,6 @@ DtoRequest
 AbortTurnControl
     request: Arc<Mutex<Option<Prepared<AgentTurnAbortDto, ()>>>>
     impl Event + Clone
-ReplyFuture = Pin<Box<dyn Future<Output = Value> + Send>>
 IntoEvent
     type Event: core_plugin::Event
     into_event(self, world: &World) -> Result<Self::Event, ()>
@@ -314,41 +318,21 @@ BoundaryError
 SyncObservations：Resource
     records: BTreeMap<Entity, RecordWatchSlot>
     ui: BTreeMap<Entity, UiWatchSlot>
-    workspaces: BTreeMap<Entity, WorkspaceRecordWatchSlot>
-    settings: BTreeMap<Entity, AgentSettingsWatchSlot>
-    tasks: BTreeMap<Entity, TaskWatchSlot>
     行为：只持监控归属和查询能力，不保存每连接全量投影或每帧发送位置。
-TaskWatchSlot
-    collection: tool_core::TaskUpdateContext--same_collection比较实际集合身份
-    source: SyncContext<tool_core::AgentTaskSnapshot>
-    active: Arc<AtomicBool>
-    impl Drop：失效active并退休source；快照读取只持集合Weak，不等待任何轮询任务。
-WorkspaceRecordWatchSlot
-    database_path: PathBuf
-    completion: Arc<MonitorCompletion>
-    cancel: CancellationToken
-    active: Arc<AtomicBool>
-    impl Drop：先active=false再取消，实际结束仍由completion确认。
-WorkspaceRecordMonitorContext
-    changes: watch::Receiver<Option<workspace_core::WorkspaceRecordsSnapshot>>
-    publish: Arc<dyn Fn(workspace_core::WorkspaceRecordsSnapshot) + Send + Sync>--只捕获视图Weak及当前来源标记
-    completion: MonitorCompletionGuard
-    cancel: CancellationToken
-    guard: AxumWorkGuard
-AgentSettingsWatchSlot
+SettingsObservations(BTreeMap<Entity, SettingsSlot>)：settings模块私有Resource
+SettingsSlot
+    storage: AgentStorage
     path: PathBuf
-    state: Arc<Mutex<SettingsReadState>>
+    cancel: CancellationToken
     completion: Arc<MonitorCompletion>
-    cancel: CancellationToken
-SettingsReadState
-    Initializing | Available | Failed(String)
-AgentSettingsMonitorContext
-    state: Arc<Mutex<SettingsReadState>>
-    storage: storage_core::AgentStorage
+    impl Drop：cancel；完成由monitor实际退出通知。
+SettingsContext
+    storage: AgentStorage
     path: PathBuf
-    completion: MonitorCompletionGuard
     cancel: CancellationToken
+    lifetime: AxumLifetime
     guard: AxumWorkGuard
+    completion: MonitorCompletionGuard
 UiWatchSlot
     completion: Arc<MonitorCompletion>
     ui_path: PathBuf
@@ -401,20 +385,15 @@ TurnView
     view: View<AgentTurnStateDto>
     sync: SyncContext<AgentTurnStateDto>
 WorkspaceViews
-    catalog: Mutex<Catalog>
+    rows: Mutex<BTreeMap<Entity, WorkspaceInfoDto>>
     view: View<Vec<WorkspaceInfoDto>>
     sync: SyncContext<Vec<WorkspaceInfoDto>>
-Catalog
-    workspaces: BTreeMap<Entity, WorkspaceViewEntry>
-WorkspaceViewEntry
-    address: String
-    alias: String
-    project_root: PathBuf
-    state: workspace_core::WorkspaceState
-    records: Vec<workspace_core::WorkspaceAgent>
-    database_revision: u64
-    source_active: Arc<AtomicBool>
-    行为：组件探针与数据库监控在同一视图锁下只修改自己负责的字段，运行状态不落数据库；来源替换先失效旧标记，旧owned快照不能覆盖新状态。
+    sources: Mutex<BTreeMap<Entity, WorkspaceWatch>>
+WorkspaceWatch
+    database: workspace_core::WorkspaceDatabase
+    active: Arc<AtomicBool>
+    cancel: CancellationToken
+    impl Drop：active=false并cancel；异步循环只捕获WorkspaceViews Weak。
 MonitorCompletion
     done: AtomicBool
     changed: Notify

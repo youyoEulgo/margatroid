@@ -164,6 +164,7 @@ fn execution_limits_have_lua_memory_and_buffer_budgets_and_round_trip() {
                 oneshot::channel().0,
                 test_tasks().update_context(),
                 None,
+                test_finish(),
             )
             .unwrap_err()
             .kind,
@@ -195,7 +196,7 @@ async fn events_share_single_claimable_oneshot_with_turn_identity() {
     assert!(init.reply.lock().unwrap().is_none());
     receiver.await.unwrap().unwrap();
     let (sender, receiver) = oneshot::channel();
-    let request = ToolExecuteRequest {
+    let request = ToolExecuteRequest::Registered {
         id: "task".into(),
         agent,
         turn: Some("turn".into()),
@@ -205,15 +206,24 @@ async fn events_share_single_claimable_oneshot_with_turn_identity() {
         reply: Arc::new(Mutex::new(Some(sender))),
     };
     let clone = request.clone();
-    clone
-        .reply
+    let ToolExecuteRequest::Registered {
+        reply: cloned_reply,
+        ..
+    } = clone
+    else {
+        unreachable!()
+    };
+    cloned_reply
         .lock()
         .unwrap()
         .take()
         .unwrap()
         .send(Ok(parse(&json!("done"))))
         .unwrap();
-    assert!(request.reply.lock().unwrap().is_none());
+    let ToolExecuteRequest::Registered { reply, .. } = request else {
+        unreachable!()
+    };
+    assert!(reply.lock().unwrap().is_none());
     assert_eq!(receiver.await.unwrap().unwrap().content, "done");
 }
 
@@ -229,19 +239,9 @@ fn errors_are_bounded_and_serializable_without_other_domains() {
     );
 }
 
-fn test_binding() -> tool_core::TaskSyncBinding {
-    tool_core::TaskSyncBinding::new(
-        client_core::Clients::default(),
-        std::sync::Arc::from([]),
-        |snapshot| {
-            serde_json::to_string(&snapshot)
-                .map(|text| std::sync::Arc::new(client_core::ClientFrame::Text(text)))
-                .map_err(|_| client_core::ClientPrepareError::EncodeFailed)
-        },
-    )
-}
 fn test_tasks() -> tool_core::ToolTasks {
-    let mut app = core_plugin::App::new();
-    let owner = app.world_mut().spawn();
-    tool_core::ToolTasks::new(owner, "agent:test/unit:dev".into(), test_binding())
+    tool_core::ToolTasks::new()
+}
+fn test_finish() -> tool_core::TaskFinish {
+    std::sync::Arc::new(|handle| Box::pin(async move { handle.wait_finished().await }))
 }

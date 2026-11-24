@@ -38,24 +38,17 @@ version = "0.1.0"
 dependencies = [
  "address",
  "agent_core",
- "agent_driver_core",
  "app_runtime_plugin",
  "async_runtime_plugin",
- "client_core",
  "closure_plugin",
  "core_plugin",
  "futures-util",
  "inference_core",
- "lua_runtime_core",
  "mcl_core",
- "prompt_resource_core",
- "sandbox_resource_core",
  "serde_json",
  "storage_core",
  "tempfile",
  "tokio",
- "tokio-util",
- "toml",
  "tool_core",
  "tool_resource_core",
  "tracing",
@@ -1027,7 +1020,6 @@ dependencies = [
 name = "inference_core"
 version = "0.1.0"
 dependencies = [
- "client_core",
  "core_plugin",
  "serde",
  "serde_json",
@@ -2112,7 +2104,6 @@ dependencies = [
 name = "sandbox_resource_core"
 version = "0.1.0"
 dependencies = [
- "client_core",
  "core_plugin",
  "serde_json",
  "tokio",
@@ -2125,7 +2116,6 @@ version = "0.1.0"
 dependencies = [
  "app_runtime_plugin",
  "async_runtime_plugin",
- "client_core",
  "closure_plugin",
  "core_plugin",
  "sandbox_resource_core",
@@ -2678,7 +2668,6 @@ name = "tool_core"
 version = "0.1.0"
 dependencies = [
  "base64",
- "client_core",
  "core_plugin",
  "serde",
  "serde_json",
@@ -2695,7 +2684,6 @@ dependencies = [
  "app_runtime_plugin",
  "async_runtime_plugin",
  "base64",
- "client_core",
  "closure_plugin",
  "core_plugin",
  "futures-util",
@@ -2721,7 +2709,6 @@ dependencies = [
 name = "tool_resource_core"
 version = "0.1.0"
 dependencies = [
- "client_core",
  "core_plugin",
  "jsonschema",
  "serde",
@@ -2737,7 +2724,6 @@ version = "0.1.0"
 dependencies = [
  "app_runtime_plugin",
  "async_runtime_plugin",
- "client_core",
  "closure_plugin",
  "core_plugin",
  "serde_json",
@@ -3346,8 +3332,9 @@ name = "workspace_core"
 version = "0.1.0"
 dependencies = [
  "core_plugin",
+ "rusqlite",
  "serde",
- "serde_yaml",
+ "serde_json",
  "tempfile",
  "tokio",
 ]
@@ -3358,19 +3345,16 @@ version = "0.1.0"
 dependencies = [
  "address",
  "agent_core",
- "agent_driver_core",
  "app_runtime_plugin",
  "async_runtime_plugin",
- "client_core",
  "closure_plugin",
  "core_plugin",
  "futures-util",
- "lua_runtime_core",
  "serde_json",
- "serde_yaml",
  "tempfile",
  "tokio",
  "tool_core",
+ "tracing",
  "workspace_core",
 ]
 

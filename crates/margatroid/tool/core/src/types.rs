@@ -1,6 +1,7 @@
 use crate::{ToolError, ToolErrorKind, encoded_len};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::BTreeMap;
 use std::future::{Future, poll_fn};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -125,11 +126,34 @@ struct ToolTaskData {
     error: Option<ToolError>,
 }
 
-#[derive(Debug)]
+pub type TaskChildCloseFuture = Pin<Box<dyn Future<Output = Result<(), ToolError>> + Send>>;
+pub type TaskChildClose = Arc<dyn Fn() -> TaskChildCloseFuture + Send + Sync>;
+pub type TaskFinish = Arc<dyn Fn(ToolTaskHandle) -> TaskChildCloseFuture + Send + Sync>;
+#[derive(Default)]
+pub(crate) struct TaskChildren {
+    accepting: bool,
+    completed: bool,
+    children: BTreeMap<core_plugin::Entity, TaskChildClose>,
+    retries: BTreeMap<u64, TaskChildClose>,
+    next_retry: u64,
+}
+impl std::fmt::Debug for TaskChildren {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TaskChildren")
+            .field("children", &self.children.len())
+            .field("retries", &self.retries.len())
+            .finish()
+    }
+}
+
 struct ToolTaskShared {
     execution_id: String,
     turn: Option<String>,
     registrations: crate::TaskScope,
+    children: Mutex<TaskChildren>,
+    child_cleanup: tokio::sync::Mutex<()>,
+    retry_cleanup: tokio::sync::Mutex<()>,
+    finish: TaskFinish,
     cancel: CancellationToken,
     task: Mutex<Option<JoinHandle<()>>>,
     task_attached: AtomicBool,
@@ -140,6 +164,13 @@ struct ToolTaskShared {
     cache_bytes: usize,
 }
 
+impl std::fmt::Debug for ToolTaskShared {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ToolTaskShared")
+            .field("execution_id", &self.execution_id)
+            .finish_non_exhaustive()
+    }
+}
 #[derive(Clone, Debug)]
 pub struct ToolTaskHandle {
     inner: Arc<ToolTaskShared>,
@@ -160,6 +191,7 @@ impl ToolTaskHandle {
         reply: oneshot::Sender<Result<ToolExecuteResponse, ToolError>>,
         updates: crate::TaskUpdateContext,
         turn: Option<String>,
+        finish: TaskFinish,
     ) -> Result<(Self, mpsc::UnboundedReceiver<Value>), ToolError> {
         if let Err(error) = limits.validate() {
             let _ = reply.send(Err(error.clone()));
@@ -179,6 +211,13 @@ impl ToolTaskHandle {
                     execution_id,
                     turn,
                     registrations: crate::TaskScope::default(),
+                    children: Mutex::new(TaskChildren {
+                        accepting: true,
+                        ..Default::default()
+                    }),
+                    child_cleanup: tokio::sync::Mutex::new(()),
+                    retry_cleanup: tokio::sync::Mutex::new(()),
+                    finish,
                     cancel: CancellationToken::new(),
                     task: Mutex::new(None),
                     task_attached: AtomicBool::new(false),
@@ -269,6 +308,7 @@ impl ToolTaskHandle {
         self.inner.registrations.close();
     }
     pub fn cancel(&self) {
+        lock(&self.inner.children).accepting = false;
         self.close_registrations();
         self.inner.cancel.cancel();
     }
@@ -426,7 +466,169 @@ impl ToolTaskHandle {
         lock(&self.inner.shared).cleanup_complete
     }
 
-    pub async fn finish(&self) -> Result<(), ToolError> {
+    pub fn finish(&self) -> TaskChildCloseFuture {
+        self.cancel();
+        if self.is_cleanup_complete() {
+            return Box::pin(async { Ok(()) });
+        }
+        (self.inner.finish)(self.clone())
+    }
+    pub fn bind_child(
+        &self,
+        entity: core_plugin::Entity,
+        close: TaskChildClose,
+    ) -> Result<(), ToolError> {
+        let mut state = lock(&self.inner.children);
+        if state.completed || !state.accepting || self.inner.cancel.is_cancelled() {
+            return Err(ToolError::new(
+                ToolErrorKind::Closed,
+                "task no longer accepts children",
+            ));
+        }
+        state.children.entry(entity).or_insert(close);
+        Ok(())
+    }
+    /// Clone an already registered child's opaque close capability for failed
+    /// creation handoff compensation. This does not reopen child admission.
+    pub fn child_close(&self, entity: core_plugin::Entity) -> Option<TaskChildClose> {
+        lock(&self.inner.children).children.get(&entity).cloned()
+    }
+
+    pub fn retain_child_for_cleanup(
+        &self,
+        entity: core_plugin::Entity,
+        close: TaskChildClose,
+    ) -> Result<(), ToolError> {
+        let mut state = lock(&self.inner.children);
+        if state.completed {
+            return Err(ToolError::new(
+                ToolErrorKind::Closed,
+                "task already cleaned up",
+            ));
+        }
+        state.children.entry(entity).or_insert(close);
+        Ok(())
+    }
+    pub async fn finish_children(&self) -> Result<(), ToolError> {
+        let _run = self.inner.child_cleanup.lock().await;
+        let children = {
+            let mut state = lock(&self.inner.children);
+            state.accepting = false;
+            state
+                .children
+                .iter()
+                .map(|(entity, close)| (*entity, close.clone()))
+                .collect::<Vec<_>>()
+        };
+        let mut failure = None;
+        for (entity, close) in children {
+            match close().await {
+                Ok(()) => {
+                    lock(&self.inner.children).children.remove(&entity);
+                }
+                Err(error) => {
+                    if failure.is_none() {
+                        failure = Some(error);
+                    }
+                }
+            }
+        }
+        failure.map_or(Ok(()), Err)
+    }
+    pub fn retain_cleanup(&self, close: TaskChildClose) -> Result<(), ToolError> {
+        let mut state = lock(&self.inner.children);
+        if state.completed {
+            return Err(ToolError::new(
+                ToolErrorKind::Closed,
+                "task already cleaned up",
+            ));
+        }
+        let id = state.next_retry;
+        state.next_retry = id
+            .checked_add(1)
+            .ok_or_else(|| ToolError::new(ToolErrorKind::CleanupFailed, "cleanup id overflow"))?;
+        state.retries.insert(id, close);
+        Ok(())
+    }
+    pub async fn retry_cleanups(&self) -> Result<(), ToolError> {
+        let _run = self.inner.retry_cleanup.lock().await;
+        let retries = lock(&self.inner.children)
+            .retries
+            .iter()
+            .map(|(id, close)| (*id, close.clone()))
+            .collect::<Vec<_>>();
+        let mut failure = None;
+        for (id, close) in retries {
+            match close().await {
+                Ok(()) => {
+                    lock(&self.inner.children).retries.remove(&id);
+                }
+                Err(error) => {
+                    if failure.is_none() {
+                        failure = Some(error);
+                    }
+                }
+            }
+        }
+        failure.map_or(Ok(()), Err)
+    }
+    pub(crate) fn begin_cleanup_completion(&self) -> bool {
+        let mut state = lock(&self.inner.children);
+        if !state.children.is_empty() || !state.retries.is_empty() {
+            return false;
+        }
+        state.completed = true;
+        state.accepting = false;
+        true
+    }
+    /// Wait only for the execution supervisor to exit; child and retry cleanup
+    /// remains the responsibility of the independently supervised TaskFinish.
+    pub async fn wait_execution_ended(&self) -> Result<(), ToolError> {
+        if let Some(current) = tokio::task::try_id()
+            && lock(&self.inner.task)
+                .as_ref()
+                .is_some_and(|task| task.id() == current)
+        {
+            return Err(ToolError::new(
+                ToolErrorKind::InvalidRequest,
+                "supervisor cannot join itself",
+            ));
+        }
+        loop {
+            // Register before observing the attachment slot: attach_task may run
+            // after this waiter begins, and notify_waiters does not retain permits.
+            let changed = self.inner.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if self.inner.supervisor_ended.load(Ordering::Acquire) || self.is_cleanup_complete() {
+                return Ok(());
+            }
+            let joined = poll_fn(|cx| {
+                let mut slot = lock(&self.inner.task);
+                let Some(task) = slot.as_mut() else {
+                    return Poll::Pending;
+                };
+                match Pin::new(task).poll(cx) {
+                    Poll::Pending => Poll::Pending,
+                    Poll::Ready(result) => {
+                        *slot = None;
+                        self.inner.supervisor_ended.store(true, Ordering::Release);
+                        self.inner.changed.notify_waiters();
+                        Poll::Ready(result.map_err(|failure| {
+                            ToolError::new(ToolErrorKind::TaskPanicked, failure.to_string())
+                        }))
+                    }
+                }
+            });
+            tokio::select! {
+                result = joined => return result,
+                () = &mut changed => {},
+            }
+        }
+    }
+
+    /// Observe the execution supervisor without invoking the finish callback again.
+    pub async fn wait_finished(&self) -> Result<(), ToolError> {
         // A supervisor must exit through its cleanup path, never join itself.
         if let Some(current) = tokio::task::try_id()
             && lock(&self.inner.task)

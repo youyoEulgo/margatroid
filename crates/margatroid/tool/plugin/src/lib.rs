@@ -13,32 +13,37 @@ use app_runtime_plugin::{RuntimeHandle, RuntimePlugin};
 use async_runtime_plugin::AsyncRuntimeHandle;
 use closure_plugin::{WorldClosureExt, WorldClosureSender};
 use core_plugin::{App, Plugin, Resource};
-use tool_core::{TaskSyncBinding, ToolExecutionLimits};
+use tool_core::{ToolExecutionLimits, ToolTasks};
+pub type TaskObserverBinder = Arc<dyn Fn(core_plugin::Entity, String, &ToolTasks) + Send + Sync>;
 
 pub use handler::runner_main;
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct ToolPlugin {
     pub(crate) schedule: String,
     pub(crate) runner_path: PathBuf,
     pub(crate) limits: ToolExecutionLimits,
-    pub(crate) sync: TaskSyncBinding,
+    pub(crate) observe_tasks: Option<TaskObserverBinder>,
 }
 
 impl ToolPlugin {
-    pub fn new(sync: TaskSyncBinding) -> Self {
+    pub fn new() -> Self {
         let runner_path = std::env::current_exe()
             .ok()
             .and_then(|path| path.parent().map(|parent| parent.join("tool_runner")))
             .unwrap_or_else(|| PathBuf::from("tool_runner"));
         Self {
-            sync,
+            observe_tasks: None,
             schedule: RuntimePlugin::UPDATE.into(),
             runner_path,
             limits: ToolExecutionLimits::default(),
         }
     }
 
+    pub fn with_task_observer(mut self, observer: TaskObserverBinder) -> Self {
+        self.observe_tasks = Some(observer);
+        self
+    }
     pub fn with_schedule(mut self, schedule: impl Into<String>) -> Self {
         self.schedule = schedule.into();
         self
@@ -85,15 +90,6 @@ impl Plugin for ToolPlugin {
             ),
             "ToolPlugin requires UPDATE or POST_UPDATE after turn abort handling"
         );
-        if let Some(clients) = app.world().get_resource::<client_core::Clients>() {
-            assert!(
-                clients.same_instance(&self.sync.clients),
-                "tool sync must use the shared Clients slot"
-            );
-        } else {
-            app.world_mut().insert_resource(self.sync.clients.clone());
-        }
-        app.world_mut().insert_resource(self.sync.clone());
         let sender = Arc::new(app.world().closure_sender(&self.schedule));
         app.world_mut().insert_resource(ToolRuntime(sender));
         services::install_on(app, &self.schedule);
@@ -106,3 +102,13 @@ impl Plugin for ToolPlugin {
 }
 
 pub use services::install as install_lua_services;
+
+impl Default for ToolPlugin {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(test)]
+#[path = "../tests/support/lifecycle.rs"]
+mod test_support;

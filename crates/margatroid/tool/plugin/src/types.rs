@@ -8,19 +8,29 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
-use tool_core::{
-    ToolConfiguration, ToolError, ToolExecuteRequest, ToolExecutionLimits, ToolTaskHandle,
-    ToolTasks,
-};
+use tool_core::{ToolConfiguration, ToolError, ToolExecutionLimits, ToolTaskHandle, ToolTasks};
 use tool_resource_core::{RegisterToolsRequest, TaskReference, ToolEntry};
 
+#[derive(Clone)]
+pub(crate) struct ToolInvocation {
+    pub id: String,
+    pub agent: core_plugin::Entity,
+    pub turn: Option<String>,
+    pub alias: String,
+    pub call_id: String,
+    pub arguments: Value,
+}
+
 pub(crate) struct ToolExecutionContext {
-    pub request: ToolExecuteRequest,
-    pub storage: storage_core::AgentStorage,
+    pub request: ToolInvocation,
+    pub storage: Option<storage_core::AgentStorage>,
     pub agent_name: String,
     pub agent_address: String,
     pub workspace: Value,
     pub diagnostic_received: bool,
+    pub path_entry: bool,
+    pub cleanup_proven: Arc<std::sync::atomic::AtomicBool>,
+    pub trusted_path: Arc<Mutex<PathBuf>>,
     pub tool_entry: ToolEntry,
     pub world: std::sync::Weak<WorldClosureSender>,
     pub sandbox_path: Option<PathBuf>,
@@ -73,10 +83,24 @@ impl ToolContext {
             context.remove("temp_dir");
             context.remove("agent_name");
             context.insert("kind".into(), Value::String("tool".into()));
-            context.insert(
-                "agent_info".into(),
-                serde_json::json!({"name": self.agent_name,"address":self.agent_address}),
-            );
+            if !self.agent_address.is_empty()
+                && !self.workspace.is_null()
+                && self.workspace.get("address").and_then(Value::as_str)
+                    != Some(self.agent_address.as_str())
+            {
+                context.insert(
+                    "agent_info".into(),
+                    serde_json::json!({"name": self.agent_name,"address":self.agent_address}),
+                );
+            } else {
+                context.remove("agent_address");
+            }
+            if self.project_root.as_os_str().is_empty() {
+                context.remove("project_root");
+            }
+            if self.workspace.is_null() {
+                context.remove("workspace");
+            }
         }
         Ok(value)
     }

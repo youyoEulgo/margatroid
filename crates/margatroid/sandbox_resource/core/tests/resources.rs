@@ -219,6 +219,6 @@ fn selecting_checks_registered_alias_but_does_not_open_policy() {
         .is_none());
 }
 
-fn test_probe<T>() -> client_core::UpdateProbe<T> {
-    client_core::UpdateProbe::new(|_| {})
+fn test_probe<T>() -> std::sync::Arc<dyn Fn(T) + Send + Sync> {
+    std::sync::Arc::new(|_| {})
 }

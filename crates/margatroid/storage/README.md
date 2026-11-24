@@ -1,6 +1,6 @@
 # Storage
 
-本轮共享Client槽位、统一写入口与异步监控已实现，尚未提交。具体函数和边界见本领域DESIGN及[DTO说明](../dto/README.md)；运行进程需使用新构建。
+本文描述当前源码中的存储和显式关闭契约，不表示运行中的daemon已经更新。具体入口见本领域DESIGN。
 storage_core定义AgentStorage、Block、历史、Agent日志和设置操作及其文件实现，只依赖mecs、SQLite、TOML等通用库，不依赖其他领域core。storage_plugin取得组件句柄并调度blocking worker，通过原请求oneshot回复，不提供额外结果事件。Agent日志另由storage_core公开函数直接读写，不进入StorageOperation或StorageRequest。
 
 当前管理库schema版本为5，Block文件schema版本为2。旧version 3 JSON Block、旧三表或其他不匹配结构明确返回SchemaMismatch，不迁移、不兼容、不生成额外备份。测试仅操作临时目录，不操作用户数据库。
@@ -9,7 +9,7 @@ storage_core定义AgentStorage、Block、历史、Agent日志和设置操作及�
 
 持久Block位于<管理库完整路径>.blocks/<真实Block逻辑名>/timeline.sqlite，快照为同目录snapshot_<id>.sqlite，每个子项对应f0、f1等宿主生成表。Block名严格采用字母/下划线起始、后续字母数字下划线连字符规则，禁止路径片段；表名不拼接用户输入。TEMP及其快照只保存在内存，不产生目录、数据库文件、映射、intent或SQLite侧文件。
 
-管理库block_snapshots每Block有一条kind=timeline、snapshot_id=0的工作映射，以及若干kind=snapshot、snapshot_id>0的只读记录。管理库只保存持久Block，instance约束为空字符串，snapshot_id、上游引用和编号按block_name独立。TEMP以真实VM实例和Block名作为纯内存集合键，与持久映射分开。fields_json仅保存子项到表的映射，不保存消息数组。
+管理库block_snapshots每Block有一条kind=timeline、snapshot_id=0的工作映射，以及若干kind=snapshot、snapshot_id>0的只读记录。管理库只保存持久Block，instance约束为空字符串，snapshot_id、上游引用和编号按block_name独立。TEMP以调用方提供的真实运行instance和Block名作为纯内存集合键；Agent上的MCL使用Agent.instance，与持久映射分开。fields_json仅保存子项到表的映射，不保存消息数组。
 
 公开同步函数snapshot_block(storage,name,instance)返回Unit语义，完整复制timeline为快照，新快照继承旧上游，timeline再指向新快照，工作文件和正文不变。read_block_snapshots返回JSON对象：timeline含file_name、fields_json、upstream_id；snapshots按ID升序，每项另有snapshot_id。timeline内部ID=0不在该JSON中暴露；TEMP查询的file_name为null，不伪造磁盘路径。Some(instance)优先选择所属TEMP，没有则按原选择器规则回退持久Block；其他实例的TEMP不可见。
 
@@ -21,7 +21,7 @@ restore_block(storage,name,instance,snapshot_id)先checkpoint并关闭工作库�
 
 restore_intent保障回档在中断后完成同一次操作。初始化在开放一般Block IO前完成登记的intent，已归档时不再次改名当前工作文件、不再分配ID；失败封闭存储并报告实际错误。跨文件的复制/改名与管理库并非一个SQL事务，中间态由共享管理连接锁及持久intent隔离，不能把rename本身当成整体原子性证明。
 
-TEMP内容与快照只属于本次VM，以纯内存消息向量和快照深副本保存。DropTemporaryBlocks只移除指定实例的内存集合，其他实例和持久Block不变；丢弃存储管理器自然释放全部TEMP。TEMP快照ID独立、上游分支及回档前归档语义与持久Block一致，但没有任何磁盘副作用。
+TEMP内容与快照只属于本次运行instance，以纯内存消息向量和快照深副本保存。DropTemporaryBlocks只移除指定实例的内存集合，其他实例和持久Block不变；丢弃存储管理器自然释放全部TEMP。TEMP快照ID独立、上游分支及回档前归档语义与持久Block一致，但没有任何磁盘副作用。
 
 所有消息统一拆为sequence、role、content、data、tool_call、payload，Block另有position表达数组位置，sequence绝不当作索引。system/user/tool_call结果的content直存文本，assistant/compact的content为包含reasoning和content的JSON对象，inject的content为消息数组JSON，error的message直存content。内部data原值独立存JSON，tool_calls独立存tool_call，payload只保留其余字段。读取重建原内部格式，拒绝replay、images别名和重复保留字段。
 
@@ -29,11 +29,17 @@ append_message_history(storage,messages,turn)在一个事务中按消息与MCL�
 
 ## 初始化与生命周期
 
-Agent启动闭包在blocking worker调用open_storage。数据库不存在则创建，已有数据库保留内容并校验schema。Agent设置文件不存在才使用Driver默认模板创建；数据库与设置分别判断。模板可为空，已有设置不覆盖、不合并，格式损坏直接报错。
+Driver的创建Agent注入方法准备文件后在blocking worker调用open_storage，取得已连接、可直接使用的AgentStorage，随后通过StartAgent事件交给实体装配System同步挂载。数据库不存在则创建，已有数据库保留内容并校验schema。Agent设置文件不存在才使用Driver默认模板创建；数据库与设置分别判断。模板可为空，已有设置不覆盖、不合并，格式损坏直接报错。
 
-AgentStorage独立挂载到Agent Entity，持有数据库句柄及设置路径，不嵌入Agent。克隆共享连接、TEMP内存和文件锁，不缓存持久Block或设置正文。所有需要协调的同库操作共享连接管理器；停止关闭新受理并等待真实worker退出后再释放句柄，不因丢弃Future认定操作已结束。有目标存储的执行host持有owned AgentStorage克隆作为日志能力；尚无Agent的Workspace Lua只使用运行诊断日志，覆盖Driver、工具及Lua worker清理期间的故障捕获和最终日志写入；完成这些写入的真实join后才drop句柄，不新建日志任务、身份注册表或System生命周期事件。
+AgentStorage独立挂载到Agent Entity，持有数据库句柄及设置路径，不嵌入Agent。克隆共享连接、TEMP内存和文件锁，不缓存持久Block或设置正文。is_open()只报告共享来源是否仍开放；settings_path()提供真实配置路径供监控，data_dir()返回其父目录。
 
-storage_core只认识路径和存储操作，不读取Workspace配置、定位Driver、加载工具或管理VM。文件路径由Agent启动参数明确提供，配置指令不允许改成任意文件路径。
+close_storage(&AgentStorage)是同步显式关闭入口，异步生命周期必须在blocking worker执行并等待真实结果。它与全部数据库、配置、日志及Block访问共用管理锁；Block连接只在该门内临时打开，取得锁时这些操作已返回。关闭将所有克隆退休，再物理关闭管理Connection并释放TEMP。
+
+SQLite关闭失败返回CloseFailed并保留Connection，来源保持退休，所有普通访问返回Closed；再次close_storage可重试，成功部分不重新打开。成功关闭后旧克隆始终Closed；open_storage相同文件可以创建独立新共享状态，不复活旧克隆。仅drop一个Arc不等于关闭共享连接。
+
+Agent关闭先停止受理、等待MCL/推理/工具及记录和文件监控worker，然后显式关闭存储；所有owned日志引用需在此之前完成写入。无Agent诊断使用既有tracing，不建立额外日志库。Block提交失败导致的封闭仍保留CleanupFailed及原恢复语义，不能误当成正常显式关闭。
+
+storage_core只认识路径和存储操作，不读取Workspace配置、定位Driver、加载工具或管理VM。文件路径由创建注入方法准备后确定，配置指令不允许改成任意文件路径。
 
 ## 消息Block
 
@@ -57,9 +63,9 @@ CREATE字段名不带类型，不存在则创建，存在且字段及生命周�
 
 agent_logs是独立的管理库日志表，仅保留sequence、created_at_ms、level、source、stage、message、details_json、context_json、origin、raw_error、traceback。sequence使用SQLite INTEGER PRIMARY KEY，由同一写事务内该表自身MAX(sequence)+1生成，空表从1开始，不使用AUTOINCREMENT，不共享历史序号。level仅debug、info、warn、error；source仅driver、tool、host；stage是load、configure、execute、driver、hostlog等阶段描述，不建立阶段枚举或调度语义。details_json可选且为对象；context_json同样可选，其turn、task、call、alias、driver_instance关联均可缺省，避免为每种运行上下文增加列。origin保存可确定的程序来源地址，raw_error和traceback可空。
 
-公开的append_agent_log(storage: &AgentStorage, record: AgentLogRecord) -> Result<StoredAgentLog, StorageError>与read_agent_logs(storage: &AgentStorage, after_sequence: Option<u64>, limit: usize) -> Result<Vec<StoredAgentLog>, StorageError>均为同步core函数。写入在现有共享连接串行锁内完成独立事务；读取同样共锁，按sequence升序读取严格大于after_sequence的记录，None从开头、limit为0返回空数组。不借出或并行使用raw Connection。异步host克隆AgentStorage后spawn_blocking并await真实join；日志方法成功表示已确认落库，不能仅发送IPC或提交worker就回复成功。读函数是供core调用方使用的诊断能力，当前没有DTO、GUI API或LLM自动读取工具。
+公开的append_agent_log(storage: &AgentStorage, record: AgentLogRecord) -> Result<StoredAgentLog, StorageError>与read_agent_logs(storage: &AgentStorage, after_sequence: Option<u64>, limit: usize) -> Result<Vec<StoredAgentLog>, StorageError>均为同步core函数。写入在现有共享连接串行锁内完成独立事务；读取同样共锁，按sequence升序读取严格大于after_sequence的记录，None从开头、limit为0返回空数组。不借出或并行使用raw Connection。异步host克隆AgentStorage后spawn_blocking并await真实join；日志方法成功表示已确认落库，不能仅发送IPC或提交worker就回复成功。read_agent_logs供core诊断调用；网络日志分页使用read_agent_log_page，不依赖脚本自动读取，也不消费日志。
 
-DomainToolPlugin和LuaRuntimePlugin只依赖storage_core取得日志能力，不依赖storage_plugin或借用ECS World。Driver与工具使用统一host及能力集合，可信运行身份仅绑定实际来源和取消归属；日志入口复用该host，脚本主动调用margatroid:log()只提交级别、消息和可选结构化详情。source始终由host保留原始运行身份：Driver日志为driver，工具日志为tool，宿主自身诊断才为host；转交统一host不能把Driver或工具日志改标host。stage、origin及context_json中的关联由host补齐，脚本无权声明或覆盖这些可信字段。
+ToolPlugin和LuaRuntimePlugin只依赖storage_core取得日志能力，不依赖storage_plugin或借用ECS World。Driver与工具使用统一host及能力集合，可信运行身份仅绑定实际来源和取消归属；日志入口复用该host，脚本主动调用margatroid:log()只提交级别、消息和可选结构化详情。source始终由host保留原始运行身份：Driver日志为driver，工具日志为tool，宿主自身诊断才为host；转交统一host不能把Driver或工具日志改标host。stage、origin及context_json中的关联由host补齐，脚本无权声明或覆盖这些可信字段。
 
 Lua加载、配置、执行、Driver回调及清理等边界的自动故障捕获，在格式化业务错误前取得完整raw_error与可用的traceback，并由host附带来源和已知关联写入日志。自动故障与主动日志共享写入能力；worker跨IPC仅使用私有Log frame及对应完成确认，不改变StorageRequest的operation载荷、不增加StorageOperation variant或SystemEvent，不在事件路由内加入日志行为。自动日志写入失败回落现有诊断通道，保留并继续交付原业务错误，不递归自动记日志；主动日志写入失败如实返回调用方。日志写入不触发history_append，不进入历史时间线或推理消息。
 
@@ -88,7 +94,7 @@ read_message_page、read_mcl_page、read_agent_log_page及read_record_watermarks
 
 ## 提交观察与范围查询
 
-COMMIT观察及索引范围SQL在基线已有实现；本轮目标把监控归属移至实际Agent存储，把出口改为共享Client槽位直投。管理库共享状态增加record_changes，保存消息、MCL及日志三个真实已提交高水位，并以Tokio watch提供独立观察。新增记录确认COMMIT后通知，读操作、空批次、已有sequence复用、失败及回滚均保持通知值。该通知是进程内状态变化能力，不是Storage ECS事件，也不保存第二份记录正文。
+管理库共享状态的record_changes，保存消息、MCL及日志三个真实已提交高水位，并以Tokio watch提供独立观察。新增记录确认COMMIT后通知，读操作、空批次、失败及回滚均保持通知值；显式history_append每次分配新序号并形成新提交。该通知是进程内状态变化能力，不是Storage ECS事件，也不保存第二份记录正文。
 
 Agent实际存储初始化时通过Agent实际资源安装回调建立一个长期异步监控，先订阅再取得初始基线，后续等待changed。watch通知可以合并，监控以实际sequence追齐记录。提交在读取期间发生时仍保留通知，未读完的同次变化继续分页；追齐后等待下次真实提交。SQL worker完成后只回到监控本身，不额外触发World调查。
 
@@ -99,3 +105,5 @@ run_record_watch不产出WebSocketMessageSend；它把非空实际记录编码�
 未绑定Agent的日志直接通过既有tracing输出，遵守配置的日志级别和过滤器；不创建独立运行日志数据库、不强制保存运行级报告。绑定Agent的日志沿原AgentStorage及提交探针处理。
 
 compact为assistant消息别名：存储原type=compact，文本/思考、工具调用、usage及请求关联按assistant可逆拆装；不新增表或迁移已有schema。
+
+显式关闭测试覆盖实际SQLite BUSY失败后的同连接重试、共享克隆统一退休、关闭等待在途受理锁、TEMP释放、配置/日志/分页/Block关闭拒绝及提交水位不变；原Block快照与崩溃恢复测试继续验证既定语义。

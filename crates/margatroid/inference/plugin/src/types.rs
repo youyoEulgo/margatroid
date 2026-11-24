@@ -36,6 +36,7 @@ pub(crate) struct InferenceCleanupFinished {
     pub agent: Entity,
     pub request_id: String,
     pub source: Arc<std::sync::atomic::AtomicBool>,
+    pub instance: String,
 }
 impl Event for InferenceCleanupFinished {}
 

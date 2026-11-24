@@ -73,8 +73,4 @@ pub use environment::{configuration_globals, create_environment, enable_executio
 mod services;
 pub use services::{LuaExecutionIdentity, LuaServiceFuture, LuaServices};
 
-pub use components::AgentWaitSlot;
-
-pub use components::WorkspaceLuaTask;
-
 pub use components::LuaAgentMonitor;

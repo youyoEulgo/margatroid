@@ -208,54 +208,35 @@ impl Fixture {
             );
         }
         let workspace = app.world_mut().spawn();
-        app.world_mut().insert_component(
-            workspace,
-            address::Address::new("workspace:test/unit:dev").unwrap(),
-        );
-        app.world_mut().insert_component(
-            workspace,
-            Address::new("workspace:margatroid/demo:dev").unwrap(),
-        );
+        app.world_mut()
+            .insert_component(workspace, address::Address::new("/demo").unwrap());
+        app.world_mut()
+            .insert_component(workspace, Address::new("/demo").unwrap());
         app.world_mut().insert_component(
             workspace,
             workspace_core::Workspace::new(
                 "demo".into(),
-                root.path().join("workspace.yaml"),
                 root.path().to_owned(),
-                workspace_core::WorkspaceState::Running,
-                std::collections::BTreeSet::new(),
-                None,
-                crate::test_workspace_context(),
+                test_database(root.path()),
             ),
         );
         let agent = app.world_mut().spawn();
-        agent_core::AgentTaskBinding::reserve(
-            app.world_mut(),
-            agent,
-            agent_core::AgentCreator {
-                address: "workspace:margatroid/test:dev".into(),
-                task_id: "fixture-driver".into(),
-            },
-        );
-        let agent_updates = app
-            .world()
-            .get_resource::<agent_core::AgentUpdateContext>()
-            .cloned()
-            .unwrap_or_else(test_agent_context);
         app.world_mut().insert_component(
             agent,
             agent_core::Agent::new(
-                "test".into(),
                 workspace,
-                AgentState::Running,
-                Some("turn".into()),
-                agent_updates.clone(),
+                workspace,
+                "fixture-driver".into(),
+                root.path().to_owned(),
             ),
         );
-        app.world_mut().insert_component(
-            agent,
-            Address::new("agent:margatroid-test-dev/agent:dev").unwrap(),
-        );
+        use agent_core::WorldAgentExt;
+        app.world_mut().agent_ready(agent).unwrap();
+        app.world_mut()
+            .agent_set_turn(agent, Some("turn".into()))
+            .unwrap();
+        app.world_mut()
+            .insert_component(agent, Address::new("/demo/agent").unwrap());
         install_vm(app.world_mut(), agent, "driver-fixture");
         let (sender, mut reply) = oneshot::channel();
         app.world().emit_event(InitInference {
@@ -355,7 +336,7 @@ impl Fixture {
         .unwrap();
         std::fs::write(directory.join("input.schema.json"), "{\"type\":\"object\"}").unwrap();
         std::fs::write(directory.join("main.lua"), "function configure(arguments, context) return {timeout_ms=30000} end\nfunction execute() end").unwrap();
-        let mut tools = Tools::new(crate::test_probe());
+        let mut tools = Tools::new();
         tools
             .insert("visible".into(), common::tool(directory.join("tool.toml")))
             .unwrap();
@@ -610,10 +591,10 @@ fn invalid_turn_and_stale_entity_never_find_a_replacement_by_address() {
     let replacement = fixture.app.world_mut().spawn();
     assert_eq!(original.index(), replacement.index());
     assert_ne!(original.generation(), replacement.generation());
-    fixture.app.world_mut().insert_component(
-        replacement,
-        Address::new("agent:margatroid-test-dev/agent:dev").unwrap(),
-    );
+    fixture
+        .app
+        .world_mut()
+        .insert_component(replacement, Address::new("/demo/agent").unwrap());
     assert_eq!(
         fixture.run(request, reply).unwrap_err().kind,
         Kind::AgentMissing
@@ -718,8 +699,17 @@ fn address_only_state_and_streams_preserve_target_through_vm_restart() {
         .app
         .world_mut()
         .insert_component(fixture.agent, storage.clone());
-    let waits =
-        agent_core::notify_agent_runtime(fixture.app.world_mut(), fixture.agent, false).unwrap();
+    let updates = fixture
+        .app
+        .world()
+        .get_resource::<agent_core::AgentUpdateContext>()
+        .unwrap()
+        .clone();
+    let waits = updates.notify(
+        fixture.app.world_mut(),
+        fixture.agent,
+        agent_core::AgentUpdateKind::SourcesInstalled { ui_path: None },
+    );
     assert!(waits.is_empty());
     let deadline = Instant::now() + Duration::from_secs(5);
     let address = loop {
@@ -792,7 +782,7 @@ fn address_only_state_and_streams_preserve_target_through_vm_restart() {
         });
         for frame in [&reasoning, &content, &finished] {
             assert!(frame.get("instance").is_none());
-            assert_eq!(frame["address"], "agent:margatroid-test-dev/agent:dev");
+            assert_eq!(frame["address"], "/demo/agent");
             serde_json::from_value::<margatroid_protocol::ServerMessage>(frame.clone()).unwrap();
         }
         assert_eq!(reasoning["reasoning"], "thinking");
@@ -1086,21 +1076,57 @@ fn new_response_reasoning_remains_generic_across_storage_and_api_switches() {
     }
 }
 
-fn test_agent_context() -> agent_core::AgentUpdateContext {
-    agent_core::AgentUpdateContext::new(|_, _, _| Vec::new(), |_, _| {})
+fn test_database(root: &std::path::Path) -> workspace_core::WorkspaceDatabase {
+    for kind in ["normal", "temporary", "archived"] {
+        std::fs::create_dir_all(root.join("agents").join(kind)).unwrap();
+    }
+    workspace_core::WorkspaceDatabase::create(
+        root.join("workspace.sqlite"),
+        workspace_core::WorkspaceMetadata {
+            address: "/demo".into(),
+            alias: "Demo".into(),
+            project_root: root.to_owned(),
+        },
+    )
+    .unwrap()
 }
-
-fn test_workspace_context() -> workspace_core::WorkspaceUpdateContext {
-    workspace_core::WorkspaceUpdateContext::new(|_, _| {})
+trait FixtureAgentState {
+    fn fixture_state(
+        &mut self,
+        entity: Entity,
+        state: AgentState,
+        turn: Option<String>,
+    ) -> Result<(), agent_core::AgentError>;
 }
-
-fn test_probe<T>() -> client_core::UpdateProbe<T> {
-    client_core::UpdateProbe::new(|_| {})
+impl FixtureAgentState for core_plugin::World {
+    fn fixture_state(
+        &mut self,
+        entity: Entity,
+        state: AgentState,
+        turn: Option<String>,
+    ) -> Result<(), agent_core::AgentError> {
+        use agent_core::WorldAgentExt;
+        if state == AgentState::Starting {
+            let old = self.get_component::<agent_core::Agent>(entity).unwrap();
+            let new = agent_core::Agent::new(
+                old.workspace(),
+                old.parent(),
+                old.task_id().to_owned(),
+                old.project_root().to_owned(),
+            );
+            self.insert_component(entity, new);
+            return Ok(());
+        }
+        if state == AgentState::Closing {
+            return self.agent_begin_close(entity);
+        }
+        self.agent_ready(entity)?;
+        self.agent_set_turn(entity, turn)
+    }
 }
 
 #[test]
 fn free_inference_executes_without_a_turn_in_starting_and_running_and_never_inherits_one() {
-    use agent_core::WorldAgentExt;
     for (state, current) in [
         (AgentState::Starting, None),
         (AgentState::Running, None),
@@ -1111,7 +1137,7 @@ fn free_inference_executes_without_a_turn_in_starting_and_running_and_never_inhe
         fixture
             .app
             .world_mut()
-            .agent_transition(fixture.agent, state, current.clone())
+            .fixture_state(fixture.agent, state, current.clone())
             .unwrap();
         let (mut request, reply) = fixture.request("free-inference");
         request.turn = None;
@@ -1140,19 +1166,14 @@ fn free_inference_executes_without_a_turn_in_starting_and_running_and_never_inhe
     }
 }
 #[test]
-fn free_inference_still_rejects_error_stopping_and_precancelled_requests() {
-    use agent_core::WorldAgentExt;
-    for (state, cancelled) in [
-        (AgentState::Error, false),
-        (AgentState::Stopping, false),
-        (AgentState::Starting, true),
-    ] {
+fn free_inference_still_rejects_closing_and_precancelled_requests() {
+    for (state, cancelled) in [(AgentState::Closing, false), (AgentState::Starting, true)] {
         let server = HttpServer::new(trace("chat_completions"));
         let mut fixture = Fixture::new(&server.url, "openai", "chat_completions");
         fixture
             .app
             .world_mut()
-            .agent_transition(fixture.agent, state, None)
+            .fixture_state(fixture.agent, state, None)
             .unwrap();
         let (mut request, reply) = fixture.request("rejected-free");
         request.turn = None;

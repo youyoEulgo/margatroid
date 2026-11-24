@@ -2,10 +2,9 @@ use address::Address;
 use agent_core::Agent;
 use core_plugin::{Entity, World};
 use margatroid_protocol::*;
-use std::collections::BTreeMap;
 use tool_core::ToolTasks;
 use tool_resource_core::Tools;
-use workspace_core::{Workspace, WorkspaceDefinitions};
+use workspace_core::Workspace;
 
 pub(crate) fn address(world: &World, entity: Entity) -> Option<String> {
     world
@@ -13,66 +12,44 @@ pub(crate) fn address(world: &World, entity: Entity) -> Option<String> {
         .map(|value| value.as_str().to_owned())
 }
 
+pub(crate) fn workspace_agent(record: workspace_core::WorkspaceAgent) -> WorkspaceAgentInfoDto {
+    WorkspaceAgentInfoDto {
+        id: record.id,
+        parent_node: record.parent_node,
+        node_name: record.node_name,
+        alias: record.alias,
+        category: format!("{:?}", record.category).to_lowercase(),
+        tool_path: record.tool_path.to_string_lossy().into_owned(),
+        tool_arguments: record.tool_arguments,
+        previous_node_name: record.previous_node_name,
+        previous_alias: record.previous_alias,
+    }
+}
 pub(crate) fn workspaces(world: &World) -> Vec<WorkspaceInfoDto> {
-    let running: BTreeMap<_, _> = world
+    let mut rows: Vec<_> = world
         .query_with::<Workspace>()
         .result()
         .into_iter()
         .filter_map(|entity| {
-            world
-                .get_component::<Workspace>(entity)
-                .map(|item| (item.definition_path.clone(), entity))
+            let value = world.get_component::<Workspace>(entity)?;
+            let records = value
+                .database
+                .subscribe_changes()
+                .borrow()
+                .as_ref()
+                .map(|snapshot| snapshot.agents.clone())
+                .unwrap_or_default();
+            Some(WorkspaceInfoDto {
+                address: address(world, entity)?,
+                alias: value.alias.clone(),
+                project_root: value.project_root.to_string_lossy().into_owned(),
+                status: format!("{:?}", value.state).to_lowercase(),
+                agents: records.into_iter().map(workspace_agent).collect(),
+            })
         })
         .collect();
-    let mut definitions: BTreeMap<_, _> = world
-        .get_resource::<WorkspaceDefinitions>()
-        .map(|catalog| catalog.list())
-        .unwrap_or_default()
-        .into_iter()
-        .collect();
-    for (path, entity) in &running {
-        if let Some(definition) = world
-            .get_component::<Workspace>(*entity)
-            .and_then(|w| w.definition.clone())
-        {
-            definitions.entry(path.clone()).or_insert(definition);
-        }
-    }
-    definitions
-        .into_iter()
-        .map(|(path, definition)| {
-            let live = running.get(&path).copied();
-            WorkspaceInfoDto {
-                path: path.to_string_lossy().into_owned(),
-                definition: WorkspaceDefinitionDto {
-                    project_root: definition.project_root.to_string_lossy().into_owned(),
-                    agents: definition
-                        .members
-                        .into_iter()
-                        .map(|member| WorkspaceAgentDefinitionDto {
-                            name: member.name,
-                            driver: member.driver,
-                            home_root: member.home_root.to_string_lossy().into_owned(),
-                        })
-                        .collect(),
-                },
-                status: live
-                    .and_then(|entity| world.get_component::<Workspace>(entity))
-                    .map(|item| format!("{:?}", item.state).to_lowercase())
-                    .unwrap_or_else(|| "inactive".into()),
-                address: live.and_then(|entity| address(world, entity)).or_else(|| {
-                    path.ancestors()
-                        .nth(4)
-                        .and_then(|root| workspace_core::workspace_address(root, &path).ok())
-                }),
-                error: live
-                    .and_then(|entity| {
-                        world.get_component::<workspace_core::WorkspaceFailure>(entity)
-                    })
-                    .map(|f| ProtocolErrorDto::new(format!("{:?}", f.0.kind), f.0.message.clone())),
-            }
-        })
-        .collect()
+    rows.sort_by(|a, b| a.address.cmp(&b.address));
+    rows
 }
 
 pub(crate) fn agents(world: &World) -> Vec<AgentStateDto> {
@@ -85,15 +62,9 @@ pub(crate) fn agents(world: &World) -> Vec<AgentStateDto> {
             Some(AgentStateDto {
                 address: address(world, entity)?,
                 workspace: address(world, agent.workspace())?,
-                creator: {
-                    let reference = world
-                        .get_component::<agent_core::AgentTaskBinding>(entity)
-                        .expect("public Agent must have creator")
-                        .creator();
-                    AgentCreatorDto {
-                        address: reference.address.clone(),
-                        task_id: reference.task_id.clone(),
-                    }
+                creator: AgentCreatorDto {
+                    address: address(world, agent.parent())?,
+                    task_id: agent.task_id().into(),
                 },
                 status: format!("{:?}", agent.state()).to_lowercase(),
                 tools: world
@@ -143,9 +114,12 @@ pub(crate) fn agents(world: &World) -> Vec<AgentStateDto> {
                             reasoning_effort: route.reasoning_effort.clone(),
                         })
                     }),
-                error: agent.fault().map(|error| {
-                    ProtocolErrorDto::new(format!("{:?}", error.kind), error.message.clone())
-                }),
+                error: world
+                    .get_component::<ToolTasks>(agent.parent())
+                    .and_then(|tasks| tasks.get(agent.task_id()).ok())
+                    .and_then(|task| task.snapshot(agent.task_id()))
+                    .and_then(|snapshot| snapshot.error)
+                    .map(|e| ProtocolErrorDto::new(format!("{:?}", e.kind), e.message)),
             })
         })
         .collect::<Vec<_>>();

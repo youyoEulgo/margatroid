@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 
 use core_plugin::{Entity, World};
 
-pub use components::{RegistrationId, Tools};
+pub use components::{RegistrationBinding, RegistrationId, Tools};
 pub use error::{ToolResourceError, ToolResourceErrorKind};
 pub use events::{ImportTool, ImportToolReply};
 pub use types::{
@@ -192,5 +192,3 @@ impl jsonschema::Retrieve for NoExternalSchema {
         Err("external schema references are not allowed".into())
     }
 }
-
-pub type ToolResourceSyncBinding = client_core::ProbeFactory<Vec<(String, ToolEntry)>>;

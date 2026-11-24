@@ -14,3 +14,6 @@ pub(crate) struct ApplicationParts {
     pub inference: InferencePlugin,
     pub workspace: WorkspacePlugin,
 }
+
+pub(crate) struct ApplicationDraining;
+impl core_plugin::Component for ApplicationDraining {}

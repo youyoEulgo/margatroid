@@ -3,167 +3,124 @@ mod error;
 mod events;
 mod sync;
 mod types;
+pub use components::Agent;
+use core_plugin::{Entity, World};
+pub use error::{AgentError, AgentErrorKind};
+pub use events::{AgentOperationReply, StartAgent, StopAgent};
 pub use sync::{
-    notify_agent_runtime, remove_agent, update_agent, AgentChange, AgentObservationWait,
-    AgentUpdateContext, AgentUpdateKind,
+    remove_agent, AgentObservationWait, AgentPublicUpdate, AgentUpdateContext, PublicModelInfo,
+    PublicToolInfo,
+};
+pub use types::{
+    AgentCloseFuture, AgentHandle, AgentReadyState, AgentReply, AgentState, AgentUpdateKind,
+    AgentWakeSlot,
 };
 
-pub use components::{Agent, AgentResources};
-pub use error::{AgentError, AgentErrorKind};
-pub use events::{AgentException, AgentOperationReply, RestartAgent, StartAgent, StopAgent};
-pub use types::{AgentStartParameters, AgentState};
-
-use core_plugin::{Entity, World};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::OnceLock;
-
-pub trait WorldAgentExt {
-    fn agent_state(&self, agent: Entity) -> Result<&AgentState, AgentError>;
-    fn agent_transition(
-        &mut self,
-        agent: Entity,
-        state: AgentState,
-        turn: Option<String>,
-    ) -> Result<(), AgentError>;
-    fn agent_ready(&mut self, agent: Entity) -> Result<(), AgentError>;
-    fn agent_start_turn(&mut self, agent: Entity) -> Result<String, AgentError>;
-    fn agent_finish_turn(&mut self, agent: Entity, turn: &str) -> Result<(), AgentError>;
-    fn agent_abort_turn(&mut self, agent: Entity, turn: &str) -> Result<(), AgentError>;
+pub(crate) fn unique_id(prefix: &str) -> String {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    static EPOCH: std::sync::OnceLock<u128> = std::sync::OnceLock::new();
+    let epoch = EPOCH.get_or_init(|| {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    });
+    format!(
+        "{prefix}:{}:{epoch}:{}",
+        std::process::id(),
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    )
 }
-
+pub trait WorldAgentExt {
+    fn agent_state(&self, entity: Entity) -> Result<&AgentState, AgentError>;
+    fn agent_ready(&mut self, entity: Entity) -> Result<(), AgentError>;
+    fn agent_start_turn(&mut self, entity: Entity) -> Result<String, AgentError>;
+    fn agent_finish_turn(&mut self, entity: Entity, turn: &str) -> Result<(), AgentError>;
+    fn agent_abort_turn(&mut self, entity: Entity, turn: &str) -> Result<(), AgentError>;
+    fn agent_set_turn(&mut self, entity: Entity, turn: Option<String>) -> Result<(), AgentError>;
+    fn agent_begin_close(&mut self, entity: Entity) -> Result<(), AgentError>;
+}
+fn missing() -> AgentError {
+    AgentError::new(AgentErrorKind::AgentMissing, "Agent entity missing")
+}
 impl WorldAgentExt for World {
-    fn agent_state(&self, entity: Entity) -> Result<&AgentState, AgentError> {
-        self.get_component::<Agent>(entity)
-            .map(|agent| &agent.state)
-            .ok_or_else(|| AgentError::new(AgentErrorKind::AgentMissing, "agent does not exist"))
+    fn agent_state(&self, e: Entity) -> Result<&AgentState, AgentError> {
+        self.get_component::<Agent>(e)
+            .map(|a| &a.state)
+            .ok_or_else(missing)
     }
-
-    fn agent_transition(
-        &mut self,
-        owner: Entity,
-        state: AgentState,
-        turn: Option<String>,
-    ) -> Result<(), AgentError> {
-        let context = self
-            .get_component::<Agent>(owner)
-            .ok_or_else(|| AgentError::new(AgentErrorKind::AgentMissing, "Agent missing"))?
-            .updates
-            .clone();
-        update_agent(
-            self,
-            owner,
-            &context,
-            AgentChange::Transition { state, turn },
-        )
+    fn agent_ready(&mut self, e: Entity) -> Result<(), AgentError> {
+        let changed = self
+            .get_component_mut::<Agent>(e)
+            .ok_or_else(missing)?
+            .mark_ready()?;
+        if changed {
+            sync::publish_changed(self, e);
+        }
+        Ok(())
     }
-    fn agent_ready(&mut self, entity: Entity) -> Result<(), AgentError> {
-        let agent = self
-            .get_component::<Agent>(entity)
-            .ok_or_else(|| AgentError::new(AgentErrorKind::AgentMissing, "Agent missing"))?;
-        if !matches!(agent.state, AgentState::Starting | AgentState::Running)
-            || agent.turn.is_some()
-        {
+    fn agent_set_turn(&mut self, e: Entity, turn: Option<String>) -> Result<(), AgentError> {
+        let changed = self
+            .get_component_mut::<Agent>(e)
+            .ok_or_else(missing)?
+            .set_turn(turn)?;
+        if changed {
+            sync::publish_changed(self, e);
+        }
+        Ok(())
+    }
+    fn agent_start_turn(&mut self, e: Entity) -> Result<String, AgentError> {
+        let a = self.get_component::<Agent>(e).ok_or_else(missing)?;
+        if a.state() != AgentState::Running {
             return Err(AgentError::new(
                 AgentErrorKind::StateRejected,
-                "Agent cannot become ready in current state",
+                "turn requires a running Agent",
             ));
         }
-        self.agent_transition(entity, AgentState::Running, None)
-    }
-    fn agent_start_turn(&mut self, entity: Entity) -> Result<String, AgentError> {
-        let agent = self
-            .get_component_mut::<Agent>(entity)
-            .ok_or_else(|| AgentError::new(AgentErrorKind::AgentMissing, "agent does not exist"))?;
-        if agent.state != AgentState::Running {
-            return Err(AgentError::new(
-                AgentErrorKind::StateRejected,
-                "a running Agent is required",
-            ));
-        }
-        if let Some(turn) = &agent.turn {
+        if let Some(turn) = a.turn() {
             return Ok(turn.clone());
         }
-        static PREFIX: OnceLock<String> = OnceLock::new();
-        static NEXT: AtomicU64 = AtomicU64::new(1);
-        let prefix = PREFIX.get_or_init(|| {
-            format!(
-                "{}-{}",
-                std::process::id(),
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .expect("clock must follow Unix epoch")
-                    .as_nanos()
-            )
-        });
-        let turn = format!("turn:{prefix}:{}", NEXT.fetch_add(1, Ordering::Relaxed));
-        let context = agent.updates.clone();
-        update_agent(
-            self,
-            entity,
-            &context,
-            AgentChange::Transition {
-                state: AgentState::Running,
-                turn: Some(turn.clone()),
-            },
-        )?;
+        let turn = unique_id("turn");
+        self.agent_set_turn(e, Some(turn.clone()))?;
         Ok(turn)
     }
-
-    fn agent_finish_turn(&mut self, entity: Entity, turn: &str) -> Result<(), AgentError> {
-        let agent = self
-            .get_component_mut::<Agent>(entity)
-            .ok_or_else(|| AgentError::new(AgentErrorKind::AgentMissing, "agent does not exist"))?;
+    fn agent_finish_turn(&mut self, e: Entity, turn: &str) -> Result<(), AgentError> {
+        let a = self.get_component::<Agent>(e).ok_or_else(missing)?;
         if turn.is_empty()
-            || agent.state != AgentState::Running
-            || agent.turn.as_deref().is_some_and(|current| current != turn)
+            || a.state() != AgentState::Running
+            || a.turn().as_deref().is_some_and(|current| current != turn)
         {
             return Err(AgentError::new(
                 AgentErrorKind::StateRejected,
-                "turn does not match the running Agent",
+                "turn does not match current Agent",
             ));
         }
-        let context = agent.updates.clone();
-        update_agent(
-            self,
-            entity,
-            &context,
-            AgentChange::Transition {
-                state: AgentState::Running,
-                turn: None,
-            },
-        )?;
-        Ok(())
+        self.agent_set_turn(e, None)
     }
-
-    fn agent_abort_turn(&mut self, entity: Entity, turn: &str) -> Result<(), AgentError> {
-        let agent = self
-            .get_component_mut::<Agent>(entity)
-            .ok_or_else(|| AgentError::new(AgentErrorKind::AgentMissing, "agent does not exist"))?;
+    fn agent_abort_turn(&mut self, e: Entity, turn: &str) -> Result<(), AgentError> {
         if turn.is_empty()
-            || agent.state != AgentState::Running
-            || agent.turn.as_deref() != Some(turn)
+            || self
+                .get_component::<Agent>(e)
+                .ok_or_else(missing)?
+                .turn()
+                .as_deref()
+                != Some(turn)
         {
             return Err(AgentError::new(
                 AgentErrorKind::StateRejected,
-                "turn does not match the running Agent",
+                "turn does not match current Agent",
             ));
         }
-        let context = agent.updates.clone();
-        update_agent(
-            self,
-            entity,
-            &context,
-            AgentChange::Transition {
-                state: AgentState::Running,
-                turn: None,
-            },
-        )?;
+        self.agent_set_turn(e, None)
+    }
+    fn agent_begin_close(&mut self, e: Entity) -> Result<(), AgentError> {
+        let changed = self
+            .get_component_mut::<Agent>(e)
+            .ok_or_else(missing)?
+            .begin_close();
+        if changed {
+            sync::publish_changed(self, e);
+        }
         Ok(())
     }
 }
-
-pub use sync::{AgentPublicUpdate, PublicModelInfo, PublicToolInfo};
-
-pub use components::{AgentCreator, AgentTaskBinding};
-
-pub use components::AgentSession;

@@ -10,6 +10,7 @@ const store = useWorkbenchStore();
 const {
   selectedAgent,
   selectedAgentState,
+  selectedAgentName,
   selectedWorkspace,
   selectedHistory,
   historyCursors,
@@ -143,7 +144,7 @@ onMounted(async () => {
       <section class="info-hero">
         <div>
           <span class="eyebrow">Agent</span>
-          <h2>{{ agent?.agent.split('/').pop()?.split(':')[0] ?? selectedAgent }}</h2>
+          <h2>{{ selectedAgentName }}</h2>
           <code>{{ selectedAgent }}</code>
         </div>
         <span class="info-status">{{ agent?.status ?? 'unknown' }}</span>

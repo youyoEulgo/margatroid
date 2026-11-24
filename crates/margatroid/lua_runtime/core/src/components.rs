@@ -17,27 +17,6 @@ pub struct DriverLuaVm {
 
 impl Component for DriverLuaVm {}
 
-#[derive(Debug)]
-pub struct AgentWaitSlot(pub Arc<Mutex<DriverWakeSlot>>);
-impl Default for AgentWaitSlot {
-    fn default() -> Self {
-        Self(DriverWakeSlot::shared())
-    }
-}
-impl Component for AgentWaitSlot {}
-impl Drop for AgentWaitSlot {
-    fn drop(&mut self) {
-        self.0.lock().unwrap_or_else(|e| e.into_inner()).close();
-    }
-}
-
-#[derive(Clone, Debug)]
-pub struct WorkspaceLuaTask {
-    pub workspace: core_plugin::Entity,
-    pub name: String,
-}
-impl Component for WorkspaceLuaTask {}
-
 /// Observes one actual execution; dropping the Agent session unlinks the monitor.
 pub struct LuaAgentMonitor {
     unlink: Option<Box<dyn FnOnce() + Send + Sync>>,

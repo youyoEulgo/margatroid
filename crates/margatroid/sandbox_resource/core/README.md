@@ -2,7 +2,7 @@
 
 独立领域 core，只依赖 `core_plugin` 和通用库；不依赖 address、其他领域 core 或 plugin。
 
-`Sandboxes` 以私有 `BTreeMap<String, PathBuf>` 保存 alias 到真实入口文件路径，提供 Default、new、get、insert、remove、iter。路径读取扩展 `WorldSandboxResourceExt::sandbox_path` 仅借用集合条目，校验完整 Entity 和 alias，不访问文件系统。各领域只检查自身 alias；跨类别冲突由调用入口协调。
+`Sandboxes` 以私有 `BTreeMap<String, PathBuf>` 保存 alias 到真实入口文件路径，提供new(updates)、get、insert、remove、iter；updates是通用SandboxChanged回调，不是client_core探针。路径读取扩展 `WorldSandboxResourceExt::sandbox_path` 仅借用集合条目，校验完整 Entity 和 alias，不访问文件系统。各领域只检查自身 alias；跨类别冲突由调用入口协调。
 
 `read_sandbox(path, limits)` 是同步有界读取函数，供使用方在 blocking worker 调用。每次调用重新读取和解析；不缓存正文，已返回的临时材料不受之后文件变化影响。读取入口策略 JSON，要求非空 UTF-8 和 JSON 对象，具体后端 schema 留给执行方校验。`SelectedSandbox` 只记录 alias；`sandbox_select` 验证 owner 和集合条目，选择失败保留旧值，None 清空选择，不读取策略。
 
@@ -11,3 +11,5 @@
 `ImportSandbox` 是携带完整 owner、alias、入口 path、CancellationToken 和共享 oneshot 回复的事件。core 只定义协议；异步校验和发布集合条目由 plugin 负责。同一请求的克隆共享一个可认领的回复端。
 
 `SandboxResourceError` 公开 kind、path、message，提供 new 和 with_path；`SandboxReadLimits` 提供 Default，可按文件分别指定 usize 字节预算。临时输入类型与预算定义在 types 模块并于 crate 根导出。测试全部在 tests 目录，覆盖集合更新、Entity generation、回复唯一性、按次读取和边界校验。
+
+SandboxObserverFactory::new绑定Fn(Entity)->(SandboxChanged,SandboxSelectionChanged)，for_owner取得同一实际对象的通用回调。Sandboxes和SelectedSandbox只在真实值改变后通知；读取条目或策略不发送变化。core不解释实体地址或文件资源字符串，定位由调用方完成；运行版本与源码修改分别确认。

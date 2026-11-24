@@ -2,7 +2,7 @@
 
 mcl_core定义语法树、队列、请求和结果，只依赖mecs及通用库。消息在MCL契约中使用结构化值，执行时由mcl_plugin转换并校验所属领域消息类型；core不引用其他领域core。mcl_plugin依赖address和所需领域core，不依赖其他plugin。
 
-本文同步本轮实现契约，不表示运行中的daemon已更新。IMPORT TOOL只向Agent的唯一Tools集合增加alias、description、input_schema和path记录，不维护选择名单。inference与tool_call使用当前Tools，各只接收一个消息数组输入；tool_call要求数组恰含一条Assistant。tool_inject、原始进程通信和MCP协议由通用工具宿主及工具侧处理，MCL使用现有指令执行领域调用。
+本文同步本轮实现契约，不表示运行中的daemon已更新。IMPORT TOOL只向Agent的唯一Tools集合增加alias、description、input_schema和path记录，不维护选择名单。inference与tool_call使用当前Tools，消息作为一个输入，另可显式传入可选turn；tool_call支持调用数组及消息tool_calls投影。tools:register、原始进程通信和MCP协议由通用工具宿主及工具侧处理，MCL使用现有指令执行领域调用。
 
 ## Block快照指令
 
@@ -37,7 +37,7 @@ CONFIG GET
 CONFIG SET ? ?
 CONFIG DELETE ?
 EFFECT inference (msg.instructions, session.conversation)
-EFFECT tool_call (session.conversation[-1])
+EFFECT tool_call session.conversation[-1].tool_calls
 EFFECT sandbox_use ?
 EFFECT history_append ?
 EFFECT start_turn
@@ -46,11 +46,11 @@ EFFECT ready
 EFFECT wake
 ```
 
-Lua调用为mcl(target_entity, text, arguments)，arguments按顺序对应问号。来源及本次VM实例由lua_runtime_plugin中的mcl宿主绑定，不接受调用者伪造source。宿主只依赖mcl_core发送MclCommand并等待reply；唯一执行入口MclCommand要求调用方显式提供source_address，网络入口及Lua宿主传入自身真实地址，与source实体身份核对，MCL审计source保存该地址而非Entity编号；history_append按消息type映射role及规范内容列，不保存调用来源，返回带真实sequence的完整消息；mcl_plugin不定义Lua函数。消息参数要求完整消息数组；marker形式分别为EFFECT inference ?和EFFECT tool_call ?，只占一个参数，不接受第二个工具alias数组。配置路径和值分别占一个参数。
+Lua调用为margatroid.mcl:execute(target_address, text, arguments)，arguments按顺序对应问号。目标使用完整节点地址，来源及实际执行instance由宿主绑定，不接受脚本伪造source。宿主只依赖mcl_core发送MclCommand并等待reply；唯一执行入口MclCommand要求调用方显式提供source_address，网络入口及Lua宿主传入自身真实地址，与source实体身份核对，MCL审计source保存该地址而非Entity编号；history_append按消息type映射role及规范内容列，不保存调用来源，返回带真实sequence的完整消息；mcl_plugin不定义Lua函数。inference使用消息数组；tool_call使用结构化调用数组或消息的tool_calls投影。marker形式为EFFECT inference ? [ ? ]和EFFECT tool_call ? [ ? ]，第二参数若存在只能是显式turn，不是工具alias列表。配置路径和值分别占一个参数。
 
 ## 消息Block
 
-Block字段只保存消息数组，创建时不写类型。普通Block存于固定timeline SQLite文件，TEMP及其快照只在内存中按VM实例隔离；持久子项各占一张表，消息按sequence/role/content/data/tool_call/payload逐行保存。CREATE不存在则创建，存在且字段一致则打开，不清空内容；不返回created标志。
+Block字段只保存消息数组，创建时不写类型。普通Block存于固定timeline SQLite文件，TEMP及其快照只在内存中按Agent.instance隔离；持久子项各占一张表，消息按sequence/role/content/data/tool_call/payload逐行保存。CREATE不存在则创建，存在且字段一致则打开，不清空内容；不返回created标志。
 
 GET返回.Array.Message，单索引也返回数组。索引从0开始，-1为末项；非负范围左闭右开，负范围左开右闭，端点同号。多来源按书写顺序拼接，Prompt alias每次按路径读取。工具和沙箱alias不作为消息GET来源。
 
@@ -70,21 +70,23 @@ IMPORT校验种类、依赖和alias后，在对应资源领域登记；TOOL保�
 
 | EFFECT | 参数 | 返回值 |
 | --- | --- | --- |
-| inference | 消息数组（单输入） | .Inference.message、.Inference.stop_reason |
-| tool_call | 单条Assistant组成的消息数组（单输入） | .Array.Message |
+| inference | 消息数组、可选turn | .Inference.message、.Inference.stop_reason |
+| tool_call | 调用数组或消息tool_calls投影、可选turn | .Array.Message |
 | sandbox_use | 零或一个沙箱alias组成的数组 | Unit |
 | history_append | 消息数组 | .Array.Message（带真实sequence） |
 | block_snapshot | Block逻辑名字符串 | Unit |
 | block_snapshots | Block逻辑名字符串 | .BlockSnapshots |
 | block_restore | Block逻辑名字符串、正整数快照ID | Unit |
-| start_turn | 无 | Unit |
+| start_turn | 无 | .Turn（当前真实回合ID） |
 | finish_turn | 无 | Unit |
 | ready | 无 | Unit |
 | wake | 无 | Unit |
 
 inference和tool_call将请求交给所属领域并等待oneshot。tool_call先发出整批带独立oneshot的请求，再通过join_all收齐并保持输入顺序；保留原调用ID，每个工具调用错误均转换为failed工具消息，包括配置、参数、执行、超时、清理、任务panic、回复丢失和关联错误；不因单个失败丢失整批结果。无法解析出有效工具调用的命令错误与其他非工具错误，通过唯一回复出口转换为Error值，形状为{"Error":{"type":"error","message":"错误种类: 说明","request_id":"本次命令id"}}，不抛Lua宿主异常终止Driver。原始执行失败仍在MCL审计中记录succeeded=false。清理尚未证明时及时返回错误并保留后台监督，不将任务伪报completed或安全退出。sandbox_use选择alias，不保存长期策略正文；实际执行读取选定路径的策略。history_append显式保存消息；其他操作不自动追加消息历史。指令审计与消息历史分别记录，不把审计参数投影成重复消息。两类历史以Agent内sequence标识并排序，不设历史key；消息按规范列拆装，payload仅保存剩余字段；历史追加每次产生新记录并返回新sequence；Block可选保留此字段，不做历史关联校验。关联、去重和查找策略由Driver自行决定，当前不提供额外关联查询。
 
-start_turn和finish_turn调用agent_core同步扩展；ready和wake调用lua_runtime_core扩展。ready只允许当前Driver对本人调用。wait是Lua宿主函数，不是MCL指令。上述调用由plugin组合，不让core之间互相依赖。
+ready/start_turn/finish_turn调用agent_core同步扩展，wake操作目标Agent自有的wake_slot，不依赖Driver VM或旧AgentWaitSlot。wait由公共LuaServices等待目标AgentWakeSlot，不是MCL指令。model_set首次创建配置时从ModelObserverFactory取得通用回调。
+
+sandbox_use首次使用时从SandboxObserverFactory创建缺失的空Sandboxes/SelectedSandbox。空alias数组可初始化为未选择；非空alias必须已经真实导入，否则失败，不自动创建策略记录。随后由sandbox_core统一选择入口提交变化。上述跨域装配只在plugin完成。
 
 ## 队列与取消
 
@@ -95,16 +97,18 @@ start_turn和finish_turn调用agent_core同步扩展；ready和wake调用lua_run
 关闭队列拒绝新命令、取消排队和在途操作，仍等待文件worker、领域任务和回执真实收口。drain成功不只表示发出了取消；清理失败保持错误，不以丢弃Future代替退出证明。
 
 
-当前工作树已实现统一Lua：复用既有资源挂载、Storage、MCL队列、任务监督、进程回收及同步入口。Workspace先启动独立Lua任务；Agent创建由公共Lua注入能力提交StartAgent，Agent不再启动/持有/终止Lua VM。执行者与目标分开，Agent统一归属Workspace，创建来源由实际任务绑定记录，配置按明确初值文件初始化持久化，UI按创建时传入目录直接监控，模型通过EFFECT model_set配置。公共mcl.execute指定目标，wait(agent)登记本次唤醒句柄；关闭Agent使用margatroid.agent:stop(address)注入方法提交原StopAgent并外部监督，不经过MCL。EFFECT tool_call只接收调用数组。Driver专用manifest依赖裁剪取消；工具发现元数据保持。初始化/委托/子代理应用未实现；前端源码不在本轮修改范围内。
+Workspace启动Agent事件只发起Driver工具调用。创建注入方法检查节点及Driver归属、准备或复用文件、打开持久化连接并登记，发送StartAgent<AgentStorage>；System同步挂载实体及组件，绑定真实parent/task_id后回复。Agent状态为Starting/Running/Closing；Workspace状态为Running/Deleting/Error，二者不共用旧四态。
 
-四态契约：Agent/Workspace公开starting、running、error、stopping；Agent挂载完成不是ready，MCL允许starting/running，推理和工具显式携带turn时要求running且匹配，省略时为Starting/Running自由调用。Lua创建的Agent在返回信息前绑定创建者真实任务scope与AgentSession；return_result不结束生命周期，任务取消/退出会提交原StopAgent并等待全部绑定Agent实际移除后才确认任务清理。主动停止Agent会解绑；异常日志沿原Agent存储处理，正常结束和取消不误报故障。关闭使用Lua agent.stop注入，不提供MCL agent_stop。
+Agent关闭先按节点找到Agent，再按其parent和task_id关闭父实体任务集合内的创建任务；任务直接等待绑定AgentHandle的关闭，不重新发送StopAgent形成回路。Return仅交付结果，不结束任务生命周期。创建、取消和关闭失败均保留真实监督，不以丢弃Future当完成。
 
 MCL状态门统一只允许Starting/Running，不根据effect判断回合。推理和工具调用只携带显式可选turn，省略为None，不抓取当前上下文自动绑定；Some时的Running/有效turn及匹配由Inference/Tool实际受理入口负责。MCL不伪造无turn的推理完成或工具中止结果，也不预先判断工具alias存在性。ready/start_turn/finish_turn的约束由Agent core统一方法承担。
 
-Agent创建注入接口为name/config_path/ui_path，拒绝旧resource_dir创建参数。配置仅首次从config_path初始化至Agent持久setting.toml，后续重启保留已修改配置；ui_path始终直接引用与监控，不创建Agent本地UI，不复制、覆盖、删除已有UI副本，也不把旧副本作为回退来源。Lua程序加载只读取程序文件，不推导或读取同目录配置。
+Agent创建注入接口为node_name/alias/project_root/config_path/ui_path，拒绝旧resource_dir创建参数。配置仅首次从config_path初始化至Agent持久setting.toml，后续重启保留已修改配置；ui_path始终直接引用与监控，不创建Agent本地UI，不复制、覆盖、删除已有UI副本，也不把旧副本作为回退来源。Lua程序加载只读取程序文件，不推导或读取同目录配置。
 
-显式可选turn契约：start_turn取得并返回当前turn，已有回合返回同一标识；推理和工具显式携带turn时严格校验，省略为None自由调用，不自动继承当前turn。自由调用仍受实际会话、权限、生命周期、取消及原有并发限制；Starting允许初始化所需自由调用，Error/Stopping拒绝。回合中止/收尾只作用于明确绑定该turn的请求，Agent关闭仍监督全部调用。详见本域DESIGN。运行中的旧进程仍需使用新构建。
+显式可选turn契约：start_turn取得并返回当前turn，已有回合返回同一标识；推理和工具显式携带turn时严格校验，省略为None自由调用，不自动继承当前turn。自由调用仍受实际会话、权限、生命周期、取消及原有并发限制；Starting允许初始化所需自由调用，Closing拒绝。回合中止/收尾只作用于明确绑定该turn的请求，Agent关闭仍监督全部调用。详见本域DESIGN。运行中的旧进程仍需使用新构建。
 
 推理领域的连接失败、HTTP错误、超时等通过Inference.message返回type=error的AgentMessage，附原request_id及stop_reason=error；不再提升为顶层MCL Error导致Driver退出。执行通道错误、MCL受理/参数/权限错误及真正的清理失败仍按各自原契约收口。压缩消息的历史写入、快照及上下文替换由compact调用方处理。
 
 GET和后续SET是两条独立命令，Lua编辑数组后整份SET覆盖最新键；中间其他SET的结果可能被覆盖，按当前契约接受，不提供隔离、token、CAS或upsert。配置单次实际提交仍原子，CONFIG/Block的单条顺序由执行锁保证。
+
+实体寻址使用/demo/coder等绝对节点路径；IMPORT中的文件资源继续使用type:scope/name:tag且tag显式非空。节点路径不替代资源定位规则。

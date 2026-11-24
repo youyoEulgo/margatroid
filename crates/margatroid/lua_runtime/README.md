@@ -1,59 +1,66 @@
 # Lua Runtime
 
-lua_runtime_core定义VM组件、程序、环境、通知能力和启停契约，只依赖mecs及通用库。lua_runtime_plugin依赖自己的core、workspace_core、mcl_core及通用身份address，通过Workspace的执行入口运行Driver，不依赖Agent或MCL的plugin。
+lua_runtime_core 定义 VM 组件、程序、环境、通知、通用 Lua 宿主绑定及启停事件，只依赖 mecs 和通用库。lua_runtime_plugin 组合所需领域 core，运行独立嵌入 VM，不依赖其他业务 plugin。本文描述当前源码，不表示运行中的 daemon 或资源产物已经替换。
 
 ## 执行与组件
 
-DriverLuaVm独立挂载到执行Entity，保存本次实例、wake、ready、ended及取消能力，不嵌入Agent组件。真正Lua状态和非Send Future只存在于Workspace专属线程；Lua Runtime不创建独立Driver线程，也不关闭Workspace线程。
+Driver 工具由工具监督启动 runner，在工具进程内运行 Lua；它不通过 WorkspaceExecutor 或 Agent 创建 System 再启动一份 VM。`StartDriverLuaVm` 是独立嵌入 VM 的入口，owner 是实际 Lua 执行宿主，不默认等同 Agent。
 
-每次启动使用新的start_id，所有请求和结果核对完整owner Entity及本次实例。不得让同Entity重启后的VM接收旧实例结果。
+每次独立 VM 启动有唯一 start_id，事件及回复同时核对完整 owner Entity 和实例。DriverLuaVm 挂载于执行宿主，保存 wake、ready、ended 和取消能力。真正的 Lua 状态及非 Send Future 在本次 VM 独立线程中的当前线程 Tokio Runtime/LocalSet 运行；线程归 lua_runtime_plugin 的 VmThreads 管理，不属于 Workspace。
+
+独立 VM 不自行创建、覆盖或移除 owner 的 ToolTasks/LuaExecutionTask。业务能力由 LuaServices 和宿主回调提供；没有实际任务能力时，任务或创建方法明确失败，不借用 owner 的其他任务伪造身份。
 
 ## 启动与停止
 
-Agent启动闭包发送StartDriverLuaVm，携带程序、环境、Workspace Entity及oneshot回复端。Handler先安装通知组件，再向Workspace线程提交任务。启动等待闭包收到ready后返回，结果Handler通过原reply确认初始化完成；不会额外发送StartDriverLuaVmResult事件。
+启动 System 校验 owner、Workspace、地址、程序与环境，挂载通知组件后启动受监督线程，再提交 ready 等待。配置可设置启动超时；ready 失败或超时会请求取消并等待真实线程收口，通过原请求 reply 返回结果，不新增启动完成业务事件。
 
-启动前错误、超时或未ready即退出都会请求取消并等待VM退出，回复错误及清理事实。停止请求取走启动时建立的ended接收端；不为重复停止重建通道。取消或通道关闭不等于VM退出，无法证明退出则返回错误并保留控制组件。
+停止请求只取一次 ended 接收端，关闭 wake 并请求取消；异步收口既等待进程/Lua 结束，也等待真实线程 join。线程 join 由独立监督持有，等待者取消不会丢弃 JoinHandle；多个等待者共享同一结果。重复停止不重建回复通道。清理失败保留组件及控制能力，不把取消或通道关闭当退出证明。
 
-StopDriverLuaVm成功只证明VM退出及Lua释放，不证明工具、推理或MCL已经收口。Agent生命周期闭包负责关闭各领域受理、请求取消并分别等待VM、执行活动和MCL；Workspace随后才退出专属线程。
+自然退出发送 DriverLuaVmExited。若没有显式停止等待者，plugin 在启动交接完成后自动提交同一线程收口，再移除 DriverLuaVm 与 VmThreads 项。通知不替代原请求 reply，也不直接修改 Agent 生命周期。
 
-run_driver结束后完成ended并发送DriverLuaVmExited，用于报告自然退出或运行错误。该通知不替代请求的oneshot回复，不修改Agent生命周期，不另设异常结果事件。
+受理阶段只按真实 owner.ToolTasks 中匹配当前 execution_id 的实际任务捕获 RunContext.execution_task。只有该能力存在时才调用 LuaServices.execution_finished 等待任务创建交接与子 Agent 关闭；没有匹配任务时只关闭独立 VM 自身资源，不对 owner 其他任务执行结束通知。Driver 工具的真正任务收口由工具监督负责。
 
-## 共享宿主环境与诊断设计
+## 共享宿主环境
 
-共享宿主、独立日志和分组API已实现；现有启停事件与System保持原契约。旧方法别名不再提供，主目录数据库不会自动迁移。
+Driver 和工具 worker 复用 create_environment、configuration_globals、load_program、enable_execution 及 Margatroid userdata。程序使用 configure(arguments, context)/execute(arguments, context)。宿主把LuaEnvironment.globals中execution_context的arguments的原始快照传给两阶段及只读margatroid.context.arguments；省略时为空对象，不硬传nil。configure 为元数据和纯计算阶段，确认配置后再开放执行方法。HostKind 只表达来源元数据，不决定能力集合。
 
-Agent启动流程仍以LuaEnvironment传入本次环境材料，但Lua只暴露共享margatroid对象；agent_info移入margatroid.context。Lua Runtime plugin构造driver:mcl和driver:wait回调，不从其他plugin取得宿主函数。lua_runtime_core提供共用userdata绑定、值转换及公共方法定义，业务能力通过中立回调传入；不依赖mcl_core、tool_core或storage_core，plugin只依赖所需领域core。工具worker复用这一套定义，按身份裁剪，不另写第二份公共接口。
+Lua 只暴露 margatroid 对象，公共子对象为 files、data、text、process、mcl、agent、workspace、tools、task，根方法包含 log、wait、wait_any。context getter 返回独立值，修改 Lua 表不能修改宿主持有的真实来源。业务回调由 LuaServices 转交，不在 core 引入其他业务 core，不保留全局 mcl、旧 driver:mcl 或无目标 wait 别名。
 
-AgentWaitSlot位于目标Agent，wait(agent.address)通过公共服务取得一次等待能力，不拥有执行者。复用原DriverWakeSlot的提前wake锁存、重复合并及取消guard；槽位随实际Agent关闭，VM保持独立。自动任务首次wait或Return交接启动，正常短任务结束也可确认成功；Agent.ready只表示目标就绪。
+公共调用示例：
 
-margatroid.driver:mcl宿主由lua_runtime_plugin根据mcl_core::MclCommand直接构造：启动时取得owner真实Address，缺失则拒绝启动；绑定本次source Entity、source_address及VM实例，每次调用显式传入，发送事件并等待原oneshot。它不解析执行MCL，不依赖mcl_plugin；来源地址不由Lua脚本填写，也不从Entity编号生成。MCL plugin只处理请求并核对来源，EFFECT ready/wake通过lua_runtime_core核对实例并操作槽位。不使用block_on桥接。
+```lua
+local args = margatroid.context.arguments
+local created = margatroid.agent:create({
+    node_name = args.node_name,
+    alias = args.alias,
+    project_root = actual_work_directory,
+    config_path = initialization_file,
+    ui_path = ui_directory,
+})
+local result = margatroid.mcl:execute(created.address, "EFFECT start_turn")
+margatroid:wait(created.address)
+```
 
-mcl调用的参数校验、reply丢失和非VM取消错误作为MclValue::Error返回Lua，形状为`{Error={type="error", message=..., request_id=...}}`；MCL返回的Error原样序列化，单次MCL调用取消也不终止VM。只有VM取消/停止仍抛出Lua错误以结束执行。通用LuaBinding宿主函数保留原错误契约，runtime不解析MCL文本推断返回形状。内置coder/reviewer只在command封装检查一次MCL Error：失败以原message抛出并直接退出执行，成功原样返回。业务函数不逐次检查或传递错误，不使用pcall/recover，也不自动补写错误历史或重试finish。MCL失败和Lua语法/逻辑异常均交宿主诊断及真实清理，初始化失败不发送ready。
+创建方法由 tool_plugin 的宿主实现检查同 Workspace 节点及 Driver 归属，准备或复用文件，打开真实持久化连接，登记后发送 StartAgent 并等待 reply。节点、别名、工作目录来自 Driver 参数；Workspace、工具真实路径、原调用参数和创建任务来自宿主固定身份。创建的 Agent 在回复之前绑定实际任务的异步关闭能力，任务清理直接等待 AgentHandle，不通过 StopAgent 绕回父任务。
 
-数组与对象分别转换，嵌套空数组保留数组身份；拒绝无法表示的混合键和稀疏数组。require只解析注入模块。标准库选择及内存、源码、指令检查预算由LuaRuntimeConfig指定；Full和Safe均不表示进程沙箱。
+Agent 的 ready/wake 槽位属于 agent_core::Agent。MCL ready 更新 Agent 状态，wake 唤醒该槽位；公共 wait 通过 LuaServices 等待目标 AgentWakeSlot。它们不拥有 VM，也不使用已移除的 AgentWaitSlot 组件。VM 自身的 DriverWakeSlot/ready 通知只服务嵌入 VM 入口。
 
+MCL Unit 投影为空 JSON 对象 `{}`，不使用 nil/null。其他成功结果保留结构，MCL 错误为 `{Error=...}` 值；业务调用可处理错误后继续。实际 VM 取消仍结束执行，不根据 MCL 文本猜测业务结果。
 
-Driver与工具bin复用lua_runtime_core的create_environment、configuration_globals、load_program、enable_execution。程序共同声明configure/execute，configure仅元数据/纯能力，配置确认后统一开放files/data/text/process/mcl/agent/workspace/tools/task及根log/wait/wait_any。HostKind只保留来源元数据，不裁剪API。调用身份、目标Agent、取消及清理归属相互独立；不保留driver:mcl或无目标driver:wait旧入口。
+## 身份与生命周期
 
-自动执行先注入Workspace/name/resource_dir/task_id，没有预造Agent信息；agent.create返回实际Agent公开信息，脚本自行封装mcl.execute。按需工具context.agent_info仍描述调用方Agent。文件、进程和任务清理复用原受监督能力，不创建脱离生命周期的后台资源。
+实体地址采用绝对节点路径，例如 `/demo/coder/reviewer`，完整 Entity/generation 和运行 instance 只在宿主持有。文件资源字符串仍采用 `type:scope/name:tag` 且 tag 必须显式非空，资源路径不是实体身份。
 
-主动margatroid:log(level,message,details)及自动故障写入AgentStorage的agent_logs。自动执行有AgentStorage时克隆存储供原日志路径使用，无Agent时按真实级别直接输出tracing，不建立运行日志库，不给StartDriverLuaVm增加事件字段。脚本编译/加载及主入口未处理错误由宿主捕获一次；记录原始错误、traceback、程序来源、阶段和当前实例后，再沿既有退出流程报告简洁错误。日志不追加会话、不触发推理、不另发退出事件，取消及正常结束不作为脚本故障。Storage core方法通过spawn_blocking和真实join完成写入，停止及退出通知之前等待已提交诊断及进程清理完成。
+Agent 状态为 Starting/Running/Closing，workspace 状态独立为 Running/Deleting/Error。Agent.instance 标识本次运行及 TEMP 存储命名空间；节点名复用不恢复旧运行身份。return_result 仅交付工具原调用结果，不结束 VM 或父任务。
 
-MCL公共宿主仍返回可处理的Error值；内置Driver在统一command入口选择遇错退出，不在业务层展开错误分支。Lua编程错误同样只由宿主记录，不转换为会话历史消息。自定义脚本若主动pcall消化异常，宿主执行入口无法再次捕获它。主动log写入失败正常返回错误；自动诊断写入失败则走现有stderr，保留原故障，避免递归日志和重复故障记录。日志实现保留，分组与命名已完成迁移，不保留旧宿主方法兼容别名。
+Lua 值桥接区分数组、对象与 null；嵌套空数组保持身份，混合键、稀疏数组、循环值和超出 Lua 表达范围的数字明确失败。require 只解析注入模块。内存、源码和指令 hook 预算沿 LuaRuntimeConfig；标准库或 HostKind 不能代替操作系统沙箱。
 
+## 诊断与资源清理
 
-文件类工具不再启动shell-client。files:info合并属性和实际路径查询，files:list提供直接子项及相同元数据，显式create_directory负责父目录创建。files:matches提供真实glob路径匹配，text:search提供通用正则位置，目录递归、忽略规则与结果展示仍属于Lua工具。文件读写保留原始字节和各自执行边界，不改变Driver与Tool的生命周期或任务内存归属。Bash和终端仍通过process:start使用shell-client。完整方法签名和行为见Tool设计的Lua宿主对象板块。
+主动 log 和加载、配置、执行、清理边界的未处理故障沿同一宿主诊断能力。真实 AgentStorage 可用时由 blocking worker 写入 agent_logs，保留可信来源、原始错误及 traceback；无 Agent 时使用既有 tracing 并遵守日志过滤，不创建独立日志库。自动故障只捕获一次，已被脚本处理的异常不会在宿主入口再次记录。
 
-本轮已实现：Lua工具注册使用{agent?, tools}，每项lifetime={agent?, task_id}独立指定任务生命周期；后端任务持有精确撤销句柄，关闭拒绝新绑定并主动注销，Return不关闭，不终止已受理工具调用。跨Agent操作限当前Workspace，环境提供workspace固定信息与实时agents查询。具体Rust接口已对齐设计，不新增System或同步事件。
+日志写入失败保留原故障，不递归记日志，也不自动写消息历史或触发推理。停止和退出等待已提交日志及进程 registry 的真实清理，随后才发 ended。没有实际任务身份时，不用静默成功的业务清理回调掩盖身份缺失。
 
+files 保留原始字节及实际工作范围，process 子进程归属本次执行 registry，取消与退出等待真实回收。工具注册和子 Agent 的生命周期绑定由实际任务监督，不由 Lua userdata 的 Drop 伪造异步完成。
 
-当前工作树已实现统一Lua：复用既有资源挂载、Storage、MCL队列、任务监督、进程回收及同步入口。Workspace先启动独立Lua任务；Agent创建由公共Lua注入能力提交StartAgent，Agent不再启动/持有/终止Lua VM。执行者与目标分开，Agent统一归属Workspace，创建来源由实际任务绑定记录，配置按明确初值文件初始化持久化，UI按创建时传入目录直接监控，模型通过EFFECT model_set配置。公共mcl.execute指定目标，wait(agent)登记本次唤醒句柄；关闭Agent使用margatroid.agent:stop(address)注入方法提交原StopAgent并外部监督，不经过MCL。EFFECT tool_call只接收调用数组。Driver专用manifest依赖裁剪取消；工具发现元数据保持。初始化/委托/子代理应用未实现；前端源码不在本轮修改范围内。
-
-MCL Lua返回值始终明确：无业务数据的成功Unit映射为空JSON对象{}，不是nil或null；其他成功结果保持既有对象结构，MCL错误保留{Error=...}供脚本判断后继续。该映射在共享宿主完成，自动执行与工具bin一致，空对象重新编码仍为{}而非[]。
-
-四态契约：Agent/Workspace公开starting、running、error、stopping；Agent挂载完成不是ready，MCL允许starting/running，推理和工具显式携带turn时要求running且匹配，省略时为Starting/Running自由调用。Lua创建的Agent在返回信息前绑定创建者真实任务scope与AgentSession；return_result不结束生命周期，任务取消/退出会提交原StopAgent并等待全部绑定Agent实际移除后才确认任务清理。主动停止Agent会解绑；异常日志沿原Agent存储处理，正常结束和取消不误报故障。关闭使用Lua agent.stop注入，不提供MCL agent_stop。
-
-
-Agent创建注入接口为name/config_path/ui_path，拒绝旧resource_dir创建参数。配置仅首次从config_path初始化至Agent持久setting.toml，后续重启保留已修改配置；ui_path始终直接引用与监控，不创建Agent本地UI，不复制、覆盖、删除已有UI副本，也不把旧副本作为回退来源。Lua程序加载只读取程序文件，不推导或读取同目录配置。
-
-未绑定Agent的日志直接通过既有tracing输出，遵守配置的日志级别和过滤器；不创建独立运行日志数据库、不强制保存运行级报告。绑定Agent的日志沿原AgentStorage及提交探针处理。
+当前测试覆盖独立线程、自然退出 join、重复停止、旧实例拒绝、启动超时、CPU hook 取消、子进程回收、任务集合不被替换、MCL 错误值、值桥接及诊断持久化。

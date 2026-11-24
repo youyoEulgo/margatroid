@@ -105,15 +105,7 @@ pub(crate) fn handle_import_result(world: &mut World, result: Result<ImportOutpu
     } else {
         validated.and_then(|entry| {
             if !world.contains_component::<Tools>(context.owner) {
-                world.insert_component(
-                    context.owner,
-                    Tools::new(
-                        world
-                            .get_resource::<tool_resource_core::ToolResourceSyncBinding>()
-                            .expect("resource sync binding required")
-                            .for_owner(context.owner),
-                    ),
-                );
+                world.insert_component(context.owner, Tools::new());
             }
             world
                 .get_component_mut::<Tools>(context.owner)
@@ -128,6 +120,8 @@ pub(crate) fn handle_import_result(world: &mut World, result: Result<ImportOutpu
     let _ = reply.send(result);
 }
 
+// Validation errors retain the owned request and its original reply for asynchronous handoff.
+#[allow(clippy::result_large_err)]
 async fn validate_import(context: ImportContext) -> Result<ImportOutput, ImportError> {
     let path = context.path.clone();
     let cancel = context.cancel.clone();

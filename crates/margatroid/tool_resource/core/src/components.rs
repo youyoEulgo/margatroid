@@ -7,27 +7,33 @@ use crate::{
     validate_alias, validate_schema, ToolEntry, ToolResourceError, ToolResourceErrorKind as Kind,
 };
 
-#[derive(Debug)]
+type ToolsObserver = std::sync::Arc<dyn Fn(Vec<(String, ToolEntry)>) + Send + Sync>;
+
 pub struct Tools {
     entries: BTreeMap<String, ToolEntry>,
     registrations: BTreeMap<String, BoundRegistration>,
-    updates: client_core::UpdateProbe<Vec<(String, ToolEntry)>>,
+    updates: Option<ToolsObserver>,
 }
 
 impl Tools {
-    pub fn new(updates: client_core::UpdateProbe<Vec<(String, ToolEntry)>>) -> Self {
+    pub fn new() -> Self {
         Self {
             entries: BTreeMap::new(),
             registrations: BTreeMap::new(),
-            updates,
+            updates: None,
         }
     }
+    pub fn observe(&mut self, changed: impl Fn(Vec<(String, ToolEntry)>) + Send + Sync + 'static) {
+        self.updates = Some(std::sync::Arc::new(changed));
+    }
     pub fn publish_current(&self) {
-        self.updates.publish(
-            self.iter()
-                .map(|(alias, entry)| (alias.clone(), entry.clone()))
-                .collect(),
-        );
+        if let Some(updates) = &self.updates {
+            updates(
+                self.iter()
+                    .map(|(alias, entry)| (alias.clone(), entry.clone()))
+                    .collect(),
+            );
+        }
     }
 
     pub fn get(&self, alias: &str) -> Option<&ToolEntry> {
@@ -144,6 +150,19 @@ impl Tools {
     }
 }
 
+impl Default for Tools {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+impl std::fmt::Debug for Tools {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Tools")
+            .field("entries", &self.entries)
+            .field("registrations", &self.registrations)
+            .finish_non_exhaustive()
+    }
+}
 impl Component for Tools {}
 
 impl PartialEq for Tools {

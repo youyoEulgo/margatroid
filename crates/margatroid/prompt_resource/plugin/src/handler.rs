@@ -117,6 +117,8 @@ pub(crate) fn handle_import_result(world: &mut World, result: Result<ImportOutpu
     let _ = reply.send(result);
 }
 
+// Validation errors retain the owned request and its original reply for asynchronous handoff.
+#[allow(clippy::result_large_err)]
 async fn validate_import(context: ImportContext) -> Result<ImportOutput, ImportError> {
     let path = context.path.clone();
     let cancel = context.cancel.clone();

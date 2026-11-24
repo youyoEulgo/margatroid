@@ -16,7 +16,6 @@ use std::sync::{Arc, Mutex, OnceLock};
 use storage_core::{AgentLogLevel, AgentLogRecord, AgentLogSource, AgentStorage, append_agent_log};
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
-use workspace_core::WorkspaceExecutor;
 
 fn failure(kind: LuaRuntimeErrorKind, description: impl Into<String>) -> LuaRuntimeError {
     LuaRuntimeError::new(kind, description)
@@ -82,28 +81,24 @@ pub(crate) fn handle_start_driver_lua_vm(world: &mut World, request: StartDriver
             })?
             .as_str()
             .to_owned();
-        let entry = world
-            .get_component::<WorkspaceExecutor>(request.workspace)
-            .map(|executor| executor.entry.clone())
-            .ok_or_else(|| {
-                failure(
-                    LuaRuntimeErrorKind::InstanceNotFound,
-                    "Workspace executor is missing",
-                )
-            })?;
         let storage = world.get_component::<AgentStorage>(request.owner).cloned();
         let root = world
-            .get_component::<workspace_core::Workspace>(request.workspace)
-            .map(|workspace| workspace.project_root.clone())
+            .get_component::<agent_core::Agent>(request.owner)
+            .map(|agent| agent.project_root().to_owned())
+            .or_else(|| {
+                world
+                    .get_component::<workspace_core::Workspace>(request.workspace)
+                    .map(|workspace| workspace.project_root.clone())
+            })
             .ok_or_else(|| {
                 failure(
                     LuaRuntimeErrorKind::EnvironmentFailed,
-                    "Workspace is missing",
+                    "Workspace component missing",
                 )
             })?;
-        Ok((entry, source_address, storage, root))
+        Ok((source_address, storage, root))
     })();
-    let (entry, source_address, storage, root) = match entry {
+    let (source_address, storage, root) = match entry {
         Ok(entry) => entry,
         Err(error) => {
             reply_start(&reply, Err(error));
@@ -114,59 +109,25 @@ pub(crate) fn handle_start_driver_lua_vm(world: &mut World, request: StartDriver
         owner: request.owner,
         start_id: next_id("driver"),
     };
-    if let Some(binding) = world.get_resource::<tool_core::TaskSyncBinding>().cloned() {
-        let address = source_address.clone();
-        let tasks = tool_core::ToolTasks::new(request.owner, address, binding.execution_only());
-        let (tx, _rx) = oneshot::channel();
-        let (handle, input) = match tool_core::ToolTaskHandle::new(
-            &tool_core::ToolExecutionLimits::default(),
-            instance.start_id.clone(),
-            request.program.origin.to_string_lossy().into_owned(),
-            tx,
-            tasks.update_context(),
-            None,
-        ) {
-            Ok(value) => value,
-            Err(error) => {
-                reply_start(
-                    &reply,
-                    Err(failure(
-                        LuaRuntimeErrorKind::EnvironmentFailed,
-                        error.to_string(),
-                    )),
-                );
-                return;
-            }
-        };
-        if let Err(error) = tasks.register(instance.start_id.clone(), handle.clone()) {
-            reply_start(
-                &reply,
-                Err(failure(
-                    LuaRuntimeErrorKind::EnvironmentFailed,
-                    error.to_string(),
-                )),
-            );
-            return;
-        }
-        world.insert_component(request.owner, tasks.clone());
-        world.insert_component(
-            request.owner,
-            tool_core::LuaExecutionTask {
-                workspace: request.workspace,
-                handle,
-                tasks,
-                input: Arc::new(tokio::sync::Mutex::new(input)),
-                resource_dir: request.program.origin.clone(),
-            },
-        );
-    }
+    let execution_task = world
+        .get_component::<tool_core::ToolTasks>(request.owner)
+        .and_then(|tasks| {
+            tasks
+                .list()
+                .into_iter()
+                .map(|(_, handle)| handle)
+                .find(|handle| {
+                    handle.execution_id() == instance.start_id
+                        && !handle.cancel_token().is_cancelled()
+                })
+        });
     let wake = DriverWakeSlot::shared();
     let (ready_sender, ready) = oneshot::channel();
     let ready_slot = Arc::new(Mutex::new(Some(ready_sender)));
     let (ended_sender, ended) = oneshot::channel();
-    let cancel = world
-        .get_component::<tool_core::LuaExecutionTask>(request.owner)
-        .map(|task| task.handle.cancel_token())
+    let cancel = execution_task
+        .as_ref()
+        .map(|task| task.cancel_token())
         .unwrap_or_default();
     world.insert_component(
         request.owner,
@@ -185,6 +146,7 @@ pub(crate) fn handle_start_driver_lua_vm(world: &mut World, request: StartDriver
             .get_resource::<lua_runtime_core::LuaServices>()
             .cloned(),
         storage,
+        execution_task,
         closures: world.closure_sender(&schedule),
         root,
         source_address,
@@ -198,16 +160,23 @@ pub(crate) fn handle_start_driver_lua_vm(world: &mut World, request: StartDriver
         events: events.clone(),
         config: config.clone(),
     };
-    if let Err(error) = entry.submit(Box::new(move || -> workspace_core::LocalFuture {
-        Box::pin(run_driver(run))
-    })) {
-        cancel.cancel();
-        world.remove_component::<DriverLuaVm>(instance.owner);
-        reply_start(
-            &reply,
-            Err(failure(LuaRuntimeErrorKind::Closed, error.to_string())),
-        );
-        return;
+    let runtime = world
+        .get_resource::<async_runtime_plugin::AsyncRuntimeHandle>()
+        .unwrap();
+    match VmThread::spawn(run, runtime) {
+        Ok(thread) => {
+            world
+                .get_resource_mut::<VmThreads>()
+                .unwrap()
+                .entries
+                .insert(instance.start_id.clone(), thread);
+        }
+        Err(error) => {
+            cancel.cancel();
+            world.remove_component::<DriverLuaVm>(instance.owner);
+            reply_start(&reply, Err(error));
+            return;
+        }
     }
     let context = StartContext {
         instance,
@@ -224,7 +193,13 @@ pub(crate) fn handle_start_result(world: &mut World, result: Result<StartOutput,
     match result {
         Ok(output) => {
             let result = if current_instance(world, &output.instance) {
-                Ok(output.instance)
+                if let Some(thread) = world
+                    .get_resource::<VmThreads>()
+                    .and_then(|threads| threads.entries.get(&output.instance.start_id))
+                {
+                    thread.start_settled.store(true, Ordering::Release);
+                }
+                Ok(output.instance.clone())
             } else {
                 Err(failure(
                     LuaRuntimeErrorKind::InstanceMismatch,
@@ -232,6 +207,7 @@ pub(crate) fn handle_start_result(world: &mut World, result: Result<StartOutput,
                 ))
             };
             reply_start(&output.reply, result);
+            maybe_stop_exited(world, &output.instance);
         }
         Err(error) => {
             if let Some(instance) = &error.instance
@@ -239,12 +215,11 @@ pub(crate) fn handle_start_result(world: &mut World, result: Result<StartOutput,
                 && current_instance(world, instance)
             {
                 world.remove_component::<DriverLuaVm>(instance.owner);
-                if world
-                    .remove_component::<tool_core::LuaExecutionTask>(instance.owner)
-                    .is_some()
-                {
-                    world.remove_component::<tool_core::ToolTasks>(instance.owner);
-                }
+                world
+                    .get_resource_mut::<VmThreads>()
+                    .unwrap()
+                    .entries
+                    .remove(&instance.start_id);
             }
             if let Some(reply) = error.reply {
                 reply_start(&reply, Err(error.error));
@@ -293,9 +268,11 @@ pub(crate) fn handle_stop_driver_lua_vm(world: &mut World, request: StopDriverLu
         .schedule
         .clone();
     let context = StopContext {
-        instance: request.instance,
+        instance: request.instance.clone(),
         ended,
-        reply,
+        reply: Some(reply),
+        thread: world.get_resource::<VmThreads>().unwrap().entries[&request.instance.start_id]
+            .clone(),
     };
     world.send_async_closure(&schedule, move || stop_vm(context));
 }
@@ -305,12 +282,11 @@ pub(crate) fn handle_stop_result(world: &mut World, result: Result<StopOutput, S
         Ok(output) => {
             let result = if current_instance(world, &output.instance) {
                 world.remove_component::<DriverLuaVm>(output.instance.owner);
-                if world
-                    .remove_component::<tool_core::LuaExecutionTask>(output.instance.owner)
-                    .is_some()
-                {
-                    world.remove_component::<tool_core::ToolTasks>(output.instance.owner);
-                }
+                world
+                    .get_resource_mut::<VmThreads>()
+                    .unwrap()
+                    .entries
+                    .remove(&output.instance.start_id);
                 Ok(())
             } else {
                 Err(failure(
@@ -318,7 +294,9 @@ pub(crate) fn handle_stop_result(world: &mut World, result: Result<StopOutput, S
                     "VM changed while waiting for stop",
                 ))
             };
-            reply_stop(&output.reply, result);
+            if let Some(reply) = &output.reply {
+                reply_stop(reply, result);
+            }
         }
         Err(error) => {
             if let Some(instance) = error.instance {
@@ -334,12 +312,54 @@ pub(crate) fn handle_stop_result(world: &mut World, result: Result<StopOutput, S
 }
 
 pub(crate) fn handle_driver_lua_vm_exited(world: &mut World, event: DriverLuaVmExited) {
-    if current_instance(world, &event.instance)
-        && let Err(error) = event.result
+    if !current_instance(world, &event.instance) {
+        return;
+    }
+    if let Err(error) = event.result
         && error.kind != LuaRuntimeErrorKind::Cancelled
     {
-        tracing::error!(instance = ?event.instance, %error, "Driver Lua VM exited with an error");
+        tracing::error!(instance=?event.instance, %error, "Lua VM exited with an error");
     }
+    if let Some(thread) = world
+        .get_resource::<VmThreads>()
+        .and_then(|threads| threads.entries.get(&event.instance.start_id))
+    {
+        thread.exited.store(true, Ordering::Release);
+    }
+    maybe_stop_exited(world, &event.instance);
+}
+fn maybe_stop_exited(world: &mut World, instance: &DriverLuaVmInstance) {
+    let Some(thread) = world
+        .get_resource::<VmThreads>()
+        .and_then(|threads| threads.entries.get(&instance.start_id))
+        .cloned()
+    else {
+        return;
+    };
+    if !thread.start_settled.load(Ordering::Acquire) || !thread.exited.load(Ordering::Acquire) {
+        return;
+    }
+    let Some(vm) = world
+        .get_component_mut::<DriverLuaVm>(instance.owner)
+        .filter(|vm| vm.instance == *instance)
+    else {
+        return;
+    };
+    let Some(ended) = vm.ended.take() else {
+        return;
+    };
+    let schedule = world
+        .get_resource::<InstalledRuntime>()
+        .unwrap()
+        .schedule
+        .clone();
+    let context = StopContext {
+        instance: instance.clone(),
+        ended,
+        reply: None,
+        thread,
+    };
+    world.send_async_closure(&schedule, move || stop_vm(context));
 }
 
 fn current_instance(world: &World, instance: &DriverLuaVmInstance) -> bool {
@@ -436,23 +456,26 @@ async fn stop_vm(context: StopContext) -> Result<StopOutput, StopError> {
         instance,
         ended,
         reply,
+        thread,
     } = context;
-    match ended.await.unwrap_or_else(|_| {
+    let result = ended.await.unwrap_or_else(|_| {
         Err(failure(
             LuaRuntimeErrorKind::EndNotificationLost,
             "VM ended sender was lost",
         ))
-    }) {
+    });
+    let joined = thread.wait_finished().await;
+    match result.and(joined) {
         Ok(()) => Ok(StopOutput { instance, reply }),
         Err(error) => Err(StopError {
             instance: Some(instance),
-            reply: Some(reply),
+            reply,
             error,
         }),
     }
 }
 
-async fn run_driver(mut context: RunContext) {
+pub(crate) async fn run_driver(mut context: RunContext) {
     let logger = DriverLogger {
         storage: context.storage.clone(),
         services: context.services.clone(),
@@ -547,8 +570,9 @@ async fn run_driver(mut context: RunContext) {
         cleanup_result = Err(error.clone());
         result = Err(error);
     }
-    let mut agent_cleanup_confirmed = true;
-    if let Some(services) = &context.services {
+    if context.execution_task.is_some()
+        && let Some(services) = &context.services
+    {
         let diagnostic = if failure_diagnostic.is_null() {
             result.as_ref().err().filter(|error|error.kind!=LuaRuntimeErrorKind::Cancelled).map(|error|serde_json::json!({"message":error.description,"raw_error":error.description,"origin":context.program.origin.to_string_lossy()})).unwrap_or(serde_json::Value::Null)
         } else {
@@ -569,28 +593,10 @@ async fn run_driver(mut context: RunContext) {
             .await
         {
             tracing::error!(%error,"Lua Agent monitor completion failed");
-            agent_cleanup_confirmed = false;
             cleanup_result = Err(error.clone());
             result = Err(error);
         }
     }
-    let source = context.instance.owner;
-    let id = context.instance.start_id.clone();
-    let cleanup = context.closures.clone();
-    let (tx, rx) = oneshot::channel();
-    cleanup.send(move |world| {
-        if let Some(task) = world
-            .get_component::<tool_core::LuaExecutionTask>(source)
-            .cloned()
-        {
-            task.handle.cancel();
-            if agent_cleanup_confirmed {
-                task.tasks.complete_cleanup(&id, &task.handle, None);
-            }
-        }
-        let _ = tx.send(());
-    });
-    let _ = rx.await;
     let RunContext {
         instance,
         wake,
@@ -786,6 +792,10 @@ async fn execute_lua(
         Some(LuaBinding::Value(value)) => value.to_json()?,
         _ => serde_json::json!({"agent_info":agent_info,"project_root":root}),
     };
+    let execution_arguments = execution_context
+        .get("arguments")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
     if let Some(values) = execution_context.as_object_mut() {
         values.insert("project_root".into(), serde_json::json!(root));
         values.insert(
@@ -805,7 +815,7 @@ async fn execute_lua(
         HostDefinition {
             kind: HostKind::Driver,
             context: execution_context.clone(),
-            arguments: serde_json::Value::Null,
+            arguments: execution_arguments.clone(),
         },
         config.max_memory_bytes,
     )
@@ -838,7 +848,7 @@ async fn execute_lua(
         .get::<mlua::Function>("configure")
         .map_err(lua_error)?
         .call((
-            mlua::Value::Nil,
+            host::data::to_lua(&lua, execution_arguments.clone()).map_err(lua_error)?,
             host::data::to_lua(&lua, execution_context.clone()).map_err(lua_error)?,
         ))
         .map_err(lua_error)?;
@@ -990,7 +1000,7 @@ async fn execute_lua(
         biased;
         () = cancel.cancelled() => Err(failure(LuaRuntimeErrorKind::Cancelled, "Lua execution cancelled")),
         () = async {if let Some(deadline)=deadline{tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await;}else{std::future::pending::<()>().await;}}=>Err(failure(LuaRuntimeErrorKind::ExecutionFailed,"Lua execution deadline exceeded")),
-        result = function.call_async::<()>((mlua::Value::Nil,public_context)) => {
+        result = function.call_async::<()>((host::data::to_lua(&lua, execution_arguments).map_err(lua_error)?,public_context)) => {
             if cancel.is_cancelled() { Err(failure(LuaRuntimeErrorKind::Cancelled, "Driver cancelled")) }
             else { result.map_err(|error| logger.capture(error, LuaRuntimeErrorKind::ExecutionFailed)) }
         }

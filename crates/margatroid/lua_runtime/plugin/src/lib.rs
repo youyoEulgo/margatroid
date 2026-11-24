@@ -8,7 +8,7 @@ use app_runtime_plugin::{RuntimeHandle, RuntimePlugin};
 use async_runtime_plugin::AsyncRuntimeHandle;
 use closure_plugin::WorldClosureExt;
 use core_plugin::{App, Plugin};
-use types::InstalledRuntime;
+use types::{InstalledRuntime, VmThreads};
 
 #[derive(Clone, Debug)]
 pub struct LuaRuntimePlugin {
@@ -60,6 +60,7 @@ impl Plugin for LuaRuntimePlugin {
         self.config.validate().expect("invalid Lua runtime budgets");
         app.world().send_closure(&self.schedule, |_| {});
         let schedule = self.schedule.clone();
+        app.world_mut().insert_resource(VmThreads::default());
         app.world_mut().insert_resource(InstalledRuntime {
             schedule: self.schedule,
             config: self.config,

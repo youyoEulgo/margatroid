@@ -33,14 +33,21 @@ method(args) -> xxx
 -- 公开，定义于agent_core
 AgentUpdateContext：组件变化和实际来源生命周期探针，公开Resource
     publish: Arc<dyn Fn(&mut World, Entity, AgentUpdateKind) -> Vec<AgentObservationWait> + Send + Sync>
-    new(publish: impl Fn(&mut World, Entity, AgentUpdateKind) -> Vec<AgentObservationWait> + Send + Sync + 'static) -> Self
+    public: Arc<dyn Fn(Entity, AgentPublicUpdate) + Send + Sync>
+    scope: Arc<AtomicBool>
+    scopes: Arc<Mutex<BTreeMap<Entity, Arc<AtomicBool>>>>
+    new(publish: impl Fn(&mut World, Entity, AgentUpdateKind) -> Vec<AgentObservationWait> + Send + Sync + 'static, public: impl Fn(Entity, AgentPublicUpdate) + Send + Sync + 'static) -> Self
+    scoped(&self, owner: Entity) -> Self
+        行为：共享publish/public，为当前Entity取得独立存活scope；SourcesClosing和Removed时退休该scope。
+    update_public(&self, owner: Entity, value: AgentPublicUpdate)
+        行为：scope仍存活才执行public回调，工具、沙箱和模型通过此入口提交纯公共值，不借用World。
     notify(&self, world: &mut World, owner: Entity, kind: AgentUpdateKind) -> Vec<AgentObservationWait>
         行为：调用装配方注入的回调，core不引用客户端或其他core；普通Changed及Removed不产生异步清理等待。
     impl Resource + Clone
 
 WorldAgentExt：Agent状态和回合的统一更新入口
     agent_ready(&mut self, entity: Entity) -> Result<(), AgentError>
-        行为：调用Agent.ready()，实际变化后释放组件借用并调用AgentUpdateContext::notify(Changed)。
+        行为：调用Agent.mark_ready()，实际变化后释放组件借用并调用AgentUpdateContext::notify(Changed)。
     agent_start_turn(&mut self, entity: Entity) -> Result<String, AgentError>
         行为：仅Running受理；已有turn返回原值，否则生成进程内唯一turn并经统一入口提交Changed。
     agent_finish_turn(&mut self, entity: Entity, turn: &str) -> Result<(), AgentError>
@@ -49,13 +56,21 @@ WorldAgentExt：Agent状态和回合的统一更新入口
         行为：仅Running且turn匹配时清空并通知Changed，调用方plugin再取消该回合执行。
     agent_set_turn(&mut self, entity: Entity, turn: Option<String>) -> Result<(), AgentError>
         行为：统一校验并提交turn改变，实际变化后经同一探针发布，不绕过状态与turn约束。
+    agent_state(&self, entity: Entity) -> Result<&AgentState, AgentError>
+    agent_begin_close(&mut self, entity: Entity) -> Result<(), AgentError>
+        行为：调用Agent.begin_close，状态实际改变后notify(Changed)，同步关闭ready/wake并清turn。
     impl WorldAgentExt for World
 
 -- 公开，定义于agent_plugin
 AgentPlugin：Agent启动插件
+    schedule: String
+    sync: AgentUpdateContext
+    new(sync: AgentUpdateContext) -> Self
+        行为：默认UPDATE，保存必需探针。
+    with_schedule(self, schedule: impl Into<String>) -> Self
     impl Plugin for AgentPlugin
         build(self, app: &mut App)
-            行为：在RuntimePlugin::UPDATE安装start_agent_system和stop_agent_system。
+            行为：核对运行设施及schedule，插入私有AgentInstalled并在同一schedule安装stop_agent_system、start_agent_system。
 ```
 
 # components
@@ -80,11 +95,11 @@ Agent：Agent自身运行组件
         行为：返回本次运行身份；不能由旧调用方覆盖。
     task_owner(&self) -> (Entity, &str)
         行为：返回parent及task_id，只定位真实创建任务，不从地址字符串猜测任务归属。
-    ready(&mut self) -> Result<(), AgentError>
+    mark_ready(&mut self) -> Result<bool, AgentError>--crate私有
         行为：Starting转为Running并将ready槽位置为Ready；Running重复调用成功；Closing拒绝。公开修改经WorldAgentExt调用，在释放组件借用后通知探针。
-    set_state(&mut self, state: AgentState) -> bool
-        行为：仅实际变化返回true；Closing关闭新受理；由plugin统一入口通知探针，不持组件借用编码网络消息。
-    set_turn(&mut self, turn: Option<String>) -> Result<bool, AgentError>
+    begin_close(&mut self) -> bool--crate私有
+        行为：置Closing、清turn、ready置Closed并关闭wake；返回是否实际变化。
+    set_turn(&mut self, turn: Option<String>) -> Result<bool, AgentError>--crate私有
         行为：校验当前状态，改变turn返回true，相同值返回false；经WorldAgentExt调用并发布实际变化。
     impl Component for Agent
 ```
@@ -121,7 +136,7 @@ StopAgent：关闭目标Agent所属启动任务的事件
 start_agent_system(world: &mut World)
     处理事件：StartAgent<storage_core::AgentStorage>
     接收闭包结果：None
-    提交闭包：rollback_created_agent(handle: AgentHandle, reply: Option<AgentReply>, error: AgentError) -> Future<Output = ()>--仅创建后失败补偿
+    提交闭包：retain_and_rollback中的独立异步补偿--仅创建后绑定/发布失败或原reply丢失
     产出事件：None
     行为：接收StartAgent并从原reply短锁take唯一AgentReply；已被认领则跳过；校验Workspace仍Running、parent仍存活。parent为Workspace时必须等于event.workspace，为Agent时其workspace必须等于event.workspace；其他实体不能作为Agent创建父节点。
         核对parent的ToolTasks中task_id存在、未取消且仍允许绑定子Agent；在本System回复前绑定，事件不可伪造跨Workspace任务归属。
@@ -158,22 +173,24 @@ stop_agent_system(world: &mut World)
 
 ```text
 -- 私有
-rollback_created_agent(handle: AgentHandle, reply: Option<AgentReply>, error: AgentError) -> Future<Output = ()>
-    行为：await handle.close()；reply为Some时成功后才通过原Sender返回原创建错误，失败则返回带清理失败原因的错误，关闭能力保留在父任务待清理项中供显式finish重试。
-        成功发送失败意味着接收端已丢失，此时reply=None仍完成关闭，不再尝试回复。
-        创建业务失败和补偿收口是两件事，父任务不能在补偿仍执行时宣布创建交接完成。
-request_agent_close(world: WorldClosureSender, entity: Entity, state: Arc<Mutex<AgentCloseState>>, runtime: AsyncRuntimeHandle) -> AgentCloseFuture
-    行为：同步短锁检查关闭状态；Idle或Failed时登记本次执行并由runtime.spawn启动独立close_agent监督，Running时订阅同一次结果，Closed时直接成功。
-        返回的Future只等待结果，不拥有清理执行；等待者取消或丢弃Future不会取消清理。失败后下一次显式close可重新执行尚未完成步骤，不恢复运行受理。
-close_agent(world: WorldClosureSender, entity: Entity, state: Arc<Mutex<AgentCloseState>>) -> Future<Output = ()>
-    行为：World闭包核对完整Entity；已不存在视为该实例已关闭，不作用于复用index的新实体。
-        将Agent.state置Closing、turn清空、ready置Closed并关闭wake；关闭自身MclQueue与ToolTasks的新受理，通知Changed并使旧生成租约失效。
-        克隆MclDrain、任务集合、实际推理句柄及存储句柄；向推理及所有自身任务请求取消，等待MCL、推理和任务真实收口。
-        仅关闭目标自身创建的子任务，绝不关闭Agent.parent中的创建者任务，避免父任务finish与Agent关闭互相等待。
-        调用notify(SourcesClosing)，等待UI、记录和配置来源监控及在途worker全部真实结束；收集错误但不提前丢弃其余等待，所有监控join后再返回聚合错误；工具的诊断引用在子Agent绑定关闭前释放，避免关闭后继续写库。
-        用blocking worker同步调用storage_core::close_storage并等待成功；所有克隆随后统一拒绝访问，不能只drop一个Arc。
-        World闭包再次核对Entity，despawn后notify(Removed)，然后将AgentCloseState置Closed，通知等待者Ok(())。
-        任一步失败置Failed并通知错误；保留Closing实体及尚未释放能力，允许下一次close继续。目录不在此处删除或移动。
+handle_start_agent(world: &mut World, request: StartAgent<AgentStorage>)
+    行为：执行同步校验、实体挂载和绑定；从AgentInstalled取schedule及sync，创建CloseControl和AgentHandle。
+        notify安装发生panic或返回非空清理等待时，把等待存入CloseControl.observations并走retain_and_rollback，不在System内await。
+retain_and_rollback(runtime: &AsyncRuntimeHandle, parent: ToolTaskHandle, handle: AgentHandle, reply: Option<AgentReply>, failure: AgentError)
+    行为：parent.retain_child_for_cleanup保留关闭能力，runtime.spawn独立任务等待handle.close后回复原错误；接收者已丢失则不回复但仍完成清理。
+request_close(sender: WorldClosureSender, entity: Entity, control: Arc<CloseControl>) -> AgentCloseFuture
+    行为：立即订阅result，在status短锁中裁决Idle/Failed转Running、Closed直接成功；Running只共享本次结果。
+        通过sender.send向World提交一次闭包，从World取得AsyncRuntimeHandle后spawn独立close_agent监督；catch_unwind转CleanupFailed，最终更新status及watch。
+        返回Future只等待watch，取消或丢弃等待不取消已排队关闭监督；Failed后显式close可重试。
+world_call<R: Send + 'static>(sender: &WorldClosureSender, op: impl FnOnce(&mut World) -> Result<R, AgentError> + Send + 'static) -> Future<Output = Result<R, AgentError>>
+    行为：一次World闭包及原oneshot交接，不跨await持World或组件借用。
+close_agent(sender: WorldClosureSender, entity: Entity, control: Arc<CloseControl>) -> Future<Output = Result<(), AgentError>>
+    行为：world_call校验完整Entity，已不存在则成功；agent_begin_close及mcl_close关闭受理，取得MclDrain、任务集合、实际推理和存储句柄。
+        tasks.close_admission后同步取消全部任务，推理retire_source并cancel；World外依次等drain、推理，再join_all所有自身任务finish，汇总清理错误。
+        不关闭Agent.parent内的创建任务；只清理本实体拥有的任务，避免父任务finish与Agent关闭形成回路。
+        执行收口成功后world_call执行SourcesClosing，将返回等待并入control.observations，take后join_all；监控及当前blocking读取全部真实退出才继续。
+        spawn_blocking执行storage_core::close_storage并等待成功；所有克隆统一拒绝后续访问，不以drop一个Arc代替关闭。
+        最后world_call核对Entity并调用agent_core::remove_agent，despawn后notify(Removed)。错误保留Closing实体和控制能力，供显式重试；不移动或删除目录。
 
 ```
 
@@ -183,14 +200,16 @@ close_agent(world: WorldClosureSender, entity: Entity, state: Arc<Mutex<AgentClo
 
 ```text
 -- 私有，定义于agent_plugin
-AgentCloseState：plugin内部关闭监督状态
-    phase: AgentClosePhase
-    result: watch::Sender<AgentCloseResult>
-AgentClosePhase
-    Idle | Running | Failed | Closed
-AgentCloseResult：Clone
-    Pending | Finished(Result<(), AgentError>)
-    行为：Running只对应一个独立监督任务；成功永久保存，失败允许显式重试，等待者不持任务清理所有权。
+AgentInstalled：plugin内部Resource
+    schedule: String
+    sync: AgentUpdateContext
+CloseControl
+    status: Mutex<CloseStatus>
+    result: watch::Sender<CloseStatus>
+    observations: Mutex<Vec<AgentObservationWait>>--安装或关闭返回的监控收口等待，由独立监督消费
+    new() -> Arc<Self>
+CloseStatus：Clone
+    Idle | Running | Failed(AgentError) | Closed
 
 ```
 
@@ -212,6 +231,24 @@ AgentUpdateKind
 AgentReadyState：Clone + Copy
     Pending | Ready | Closed
 
+AgentPublicUpdate
+    Tools(Vec<PublicToolInfo>) | Sandboxes(Vec<(String, PathBuf)>) | Sandbox(Option<String>) | Model(Option<PublicModelInfo>)
+PublicToolInfo
+    alias: String
+    path: PathBuf
+    description: String
+    input_schema: serde_json::Value
+    owner_task_id: Option<String>
+    binding: Option<serde_json::Value>
+PublicModelInfo
+    id: String
+    model: String
+    provider: String
+    api_type: String
+    context_window_tokens: u64
+    thinking: Option<String>
+    reasoning_effort: Option<String>
+
 AgentState
     Starting--组件已挂载，等待ready；无turn调用可受理
     Running--ready已完成；有turn调用必须与当前有效turn一致，无turn调用不要求伪造回合
@@ -224,7 +261,7 @@ AgentWakeSlot
     waiter: Option<u64>--当前等待代号，发送唤醒后仍保留到本等待guard退出
     closed: bool--关闭后拒绝新等待和唤醒
     new() -> Self
-        行为：同步创建空槽位，pending_wake及closed为false，waiter=None，next_waiter从1递增。
+        行为：同步创建空槽位，pending_wake及closed为false，waiter=None，next_waiter初始0，每次checked_add(1)产生等待代号。
     wake(&mut self) -> Result<(), AgentError>
         行为：已关闭则返回错误；存在等待者则唤醒，否则记录pending_wake；重复唤醒合并。
     wait(slot: Arc<Mutex<Self>>) -> Future<Output = Result<(), AgentError>>
@@ -258,7 +295,10 @@ AgentHandle：Agent实体的关闭句柄
 ```text
 -- 公开，定义于agent_core
 AgentError：Agent创建或关闭错误
+    kind: AgentErrorKind
     message: String--地址校验、实体创建或实际清理的失败说明
+AgentErrorKind
+    InvalidRequest | AgentMissing | StateRejected | StartFailed | StopFailed | CleanupFailed | ReplyClosed
     impl Clone + Debug
     impl Display + std::error::Error
 ```
@@ -301,7 +341,7 @@ StopAgent
     ├── entity: Entity
     ├── ready观察接收端
     └── 关闭能力（agent_plugin注入）
-        └── AgentCloseState
+        └── CloseControl
             └── 完整Entity、WorldClosureSender及独立关闭监督状态
 
 AgentUpdateContext

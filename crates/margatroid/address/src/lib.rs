@@ -7,8 +7,8 @@ use core_plugin::{Entity, World};
 
 pub use components::Address;
 pub use error::AddressError;
-pub use handler::resolve_file;
-pub use types::ParsedAddress;
+pub use handler::{query_resources, resolve_file};
+pub use types::{ParsedAddress, ResourceFile, ResourceQuery, ResourceRoots};
 
 pub trait WorldAddressExt {
     fn entity_by_address(&self, address: &str) -> Result<Entity, AddressError>;

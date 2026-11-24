@@ -55,14 +55,10 @@ ToolPlugin：工具执行插件
                 require schedule in [RuntimePlugin::UPDATE, RuntimePlugin::POST_UPDATE]
                 install init_tool_tasks_system, tool_execute_system
 
-TaskSyncBinding：对象与网络同步的绑定能力，定义于tool_plugin
-    clients: Clients
-    targets: Arc<[ClientSelector]>
-    encode: Arc<dyn Fn(AgentTaskSnapshot) -> Result<Arc<ClientFrame>, ClientPrepareError> + Send + Sync>
-    new(clients, targets, encode) -> Self
-    bind(&self, owner: Entity, address: String, tasks: &ToolTasks)
-        行为：取得tasks.snapshot_source()，在plugin内建立对象的SyncContext；通过tasks.observe登记publish和close回调。
-            网络来源只持集合Weak读取能力，不反向强引用任务集合；不修改集合归属或影响其独立使用。
+TaskObserverBinder = Arc<dyn Fn(Entity, String, &tool_core::ToolTasks) + Send + Sync>
+ToolRuntime(Arc<WorldClosureSender>)：plugin私有Resource
+    行为：插件安装时保存本schedule的World闭包发送能力；owned执行材料只持Weak，避免任务与World强引用环。
+
 ```
 
 # components
@@ -75,7 +71,7 @@ ToolTasks：通用工具任务句柄集合，tool_core公开组件
     shared: Arc<TaskSetShared>--唯一集合及版本，内部可变字段私有
     updates: TaskUpdateContext--针对集合本身的更新能力，不绑定Entity、地址或客户端
     new() -> Self
-        行为：创建accepting=true的空TaskSetShared及其TaskUpdateContext；不要求owner、address或TaskSyncBinding，不挂载组件，不建立网络同步来源。
+        行为：创建accepting=true的空TaskSetShared及其TaskUpdateContext；不要求owner、address或TaskObserverBinder，不挂载组件，不建立网络同步来源。
     close_admission(&self)
         行为：同register的短锁中同步置accepting=false，此后所有Path/Registered登记拒绝，已经登记任务继续清理。
     is_accepting(&self) -> bool
@@ -172,7 +168,7 @@ init_tool_tasks_system(world: &mut World)
 tool_execute_system(world: &mut World)
     处理事件：ToolExecuteRequest
     接收闭包结果：Result<ToolLaunchOutput, ToolLaunchError>
-    提交闭包：launch_tool(ToolExecutionContext) -> Future<Output = Result<ToolLaunchOutput, ToolLaunchError>>
+    提交闭包：launch_tool(ToolLaunchGuard) -> Future<Output = Result<ToolLaunchOutput, ToolLaunchError>>
     产出事件：None
     oneshot回复：Result<ToolExecuteResponse, ToolError>
     行为：
@@ -191,7 +187,7 @@ handle_init_tool_tasks(world: &mut World, request: InitToolTasks)
     行为：
         认领reply，检查agent实体；
         不存在ToolTasks则用ToolTasks::new()构造并挂载，已存在不覆盖；
-        对象地址与网络同步由本plugin的TaskSyncBinding绑定，不交给ToolTasks::new处理；
+        对象地址与网络同步由本plugin的TaskObserverBinder绑定，不交给ToolTasks::new处理；
         组件可查询后回复Ok(())，失败回复ToolError。
 
 handle_tool_execute(world: &mut World, request: ToolExecuteRequest)
@@ -214,7 +210,7 @@ handle_tool_execute(world: &mut World, request: ToolExecuteRequest)
         模型参数不能覆盖宿主context标记
         固定本次工具、策略路径和目录参数，准备owned执行材料，不跨await借用World。
         受理后ToolTask独立持有执行材料；之后Tools记录被删除不影响该任务。
-        在plugin构造ToolCleanupControl及TaskFinish回调，从ToolTasks.updates衍生同一来源的ToolTaskHandle，经统一Register入口登记，再把该能力克隆交给工作任务；
+        在plugin构造独立cleanup异步锁、cleanup_proven及TaskFinish回调，从ToolTasks.updates衍生同一来源的ToolTaskHandle，经统一Register入口登记，再把该能力克隆交给工作任务；
         通过send_async_closure提交launch_tool，失败通过原reply回复错误；
         不缓存执行器Handle。
 ```
@@ -225,10 +221,10 @@ update_task<R>(context: &TaskUpdateContext, change: impl FnOnce() -> Result<(R, 
     行为：取得必需context.gate，在同一更新门执行具体修改，失败不发布；返回的changed仅在可观察状态实际改变时为true。同门内递增revision，释放门后调用已登记的通用变更回调；客户端投递由plugin绑定的回调负责。
     生产唯一写能力由ToolTaskHandle/ToolTasks方法构造具体闭包，内部可变字段保持私有；网络准备只持Weak集合，读取完整快照时取得同一更新门。
 
-launch_tool(context: ToolExecutionContext) -> Future<Output = Result<ToolLaunchOutput, ToolLaunchError>>
+launch_tool(launch: ToolLaunchGuard) -> Future<Output = Result<ToolLaunchOutput, ToolLaunchError>>
     行为：
-        在普通异步闭包内部创建本领域监督任务，立即把真实JoinHandle交给已登记的ToolTaskHandle，再返回启动结果。该闭包结果只证明启动交接，不表示工具完成；
-        supervise_tool才负责业务reply和真实清理。启动异常记录于原ToolTask并完成原reply，System只收口启动事实，不反向控制其他领域。
+        从ToolLaunchGuard取得context槽位，tokio::spawn监督任务先等私有start oneshot；先把真实JoinHandle attach到已登记ToolTaskHandle，再释放start，最后解除guard。
+        attach/提交失败由ToolLaunchFallback保留原context和reply收口；成功返回无字段ToolLaunchOutput，仅表示交接。supervise_tool负责实际结果和执行清理。
 
 supervise_tool(context: ToolExecutionContext) -> Future<Output = ()>
     行为：
@@ -251,14 +247,20 @@ supervise_tool(context: ToolExecutionContext) -> Future<Output = ()>
         清理失败及时交付CleanupFailed；
         保持未finish并保留本次runner管理能力继续清理，不标记已finish。
 
+supervise_tool执行结束收口
+    行为：受保护执行Future正常返回代表runner和临时目录清理路径已真实结束，即使业务结果为Err；panic被转换为CleanupFailed且不置cleanup_proven。
+        完成cleanup_owner后才设置context.cleanup_proven=true，drop执行材料并请求handle.finish；TaskFinish异步等待本监督真正退出，不循环等待自己。
+
 run_runner(context: &mut ToolExecutionContext, request: RunnerRequest, policy: Option<Value>) -> Future<Output = Result<(), ToolError>>
     行为：
         直接启动可信supervisor，传递执行材料及可选沙箱后端与策略。
         不建立内存cgroup、systemd scope或全局MemoryPool，不设置外部进程内存额度。
-        并行投递stdin、读取stdout/stderr和等待退出，处理双向协议帧。
+        独立writer任务串行写RunnerRequest和HostFrame，diagnostic_drain独立读取stderr；主select循环持续读取stdout及任务输入。
+        RunnerFrame::Host立即加入FuturesUnordered pending_hosts，响应完成后经writer发送；不在stdout读取分支串行await Host调用，避免子Agent关闭期间停止泵送清理消息。
+        主循环同时受cancel及lifetime_expired驱动；pending Host调用的等待取消不会取消create_agent已独立spawn的创建监督，任务finish_task仍等真实创建watch。
         取消或超时向supervisor发送终止请求，继续等待真实后代回收证明、supervisor退出和两端管道收口。
         清理失败保持监督，不以丢弃Future或收到Return冒充清理成功。
-        Return不是进程终态，真实退出清理后返回。
+        Return不是进程终态；Stopped(cleanup_proven=true)、child.wait及writer/diagnostics实际join全部完成才作为执行清理证明。无证明时持续保留监督，不complete_cleanup。
 
 supervisor_main(args: Vec<OsString>) -> Future<Output = i32>
     行为：
@@ -496,48 +498,77 @@ ProcessSession：原始子进程userdata
 私有：
 ```text
 
-ToolCleanupControl：plugin私有，每个实际任务一份
-    phase: Mutex<ToolCleanupPhase>
-    result: watch::Sender<ToolCleanupResult>
-    runtime: AsyncRuntimeHandle
-ToolCleanupPhase
-    Idle | Running | Failed | Closed
-ToolCleanupResult：Clone
-    Pending | Finished(Result<(), ToolError>)
-    行为：TaskFinish回调只捕获control；被调用时接收实际ToolTaskHandle，短锁裁决后spawn独立监督，不让取消调用者丢失清理。
-        主执行监督负责结束worker、回收后代并返回实际执行退出事实；正常退出只请求独立清理后返回，不await自己的JoinHandle。
-        独立清理等待主执行退出、已受理创建交接及子Agent关闭，调用ToolTaskHandle.retry_cleanups()；失败回调留在任务共享状态，下次finish只重试尚未完成清理，不重新执行Lua或工具业务。
-        清理成功调用CompleteCleanup后置Closed；清理失败置Failed并通知，任务仍在集合，不能用旧失败缓存阻止显式重试。
-
-ToolExecutionSource
-    Registered { entry: tool_resource_core::ToolEntry }--受理时固定的工具Schema
-    Path--worker读取本次实际入口的工具定义及Schema
-ToolLaunchOutput
-    initiator: Entity
-    task_id: String
-    execution_id: String
-ToolLaunchError
-    handle: tool_core::ToolTaskHandle
-    error: ToolError
-    行为：只收口启动失败，原reply仍由handle唯一裁决并安排真实清理。
-
-ToolExecutionContext：plugin内部owned执行材料
-    initiator: Entity
-    workspace: Option<Entity>
-    task_id: String
-    execution_id: String
-    tool_path: PathBuf--已规范化入口
-    source: ToolExecutionSource
-    policy_path: Option<PathBuf>
-    limits: ToolExecutionLimits
-    runner_path: PathBuf
-    arguments: Value--宿主原始快照，不受Lua修改
-    project_root: Option<PathBuf>--实际发起者工作根
-    tasks: tool_core::ToolTasks
-    handle: tool_core::ToolTaskHandle
+ToolInvocation：plugin内部Clone值
+    id: String
+    agent: Entity--Path为initiator，Registered为目标Agent
+    turn: Option<String>
+    alias: String
+    call_id: String
+    arguments: Value
+ToolExecutionContext：plugin内部owned材料
+    request: ToolInvocation
     storage: Option<storage_core::AgentStorage>
-    行为：Path仅需有效ToolTasks可登记；涉及Agent创建时必须能从实际发起者取得Workspace，否则明确缺能力。
-
+    agent_name: String
+    agent_address: String
+    workspace: Value
+    diagnostic_received: bool
+    path_entry: bool
+    cleanup_proven: Arc<AtomicBool>
+    trusted_path: Arc<Mutex<PathBuf>>
+    tool_entry: tool_resource_core::ToolEntry
+    world: Weak<WorldClosureSender>
+    sandbox_path: Option<PathBuf>
+    project_root: PathBuf--缺少真实工作根时为空路径，不制造Agent身份
+    runner_path: PathBuf
+    limits: ToolExecutionLimits
+    configuration: Option<ToolConfiguration>
+    handle: ToolTaskHandle
+    tasks: ToolTasks
+    input: mpsc::UnboundedReceiver<Value>
+TaskFinish注入闭包：每次执行的独立清理能力
+    cleanup: Arc<tokio::sync::Mutex<()>>--串行化显式finish重试
+    cleanup_proven: Arc<AtomicBool>
+    tasks: ToolTasks
+    id: String
+    world: Weak<WorldClosureSender>
+    行为：收到handle立即创建oneshot，将清理Future通过World闭包取得AsyncRuntimeHandle后spawn；等待者Future只等原oneshot，取消等待不取消监督。
+        持cleanup异步锁，已清理直接成功，否则等handle.wait_execution_ended并要求cleanup_proven；无runner清理证明返回CleanupFailed并保留任务。
+        调用services::finish_task等待在途Agent创建并释放诊断/调用登记，再finish_children及retry_cleanups，全部成功才tasks.complete_cleanup。
+        清理失败set_error并回复；下一次finish重新执行尚未完成清理，不缓存失败结果，不重跑工具业务。
+ToolContext：发送给工具worker的纯值
+    agent_name: String
+    agent_address: String
+    workspace: Value
+    owner_agent: Option<String>
+    turn: Option<String>
+    source_origin: String
+    task_id: String
+    call_id: String
+    alias: String
+    owner_task_id: Option<String>
+    binding: Option<Value>
+    resource_dir: PathBuf
+    project_root: PathBuf
+    temp_dir: PathBuf
+RunnerRequest
+    protocol_version: u32
+    program: String
+    arguments: Value
+    context: ToolContext
+    limits: ToolExecutionLimits
+ToolLaunchOutput：无字段
+ToolLaunchError
+    fallback: Option<ToolLaunchFallback>
+    error: ToolError
+ToolLaunchFallback：Clone
+    slot: Arc<Mutex<Option<ToolExecutionContext>>>
+    handle: ToolTaskHandle
+    fail(&self, failure: ToolError)
+        行为：未交接context仍在slot时认领原reply、确认未启动清理并complete_cleanup；已交接则只return_result/set_error/cancel，保留实际监督。
+ToolLaunchGuard
+    fallback: ToolLaunchFallback
+    armed: bool
+    impl Drop：armed时调用fallback.fail(SubmitFailed)，不丢失尚未交接context。
 RunnerFrame::Host { request_id: String, method: String, arguments: Value }
     行为：工具bin复用公共Lua宿主服务协议，宿主自动绑定实际任务身份，不接受脚本伪造source。
 LuaExecutionTask（tool_core公开组件）
@@ -551,43 +582,62 @@ LuaServices安装（tool/plugin/src/services.rs）
     install(app: &mut App)
     install_on(app: &mut App, schedule: &str)
         行为：应用内唯一服务表，Weak World发送能力避免环；自动执行和tool bin转发使用同一invoke。
-    AgentCreateArguments：注入方法已校验的owned参数
+    CreateArguments：Deserialize，deny_unknown_fields
         node_name: Option<String>
         alias: Option<String>
         project_root: PathBuf
         config_path: PathBuf
         ui_path: PathBuf
-    CreationSupervisor：plugin内部单次创建监督
-        identity: lua_runtime_core::LuaExecutionIdentity
-        arguments: AgentCreateArguments
-        creator_task: tool_core::ToolTaskHandle
-        operation: Arc<workspace_core::WorkspaceOperation>
-        record: workspace_core::WorkspaceAgent
-        created_directory: bool
-        storage: Option<storage_core::AgentStorage>
-        agent: Option<agent_core::AgentHandle>
-        completion: watch::Sender<Option<Result<(), ToolError>>>
-        reply: oneshot::Sender<Result<Value, lua_runtime_core::LuaRuntimeError>>
-        行为：由AsyncRuntimeHandle独立spawn持有；所有blocking worker克隆同一operation Arc，最后一个工作结束后才释放受理凭证。Lua调用只等待reply，不拥有监督Future。
-    CreationCompletion = watch::Receiver<Option<Result<(), ToolError>>>
-    ExecutionBindings：plugin内部Resource
-        creating: Arc<Mutex<BTreeMap<String, Vec<CreationCompletion>>>>--按实际execution_id保存已受理创建的完成观察
-        diagnostics: Arc<Mutex<BTreeMap<String, Vec<MonitoredAgent>>>>--只存完整Entity及实际存储诊断引用
-    CreationCompletion的行为：真实StartAgent交接、绑定、取消补偿已结束后才通知；Err携带残留清理诊断，不等同于永久无法完成。父任务重试以保留的子关闭及retry_cleanups实际结果为准，不让旧创建错误永远阻断cleanup。
+    Invocation：Clone
+        task_id: String
+        path: Arc<Mutex<PathBuf>>--实际入口规范化后更新到同一可信来源
+        arguments: Value
+    ExecutionBindings：Resource
+        invocations: Mutex<HashMap<String, Invocation>>
+        diagnostics: Arc<Mutex<HashMap<String, BTreeMap<u64, MonitoredAgent>>>>
+        creating: Mutex<HashMap<String, Vec<watch::Receiver<bool>>>>
     MonitoredAgent
         entity: Entity
-        instance: String
-        storage: Option<storage_core::AgentStorage>
-    bind_agent(world, parent: Entity, task_id: &str, handle: agent_core::AgentHandle)
-        行为：核对parent.ToolTasks中的确切任务和execution_id，调用tool_core::ToolTaskHandle::bind_child；关闭回调只调用handle.close，不发StopAgent。
-            Agent System在回复前完成唯一绑定，本入口只幂等核对该绑定，不重复登记；同一任务可创建多个Agent；停止或归档其中一个会关闭共享创建任务及其全部Agent，只有选定记录归档。实体实际销毁后可退休该项，不能由scope同步Drop丢掉未完成Future。
-    finish_execution(sender, identity, diagnostic)
-        行为：停止本执行的新增创建受理，先等待creating中已受理的全部创建监督，再由实际任务finish_children关闭其全部Agent，等待真实结束。
-            释放对应诊断存储引用再关闭子Agent，避免关闭数据库后日志继续写入；关闭后诊断只走tracing。
-            清理失败保留任务与未完成子关闭能力并返回CleanupFailed，禁止complete_cleanup；成功才移除运行任务。return_result不触发此步骤。
-    ToolContext = ToolExecutionContext--宿主内部值投影入口，不额外复制身份来源
-    ToolContext::public_value(arguments) -> Result<Value,serde_json::Error>
-        行为：输出resource_dir，不隐式输出data_dir；不向Lua暴露内部temp_dir，内部沙箱staging仍由宿主监督使用。
+        session: String--值为Agent.instance，不是AgentSession组件
+        storage: AgentStorage
+    CreationDone(watch::Sender<bool>)
+        impl Drop：独立创建监督真实退出才send_replace(true)，Lua Future取消不代表创建结束。
+    PreparedCreation
+        database: workspace_core::WorkspaceDatabase
+        operation: Arc<workspace_core::WorkspaceOperation>
+        record: workspace_core::WorkspaceAgent
+        creator: ToolTaskHandle
+        task_id: String
+        parent: Entity
+        root: PathBuf
+    PendingAgentHandoff：Clone
+        world: Weak<WorldClosureSender>
+        address: String
+        parent: Entity
+        task_id: String
+        storage: AgentStorage
+    Compensation
+        pending_handoff: Option<PendingAgentHandoff>
+        agent: Option<AgentHandle>
+        storage: Option<AgentStorage>
+        directory: PathBuf
+        remove_directory: bool
+        operation: Option<Arc<workspace_core::WorkspaceOperation>>
+    create_agent(sender: Arc<WorldClosureSender>, identity: LuaExecutionIdentity, arguments: Value) -> Future<Output = Result<Value, LuaRuntimeError>>
+        行为：World校验真实调用并登记creating的watch，然后tokio::spawn独立create_supervised；调用者只await原oneshot。
+    create_supervised(sender: Arc<WorldClosureSender>, identity: LuaExecutionIdentity, args: CreateArguments, invocation: Invocation) -> Future<Output = Result<Value, LuaRuntimeError>>
+        行为：取得节点操作凭证和候选记录，spawn_blocking准备文件、open_storage连接及commit_agent；再经World发送StartAgent等待原reply。
+            System已在回复前bind_child；交接后核对Agent.parent/task_id及创建者仍存活，登记真实存储诊断并返回{address}。
+            取消/错误沿compensate收口；失败把同一Compensation闭包retain_cleanup到创建任务，保留连接和operation供重试。
+    compensate(state: Arc<Mutex<Compensation>>) -> Future<Output = Result<(), ToolError>>
+        行为：失联StartAgent交接先在World按same_database找真实实体并核对父任务/地址，使用其保留的child_close等待；不直接关闭仍被实体持有的数据库。
+            关闭已取得AgentHandle后，blocking worker关闭storage、只删除本次独占未登记目录，最后释放operation；失败保留原能力。
+    finish_task(sender: Arc<WorldClosureSender>, handle: ToolTaskHandle) -> Future<Output = Result<(), ToolError>>
+        行为：取走该execution_id的creating列表逐个等待真实done，再移除诊断和invocations，不用旧创建失败永久阻止cleanup。
+    finish_execution(sender: Arc<WorldClosureSender>, identity: LuaExecutionIdentity, diagnostic: Value) -> Future<Output = Result<Value, LuaRuntimeError>>
+        行为：定位实际任务，先finish_task，再close_registrations及finish_children；不发送StopAgent关闭本任务。
+    ToolContext::public_value(&self, arguments: &Value) -> Result<Value, serde_json::Error>
+        行为：序列化独立context.arguments，移除source_origin、temp_dir和agent_name；只对实际Agent附agent_info，缺失工作根或Workspace时省略相应字段。
     invoke(sender, identity, method, arguments) -> LuaServiceFuture
         行为：所有实际World读取/修改处validate_execution核对source Address、实际VM或唯一task-instance及取消状态。
         execution_log将自动执行的主动日志投递给实际绑定Agent存储，沿原提交探针发布；无Agent的诊断由Lua宿主直接按原级别输出tracing，受既有日志级别及过滤配置控制。
@@ -596,8 +646,6 @@ LuaServices安装（tool/plugin/src/services.rs）
         agent_create接收node_name/alias/project_root/config_path/ui_path，所属Workspace及Driver路径由宿主持有的实际执行身份取得，调用上述创建注入方法完成登记或同Driver复用；不同Driver不得接管已有节点，持久目录按普通、临时、归档类别区分。
         agent_create先登记在途创建完成观察，再按上述受监督准备/连接/提交/创建顺序执行；取消后仍等待原reply并通过返回AgentHandle清理。
         mcl_execute沿MclCommand原reply，wait从目标agent_core::Agent.wake取得通用槽位，不引用旧AgentWaitSlot；所有宿主服务继续校验真实任务和取消状态。
-    acknowledge_execution(world: &World, identity: &LuaExecutionIdentity)
-        行为：自动Lua首次wait或Return交接启动；短任务正常执行结束也可成功，Agent.ready不控制VM寿命。
 
 ```
 
@@ -613,10 +661,10 @@ ToolTaskHandle：可克隆的任务共享句柄，公开类型
     execution_id(&self) -> &str--每个实际任务唯一，MCL来源不使用可重用业务id
     inner: Arc<ToolTaskShared>
     updates: TaskUpdateContext--来源于同一ToolTasks；plugin的快照读取能力只捕获集合Weak，避免强引用环
-    write / replace / try_return / set_error / complete_cleanup
+    write / replace / return_result / set_error
         行为：只构造具体修改闭包交给update_task；取消/超时/worker故障/中止与正常执行不能旁路。
     finish(&self) -> Future<Output = Result<(), ToolError>>
-        行为：立即请求取消，由plugin注入的独立清理监督执行；调用者Future只等待，不持有清理执行权。并发finish共享本次结果，失败可再次显式finish重试未完成清理，已退出Lua/进程不重跑。
+        行为：立即请求取消，由plugin注入的独立清理监督执行；调用者Future只等待，不持有清理执行权。并发finish通过plugin清理异步锁串行复核实际完成结果，失败可再次显式finish重试未完成清理，已退出Lua/进程不重跑。
             等待创建监督、finish_children及所有资源收口后才CompleteCleanup；父任务完成必须晚于全部子Agent关闭。该能力在register前已安装，不存在已登记而无人监督的任务。
     is_cleanup_complete(&self) -> bool
         行为：
@@ -654,12 +702,17 @@ ToolTaskShared：任务持有数据
     turn: Option<String>--构造时固定的显式回合关联
     registrations: TaskScope
     finish: TaskFinish--plugin注入的清理请求，回调不捕获本任务强引用
-    cleanup_retries: Mutex<TaskCleanupRetries>--未完成资源关闭，CompleteCleanup前必须清空
-    children: Arc<Mutex<TaskChildren>>--创建的子Agent关闭能力，任务Supervisor显式等待
+    children: Mutex<TaskChildren>--同时保存子Agent与可重试补偿
+    child_cleanup: tokio::sync::Mutex<()>
+    retry_cleanup: tokio::sync::Mutex<()>
+    task_attached: AtomicBool
+    supervisor_ended: AtomicBool
+    changed: Notify
+    cache_bytes: usize
     cancel: CancellationToken--存活任务取消能力；回合中止只触发原子裁决仍未return的任务，不取消已return后台任务
     task: Mutex<Option<JoinHandle<()>>>--监督任务句柄，取消时不直接abort
     shared: Mutex<ToolTaskData>--私有；只允许update_task修改同步可见字段，returned与唯一reply同锁裁决
-    input: mpsc::Sender<serde_json::Value>
+    input: mpsc::UnboundedSender<serde_json::Value>
 
 ToolTaskData：任务查询数据
     output: Vec<serde_json::Value>
@@ -712,9 +765,6 @@ ToolConfiguration：Lua配置函数返回的本次时间预算
         拒绝未知字段、负数及不可表示时间，不使用后端默认值。
         ToolTask保存配置确认时确定的deadline；到期取消，等待真实清理后完成。
         不另设宿主、shell或清理限时；仅configure确认后安装执行能力并调用execute。
-TaskCleanupRetries：core私有
-    next_id: u64
-    entries: BTreeMap<u64, TaskChildClose>
 ToolTaskHandle::retain_cleanup(&self, close: TaskChildClose) -> Result<(), ToolError>
     行为：同清理门下检查尚未CompleteCleanup，登记可重试补偿；回调不能捕获本任务强引用。已登记创建监督结束前任务不可能完成，故可在取消后接收补偿。
 ToolTaskHandle::retry_cleanups(&self) -> Future<Output = Result<(), ToolError>>
@@ -735,7 +785,10 @@ ToolTaskHandle::finish_children(&self) -> Future<Output = Result<(), ToolError>>
     正在创建的Agent须先由finish_execution等待创建交接；本方法不持锁跨await，不把同步scope撤销视为Agent已关闭。
 TaskChildren：core私有共享值
     accepting: bool
-    entries: BTreeMap<Entity, TaskChildClose>
+    completed: bool
+    children: BTreeMap<Entity, TaskChildClose>
+    retries: BTreeMap<u64, TaskChildClose>
+    next_retry: u64
 
 TaskScope(Arc<ScopeInner>)：Clone + Default + Debug
     bind(&self, revoke: impl FnOnce() + Send + 'static) -> Result<TaskBinding, ToolError>

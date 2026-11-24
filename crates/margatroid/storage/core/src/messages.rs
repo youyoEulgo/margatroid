@@ -191,13 +191,11 @@ pub fn append_message_history(
     turn: Option<&str>,
 ) -> Result<Vec<Value>, StorageError> {
     let state = &storage.database.shared;
-    let db = state
+    let guard = state
         .connection
         .lock()
         .map_err(|_| err(K::Closed, "database lock poisoned"))?;
-    if state.retired.load(Ordering::Acquire) {
-        return Err(err(K::CleanupFailed, "database connection retired"));
-    }
+    let db = open_connection(state, &guard)?;
     let timestamp: i64 = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(write_err)?
@@ -207,10 +205,10 @@ pub fn append_message_history(
     db.execute_batch("BEGIN IMMEDIATE").map_err(write_err)?;
     let result: Result<Vec<Value>, StorageError> = messages
         .iter()
-        .map(|m| append(&db, m, turn, timestamp))
+        .map(|m| append(db, m, turn, timestamp))
         .collect();
-    let result = result.and_then(|value| Ok((value, pages::record_watermarks(&db)?)));
-    let (value, committed) = finish_transaction(&db, &state.retired, result)?;
+    let result = result.and_then(|value| Ok((value, pages::record_watermarks(db)?)));
+    let (value, committed) = finish_transaction(db, &state.retired, result)?;
     publish_record_changes(state, committed);
     Ok(value)
 }

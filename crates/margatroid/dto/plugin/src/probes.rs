@@ -136,17 +136,36 @@ pub fn agent_sync_context(clients: Clients) -> AgentUpdateContext {
             }
             match kind {
                 AgentUpdateKind::Changed => vec![],
-                AgentUpdateKind::RuntimeInstalled => {
-                    let mut waits = crate::ui::refresh_ui_watch(world, owner);
+                AgentUpdateKind::Installed => {
+                    if let Some(tasks) = world.get_component::<tool_core::ToolTasks>(owner)
+                        && let Some(address) = crate::projection::address(world, owner)
+                        && let Some(binding) = world.get_resource::<crate::TaskSyncInstaller>()
+                    {
+                        (binding.0)(owner, address, tasks);
+                    }
+                    let callback = resource_sync_bindings(
+                        world
+                            .get_resource::<AgentUpdateContext>()
+                            .expect("Agent probes required")
+                            .clone(),
+                    );
+                    if let Some(tools) = world.get_component_mut::<tool_resource_core::Tools>(owner)
+                    {
+                        let callback = callback.for_owner(owner);
+                        tools.observe(move |v| callback(v));
+                    }
+                    vec![]
+                }
+                AgentUpdateKind::SourcesInstalled { ui_path } => {
+                    let mut waits = crate::ui::refresh_ui_watch(world, owner, ui_path);
                     waits.extend(crate::records::refresh_record_watch(world, owner));
+                    waits.extend(crate::settings::refresh_settings_watch(world, owner));
                     waits
                 }
-                AgentUpdateKind::RuntimeStopped | AgentUpdateKind::Removed => {
-                    if let Some(tasks) = world.get_component::<tool_core::ToolTasks>(owner) {
-                        tasks.close_sync();
-                    }
+                AgentUpdateKind::SourcesClosing | AgentUpdateKind::Removed => {
                     let mut waits = crate::ui::stop_ui_watch(world, owner);
                     waits.extend(crate::records::stop_record_watch(world, owner));
+                    waits.extend(crate::settings::stop_settings_watch(world, owner));
                     waits
                 }
             }
@@ -207,47 +226,41 @@ pub fn agent_sync_context(clients: Clients) -> AgentUpdateContext {
     )
 }
 pub(crate) fn initialize_agent_sources(world: &mut World) {
-    let owners = world.query_with::<agent_core::Agent>().result();
-    for owner in owners {
-        let context = world
-            .get_component::<agent_core::Agent>(owner)
-            .unwrap()
-            .updates();
-        let waits = context.notify(world, owner, AgentUpdateKind::Changed);
+    let context = world.get_resource::<AgentUpdateContext>().unwrap().clone();
+    for owner in world.query_with::<agent_core::Agent>().result() {
+        let waits = context.notify(world, owner, AgentUpdateKind::Installed);
         assert!(waits.is_empty());
-        let waits = context.notify(world, owner, AgentUpdateKind::RuntimeInstalled);
-        assert!(
-            waits.is_empty(),
-            "initial observer setup cannot replace an existing source"
-        );
     }
 }
 pub(crate) fn get_or_create_agent_context(world: &mut World) -> AgentUpdateContext {
     if let Some(context) = world.get_resource::<AgentUpdateContext>() {
         return context.clone();
     }
-    let clients = world
-        .get_resource::<Clients>()
-        .expect("Clients required")
-        .clone();
-    let context = agent_sync_context(clients);
+    let context = agent_sync_context(
+        world
+            .get_resource::<Clients>()
+            .expect("Clients required")
+            .clone(),
+    );
     world.insert_resource(context.clone());
     context
 }
-
-pub fn resource_sync_bindings(
-    context: AgentUpdateContext,
-) -> (
-    tool_resource_core::ToolResourceSyncBinding,
-    sandbox_resource_core::SandboxSyncBinding,
-    sandbox_resource_core::SandboxSelectionSyncBinding,
-) {
-    let tools = context.clone();
-    let sandboxes = context.clone();
-    (
-        client_core::ProbeFactory::new(move |owner| {
-            let context = tools.scoped(owner);
-            client_core::UpdateProbe::new(
+pub type ToolChangeObserver =
+    Arc<dyn Fn(Vec<(String, tool_resource_core::ToolEntry)>) + Send + Sync>;
+#[derive(Clone)]
+pub struct ToolObserverFactory {
+    bind: Arc<dyn Fn(Entity) -> ToolChangeObserver + Send + Sync>,
+}
+impl ToolObserverFactory {
+    pub fn for_owner(&self, owner: Entity) -> ToolChangeObserver {
+        (self.bind)(owner)
+    }
+}
+pub fn resource_sync_bindings(context: AgentUpdateContext) -> ToolObserverFactory {
+    ToolObserverFactory {
+        bind: Arc::new(move |owner| {
+            let context = context.scoped(owner);
+            Arc::new(
                 move |values: Vec<(String, tool_resource_core::ToolEntry)>| {
                     context.update_public(
                         owner,
@@ -264,44 +277,32 @@ pub fn resource_sync_bindings(
                                 })
                                 .collect(),
                         ),
-                    )
+                    );
                 },
             )
         }),
-        client_core::ProbeFactory::new(move |owner| {
-            let context = sandboxes.scoped(owner);
-            client_core::UpdateProbe::new(move |values| {
-                context.update_public(owner, agent_core::AgentPublicUpdate::Sandboxes(values))
-            })
-        }),
-        client_core::ProbeFactory::new(move |owner| {
-            let context = context.scoped(owner);
-            client_core::UpdateProbe::new(move |value| {
-                context.update_public(owner, agent_core::AgentPublicUpdate::Sandbox(value))
-            })
-        }),
-    )
-}
-pub(crate) fn install_resource_bindings(world: &mut World, context: AgentUpdateContext) {
-    if !world.contains_resource::<inference_core::ModelSyncBinding>() {
-        world.insert_resource(model_sync_binding(context.clone()));
-    }
-    let (tools, sandboxes, selection) = resource_sync_bindings(context);
-    if !world.contains_resource::<tool_resource_core::ToolResourceSyncBinding>() {
-        world.insert_resource(tools);
-    }
-    if !world.contains_resource::<sandbox_resource_core::SandboxSyncBinding>() {
-        world.insert_resource(sandboxes);
-    }
-    if !world.contains_resource::<sandbox_resource_core::SandboxSelectionSyncBinding>() {
-        world.insert_resource(selection);
     }
 }
-
-pub fn model_sync_binding(context: AgentUpdateContext) -> inference_core::ModelSyncBinding {
-    client_core::ProbeFactory::new(move |owner| {
+pub fn sandbox_sync_binding(
+    context: AgentUpdateContext,
+) -> sandbox_resource_core::SandboxObserverFactory {
+    sandbox_resource_core::SandboxObserverFactory::new(move |owner| {
+        let list = context.scoped(owner);
+        let selection = list.clone();
+        (
+            Arc::new(move |values| {
+                list.update_public(owner, agent_core::AgentPublicUpdate::Sandboxes(values))
+            }),
+            Arc::new(move |value| {
+                selection.update_public(owner, agent_core::AgentPublicUpdate::Sandbox(value))
+            }),
+        )
+    })
+}
+pub fn model_sync_binding(context: AgentUpdateContext) -> inference_core::ModelObserverFactory {
+    inference_core::ModelObserverFactory::new(move |owner| {
         let context = context.scoped(owner);
-        client_core::UpdateProbe::new(move |value: Option<inference_core::PublicModelInfo>| {
+        Arc::new(move |value: Option<inference_core::PublicModelInfo>| {
             context.update_public(
                 owner,
                 agent_core::AgentPublicUpdate::Model(value.map(|model| {
@@ -318,6 +319,14 @@ pub fn model_sync_binding(context: AgentUpdateContext) -> inference_core::ModelS
             )
         })
     })
+}
+pub(crate) fn install_resource_bindings(world: &mut World, context: AgentUpdateContext) {
+    if !world.contains_resource::<inference_core::ModelObserverFactory>() {
+        world.insert_resource(model_sync_binding(context.clone()));
+    }
+    if !world.contains_resource::<sandbox_resource_core::SandboxObserverFactory>() {
+        world.insert_resource(sandbox_sync_binding(context));
+    }
 }
 
 #[derive(Clone, PartialEq)]

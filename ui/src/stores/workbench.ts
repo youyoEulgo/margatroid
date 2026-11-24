@@ -32,13 +32,13 @@ import { parseModelRoutes } from '@/lib/modelConfig';
 
 export type ConnectionStatus = 'offline' | 'connecting' | 'online';
 const COMMAND_RESULT: Partial<Record<ClientMessage['type'], ServerMessage['type']>> = {
-  'workspace.start': 'workspace.start.result',
-  'workspace.stop': 'workspace.stop.result',
-  'workspace.restart': 'workspace.restart.result',
   'workspace.create': 'workspace.create.result',
-  'workspace.update': 'workspace.update.result',
-  'workspace.rename': 'workspace.rename.result',
   'workspace.delete': 'workspace.delete.result',
+  'workspace.rename': 'workspace.rename.result',
+  'agent.rename': 'agent.rename.result',
+  'agent.start': 'agent.start.result',
+  'agent.stop': 'agent.stop.result',
+  'agent.archive': 'agent.archive.result',
   'agent.turn.abort': 'agent.turn.abort.result',
   'mcl.execute': 'mcl.execute.result',
   'model.config.update': 'model.config.update.result',
@@ -114,12 +114,15 @@ export interface SidebarAgent {
   depth: number;
   creator: { address: string; task_id: string } | null;
   children: SidebarAgent[];
+  category?: 'normal' | 'temporary' | 'archived';
+  nodeName?: string | null;
+  running?: boolean;
 }
 export interface SidebarWorkspace {
   key: string;
   name: string;
   path: string;
-  address: string | null;
+  address: string;
   projectRoot: string;
   status: TreeStatus;
   lifecycle: string;
@@ -379,6 +382,121 @@ export function latestContextTokens(history: AgentHistory | undefined): number |
   }
   return latest;
 }
+export function buildWorkspaceSidebar(
+  snapshots: WorkspaceSnapshot[],
+  states: AgentState[],
+  selectedKey: string,
+  selectedAgent: string | null,
+): SidebarModel {
+  return {
+    selectedKey,
+    workspaces: snapshots.map((workspace) => {
+      const workspaceStates = states.filter(
+        (candidate) => workspaceKey(candidate.workspace) === workspace.address,
+      );
+      const normalRegistrations = workspace.agents.filter(
+        (agent) => agent.category === 'normal' && agent.node_name !== null,
+      );
+      const normalNodeAddresses = new Set(
+        normalRegistrations.map((agent) => `${agent.parent_node}/${agent.node_name}`),
+      );
+      const tempRegistrations = workspace.agents.filter((agent) => agent.category === 'temporary');
+      type Entry = {
+        registration: (typeof workspace.agents)[number] | null;
+        nodeAddress: string | null;
+        state: AgentState | null;
+      };
+      const entries: Entry[] = normalRegistrations.map((registration) => {
+        const nodeAddress = `${registration.parent_node}/${registration.node_name}`;
+        return {
+          registration,
+          nodeAddress,
+          state: workspaceStates.find((state) => state.agent === nodeAddress) ?? null,
+        };
+      });
+      const usedTemporaryStates = new Set<string>();
+      for (const registration of tempRegistrations) {
+        const state = workspaceStates.find(
+          (candidate) =>
+            !normalNodeAddresses.has(candidate.agent) &&
+            !usedTemporaryStates.has(candidate.agent) &&
+            (candidate.agent.includes(registration.id) ||
+              registration.id.includes(resourceName(candidate.agent))),
+        );
+        if (!state) continue;
+        usedTemporaryStates.add(state.agent);
+        entries.push({ registration, nodeAddress: state.agent, state });
+      }
+      for (const state of workspaceStates) {
+        if (normalNodeAddresses.has(state.agent) || usedTemporaryStates.has(state.agent)) continue;
+        entries.push({ registration: null, nodeAddress: state.agent, state });
+      }
+      const registrations = entries;
+      const rows: SidebarAgent[] = entries.map(({ registration, nodeAddress, state }) => ({
+        key: nodeAddress ?? registration?.id ?? '',
+        id: nodeAddress,
+        name:
+          registration?.alias?.trim() ||
+          registration?.node_name ||
+          registration?.previous_alias?.trim() ||
+          registration?.previous_node_name ||
+          (nodeAddress ? resourceName(nodeAddress) : 'temporary'),
+        driver: registration?.tool_path ?? '',
+        status: state
+          ? state.status === 'running'
+            ? 'running'
+            : state.status === 'starting' || state.status === 'closing'
+              ? 'stopped'
+              : 'error'
+          : 'stopped',
+        reason: state?.error?.message ?? '',
+        active: nodeAddress !== null && nodeAddress === selectedAgent,
+        depth: 0,
+        creator: state?.creator ?? null,
+        children: [],
+        category: registration?.category ?? 'temporary',
+        nodeName: registration?.node_name ?? null,
+        running: !!state,
+      }));
+      const byNode = new Map<string, SidebarAgent>();
+      registrations.forEach(({ nodeAddress }, index) => {
+        if (nodeAddress) byNode.set(nodeAddress, rows[index]!);
+      });
+      const roots: SidebarAgent[] = [];
+      registrations.forEach(({ registration, state }, index) => {
+        const row = rows[index]!;
+        const parentNode = registration?.parent_node ?? state?.creator?.address ?? null;
+        const parent =
+          parentNode === null || parentNode === workspace.address
+            ? null
+            : (byNode.get(parentNode) ?? null);
+        if (parent && parent !== row) parent.children.push(row);
+        else roots.push(row);
+      });
+      const agents: SidebarAgent[] = [];
+      const append = (row: SidebarAgent, depth: number) => {
+        row.depth = depth;
+        agents.push(row);
+        for (const child of row.children) append(child, depth + 1);
+      };
+      for (const row of roots) append(row, 0);
+      const reason = agents.find((agent) => agent.reason)?.reason ?? '';
+      return {
+        key: workspace.address,
+        name: workspace.alias?.trim() || workspace.address.split('/').pop() || workspace.address,
+        path: workspace.address,
+        address: workspace.address,
+        projectRoot: workspace.project_root,
+        status: reason ? 'error' : agents.some((agent) => agent.running) ? 'running' : 'stopped',
+        lifecycle: workspace.status,
+        reason,
+        active: workspace.address === selectedKey,
+        expanded: true,
+        agents,
+      };
+    }),
+  };
+}
 export function buildSidebarModel(
   definitions: WorkspaceConfig[],
   runtime: WorkspaceInfo[],
@@ -419,7 +537,7 @@ export function buildSidebarModel(
           memberFailure ||
           state?.error?.message ||
           (instance && member.id ? failures.get(`${instance.id}:${member.id}`)?.message : '') ||
-          (state?.status === 'error' ? 'Agent error' : '');
+          '';
         const row: SidebarAgent = {
           ...member,
           key: member.id ?? member.name,
@@ -462,7 +580,7 @@ export function buildSidebarModel(
       return {
         key: definition.path,
         path: definition.path,
-        address: instance?.id ?? null,
+        address: instance?.id ?? '',
         name: workspaceDisplayName(definition.cache, definition.path, instance?.id),
         projectRoot: definition.cache.project_root,
         status,
@@ -602,9 +720,19 @@ export const useWorkbenchStore = defineStore('workbench', () => {
           workspaceKey(state.workspace) === selectedRuntimeWorkspace.value?.id,
       ) ?? null,
   );
-  const selectedAgentName = computed(() =>
-    selectedAgent.value ? resourceName(selectedAgent.value) : 'Choose an agent',
-  );
+  const selectedAgentName = computed(() => {
+    const address = selectedAgent.value;
+    if (!address) return 'Choose an agent';
+    const workspace = workspaceSnapshots.value.find(
+      (candidate) => candidate.address === selectedRuntimeWorkspace.value?.id,
+    );
+    const registration = workspace?.agents.find((agent) => {
+      if (agent.category === 'archived') return false;
+      if (agent.node_name) return `${agent.parent_node}/${agent.node_name}` === address;
+      return address.includes(agent.id) || agent.id.includes(resourceName(address));
+    });
+    return registration?.alias?.trim() || registration?.node_name || resourceName(address);
+  });
   const selectedAgentReady = computed(() => selectedAgentState.value?.status === 'running');
   const selectedAgentIdle = computed(
     () => selectedAgentReady.value && !selectedAgentState.value?.turn,
@@ -622,12 +750,9 @@ export const useWorkbenchStore = defineStore('workbench', () => {
   const abortPending = computed(() => selectedAgentWorking.value && !!selectedAbortGuard.value);
   const canAbortTurn = computed(() => selectedAgentWorking.value && !abortPending.value);
   const sidebarTree = computed(() =>
-    buildSidebarModel(
-      definitions.value,
-      runtimeWorkspaces.value,
+    buildWorkspaceSidebar(
+      workspaceSnapshots.value,
       agentStates.value,
-      lastFailures.value,
-      expandedWorkspaceKeys.value,
       selectedWorkspaceKey.value,
       selectedAgent.value,
     ),
@@ -1404,23 +1529,26 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     histories.value = histories.value.filter((history) => live.has(history.agent));
   }
   function projectSnapshots() {
-    definitions.value = workspaceSnapshots.value.map((w) => ({
-      path: w.path,
-      cache: w.definition,
+    definitions.value = workspaceSnapshots.value.map((workspace) => ({
+      path: workspace.address,
+      cache: {
+        path: workspace.address,
+        alias: workspace.alias,
+        project_root: workspace.project_root,
+        agents: [],
+      },
     }));
-    runtimeWorkspaces.value = workspaceSnapshots.value
-      .filter((w) => w.status !== 'inactive')
-      .map((w) => ({
-        id: w.address!,
-        name: workspaceDisplayName(w.definition, w.path, w.address),
-        project_root: w.definition.project_root,
-        definition_path: w.path,
-        status: w.status as WorkspaceInfo['status'],
-        error: w.error,
-        agents: activeAgentInfos.value
-          .filter((a) => a.workspace === w.address)
-          .map((a) => a.address),
-      }));
+    runtimeWorkspaces.value = workspaceSnapshots.value.map((workspace) => ({
+      id: workspace.address,
+      name: workspace.alias?.trim() || workspace.address.split('/').pop() || workspace.address,
+      project_root: workspace.project_root,
+      definition_path: workspace.address,
+      status: workspace.status,
+      error: null,
+      agents: activeAgentInfos.value
+        .filter((agent) => agent.workspace === workspace.address)
+        .map((agent) => agent.address),
+    }));
     agentStates.value = activeAgentInfos.value.map((a) => ({
       workspace: runtimeWorkspaces.value.find((w) => w.id === a.workspace) ?? {
         id: a.workspace,
@@ -1598,6 +1726,13 @@ export const useWorkbenchStore = defineStore('workbench', () => {
         queryState();
         requestModelConfig();
         break;
+      case 'resource.res':
+        settle(
+          event.id,
+          event.success ? event.resources : null,
+          event.success ? undefined : event.error.message,
+        );
+        break;
       case 'workspace.res':
         if (listQueries.get(event.id) !== 'workspace.req') break;
         listQueries.delete(event.id);
@@ -1639,13 +1774,13 @@ export const useWorkbenchStore = defineStore('workbench', () => {
         pruneAgentState();
         projectSnapshots();
         break;
-      case 'workspace.start.result':
-      case 'workspace.stop.result':
-      case 'workspace.restart.result':
       case 'workspace.create.result':
-      case 'workspace.update.result':
-      case 'workspace.rename.result':
       case 'workspace.delete.result':
+      case 'workspace.rename.result':
+      case 'agent.rename.result':
+      case 'agent.start.result':
+      case 'agent.stop.result':
+      case 'agent.archive.result':
         settle(event.id, null, event.success ? undefined : event.error.message);
         break;
       case 'agent.turn.abort.result': {
@@ -1830,83 +1965,87 @@ export const useWorkbenchStore = defineStore('workbench', () => {
       workspaceOperationPending.value = false;
     }
   }
-  function workspaceAddress(path: string): string | null {
-    return (
-      workspaceSnapshots.value.find((workspace) => workspace.path === path)?.address ??
-      workspaceAddressFromPath(path)
-    );
-  }
-  async function startWorkspace(path = selectedDefinition.value?.path): Promise<void> {
-    const address = path ? workspaceAddress(path) : null;
-    if (!path || !address || !definitions.value.some((entry) => entry.path === path))
-      throw new Error('Choose a configured workspace definition');
-    if (runtimeWorkspaces.value.some((workspace) => workspace.definition_path === path))
-      throw new Error('Workspace is already active');
-    await workspaceRequest({ type: 'workspace.start', id: randomId(), message: { address } });
-    workspaceNotice.value = 'Workspace started.';
-  }
-  async function restartWorkspace(path = selectedDefinition.value?.path): Promise<void> {
-    const address = path ? workspaceAddress(path) : null;
-    if (
-      !path ||
-      !address ||
-      !runtimeWorkspaces.value.some(
-        (workspace) =>
-          workspace.definition_path === path && ['running', 'error'].includes(workspace.status),
-      )
-    )
-      throw new Error('Choose a running or failed workspace');
-    await workspaceRequest({
-      type: 'workspace.restart',
-      id: randomId(),
-      message: { address },
-    });
-    workspaceNotice.value = 'Workspace restarted.';
-  }
-  async function stopWorkspace(address = selectedRuntimeWorkspace.value?.id): Promise<void> {
-    if (
-      !address ||
-      !runtimeWorkspaces.value.some(
-        (workspace) => workspace.id === address && ['running', 'error'].includes(workspace.status),
-      )
-    )
-      throw new Error('Choose a running or failed workspace');
-    await workspaceRequest({
-      type: 'workspace.stop',
-      id: randomId(),
-      message: { address },
-    });
-    workspaceNotice.value = 'Workspace stopped.';
-  }
-  async function updateWorkspace(
-    address: string,
-    definition: Omit<WorkspaceDefinition, 'name'>,
-  ): Promise<void> {
-    await workspaceRequest({
-      type: 'workspace.update',
-      id: randomId(),
-      message: { address, definition },
-    });
-    workspaceNotice.value = 'Workspace updated.';
+  async function createWorkspace(payload: {
+    address: string;
+    alias: string;
+    project_root: string;
+  }) {
+    await workspaceRequest({ type: 'workspace.create', id: randomId(), message: payload });
+    workspaceNotice.value = 'Workspace created.';
     sendQuery('workspace.req');
   }
-  async function renameWorkspace(address: string, newAddress: string): Promise<void> {
+  async function renameWorkspaceAlias(address: string, alias: string) {
     await workspaceRequest({
       type: 'workspace.rename',
       id: randomId(),
-      message: { address, new_address: newAddress },
+      message: { address, alias },
     });
-    workspaceNotice.value = 'Workspace renamed.';
+    workspaceNotice.value = 'Workspace alias updated.';
     sendQuery('workspace.req');
   }
-  async function deleteWorkspace(address: string): Promise<void> {
+  async function renameAgentAlias(address: string, alias: string) {
     await workspaceRequest({
-      type: 'workspace.delete',
+      type: 'agent.rename',
       id: randomId(),
-      message: { address },
+      message: { address, alias },
     });
+    workspaceNotice.value = 'Agent alias updated.';
+    sendQuery('workspace.req');
+    sendQuery('agent.req');
+  }
+  async function deleteWorkspace(address: string) {
+    await workspaceRequest({ type: 'workspace.delete', id: randomId(), message: { address } });
     workspaceNotice.value = 'Workspace deleted.';
     sendQuery('workspace.req');
+    sendQuery('agent.req');
+  }
+  async function startAgentExisting(workspace: string, nodeName: string) {
+    await workspaceRequest({
+      type: 'agent.start',
+      id: randomId(),
+      message: { mode: 'existing', workspace, node_name: nodeName },
+    });
+    workspaceNotice.value = 'Agent start requested.';
+    sendQuery('workspace.req');
+    sendQuery('agent.req');
+  }
+  async function startAgentNew(
+    workspace: string,
+    toolPath: string,
+    argumentsValue: Record<string, unknown>,
+  ) {
+    await workspaceRequest({
+      type: 'agent.start',
+      id: randomId(),
+      message: { mode: 'new', workspace, tool_path: toolPath, arguments: argumentsValue },
+    });
+    workspaceNotice.value = 'Agent start requested.';
+    sendQuery('workspace.req');
+    sendQuery('agent.req');
+  }
+  async function stopAgent(address: string) {
+    await workspaceRequest({ type: 'agent.stop', id: randomId(), message: { address } });
+    workspaceNotice.value = 'Agent stop requested.';
+    sendQuery('workspace.req');
+    sendQuery('agent.req');
+  }
+  async function archiveAgent(workspace: string, nodeName: string) {
+    await workspaceRequest({
+      type: 'agent.archive',
+      id: randomId(),
+      message: { workspace, node_name: nodeName },
+    });
+    workspaceNotice.value = 'Agent archived.';
+    sendQuery('workspace.req');
+  }
+  async function queryResources(
+    message: {
+      type?: 'driver' | 'tool' | 'prompt' | 'sandbox';
+      scope?: string;
+      name?: string;
+    } = {},
+  ) {
+    return request({ type: 'resource.req', id: randomId(), message });
   }
   function clearLogs() {
     logs.value = [];
@@ -1954,13 +2093,15 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     selectedRuntimeWorkspace,
     workspaceOperationPending,
     workspaceNotice,
-    startWorkspace,
-    restartWorkspace,
-    stopWorkspace,
-    workspaceAddress,
-    updateWorkspace,
-    renameWorkspace,
+    createWorkspace,
     deleteWorkspace,
+    renameWorkspaceAlias,
+    renameAgentAlias,
+    startAgentExisting,
+    startAgentNew,
+    stopAgent,
+    archiveAgent,
+    queryResources,
     sidebarTree,
     toggleWorkspace,
     selectedWorkspaceKey,

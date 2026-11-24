@@ -1,14 +1,29 @@
 {
   "type": "object",
   "properties": {
-    "instructions": {
+    "node_name": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "minLength": 1,
+      "description": "Unique ordinary Agent node in this Workspace; omitted/null creates a temporary Agent."
+    },
+    "alias": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "minLength": 1,
+      "description": "Optional display alias."
+    },
+    "path": {
       "type": "string",
       "minLength": 1,
-      "description": "Complete instructions for this background subagent, in addition to inherited parent context."
+      "default": ".",
+      "description": "Existing work directory relative to the creator project_root."
     }
   },
-  "required": [
-    "instructions"
-  ],
+  "required": [],
   "additionalProperties": false
 }

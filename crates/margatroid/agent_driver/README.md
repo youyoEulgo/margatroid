@@ -59,15 +59,15 @@ Driver任务目标保存在自身配置driver_task={agent=执行地址,task_id=�
 
 推理领域执行失败以Inference.message={type="error",message=原错误文本,request_id=原请求id}及stop_reason="error"返回，不走顶层MCL Error。普通回合将error排入原消息入口，记录历史并等待本轮真实清理；压缩调用直接记录error，不改成compact、不替换上下文、不自动重试，Driver仍可接收后续任务。MCL参数/权限/队列或历史写入等真实执行错误仍由原command封装处理。
 
-内置Driver的初始设置包含[initialization]：default为原静态IMPORT/CREATE/INJECT指令对象数组，每项固定为{command=指令文本,arguments=参数数组}，custom初始为[]，供用户追加初始化指令。initialize读取Agent配置，严格按default再custom顺序逐条command(item.command,item.arguments)执行；参数化model_set、sandbox_use、driver_task登记及最后ready保留在脚本，任一指令失败不发送ready。已有Agent持久配置缺少整个initialization段时，只读Driver资源目录setting.toml中的该段执行，不自动写回或覆盖持久配置；显式配置了该段时使用其default/custom，不合并额外隐藏指令。修改custom在下一次Driver初始化时生效，编辑保留默认数组和soul/compact及msg/entry/session等运行依赖。
+内置Driver的初始设置包含[initialization]：default为原静态IMPORT/CREATE/INJECT指令对象数组，每项固定为{command=指令文本,arguments=参数数组}，custom初始为[]，供用户追加初始化指令。initialize读取Agent配置，严格按default再custom顺序逐条command(item.command,item.arguments)执行；参数化model_set、sandbox_use、driver_task登记及最后ready保留在脚本，任一指令失败不发送ready。initialization、default或custom缺失或为空时跳过对应数组，不再读取资源配置补齐，不合并隐藏指令。修改custom在下一次Driver初始化时生效，编辑保留默认数组和soul/compact及msg/entry/session等运行依赖。
 
 初始化default/custom统一使用对象条目，不混用旧字符串；无参数条目显式arguments=[]，有参数条目以arguments按顺序绑定?。参数保留TOML可表示的数组/对象/数字/布尔/字符串类型，不做文本替换或内联JSON拼接；tool_call对象内的arguments沿原协议为JSON字符串。现有用户持久设置不自动迁移；已有initialization段中的字符串条目需手动改为对象。
 
-内置coder/reviewer通过同一base.lua按context.kind区分主Driver和subdriver。主模式读取相邻description.md/schema注册subagent，不指定lifetime；子模式不注册subagent工具。
+内置coder/reviewer的base.lua与main.lua保持相同程序，按instructions参数是否存在区分主Driver与子代理。input.schema.json只校验默认工具启动的node_name、alias、path，不包含instructions；主模式读取subagent.schema.json原样注册subagent，该Schema只开放必需instructions与可选path，不开放node_name或alias。子模式不注册subagent工具。
 
 subagent采用全新对话：config_path固定资源目录setting.toml，不读取父Agent配置/上下文，不继承父initialization.custom或动态工具，不注入继承边界或父消息。默认配置初始化完成并ready后return_result({task_id})，再将委托instructions作为第一条user消息正常记录历史、开始子回合。只有Driver默认配置中定义的工具/初始化可用于子代理。
 
-子模式与主模式共用history_append记录本轮user/assistant/tool_call/error/compact及真实sequence。任务输出包含非空assistant.content，error额外追加[subagent error]运行时诊断；reasoning、工具结果、user及compact不写任务输出。子Agent结束回合后停止，但任务保留输出等待父task_finish；宿主异常沿既有task.error及真实清理路径交付，不自动重试。
+子模式与主模式共用history_append记录本轮user/assistant/tool_call/error/compact及真实sequence。任务输出包含非空assistant.content，error额外追加[subagent error]运行时诊断；reasoning、工具结果、user及compact不写任务输出。子Agent结束回合后只清空turn并进入task.receive等待，不调用agent.stop或自行finish；Agent与任务输出一起保留，父Agent通过task_read读取后显式task_finish才关闭任务和子Agent；宿主异常沿既有task.error及真实清理路径交付，不自动重试。
 
 主Agent创建时ui_path使用资源目录/ui，子模式使用/subagent-ui。两种UI来源均由原目录监控和agent.ui接口交付，不复制、不回退主UI。创建来源creator由真实任务绑定产生，不由脚本传owner。
 
@@ -75,4 +75,4 @@ skill_register与mcp_register在实际注册成功后，使用目标Agent CONFIG
 
 CONFIG写入失败返回“本次已注册但启动命令未保存”的失败说明。skill静态工具保留；MCP返回失败说明及当前serving task_id，任务仍存活、维持已注册工具转发。后续启动重新执行已保存命令，建立新MCP连接/任务，不使用旧task_id。GET编辑SET之间不做隔离，整数组覆盖语义由调用方接受。
 
-已有配置缺少initialization.default时，从资源默认配置只读取得default；如存在custom则仍执行并可追加注册命令，完全缺少initialization时沿原资源default/custom回退，不自动写回default。默认配置文件本身不因目标Agent注册而修改，子代理不继承父持久注册项。
+持久配置是本次初始化的唯一来源；缺失或空初始化不回退资源模板。资源setting.toml只用于新Agent配置文件首次创建，子代理不继承父持久注册项。

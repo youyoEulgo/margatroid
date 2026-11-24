@@ -6,14 +6,9 @@ fn agent(world: &mut World) -> core_plugin::Entity {
     let entity = world.spawn();
     world.insert_component(
         entity,
-        agent_core::Agent::new(
-            "coder".into(),
-            workspace,
-            AgentState::Running,
-            None,
-            crate::test_agent_context(),
-        ),
+        Agent::new(workspace, workspace, "task-1".into(), "/project".into()),
     );
+    world.agent_ready(entity).unwrap();
     entity
 }
 
@@ -22,10 +17,7 @@ fn turn_admission_changes_state_synchronously_and_never_overwrites() {
     let mut world = World::new();
     let entity = agent(&mut world);
     let turn = world.agent_start_turn(entity).unwrap();
-    assert!(
-        world.agent_ready(entity).is_err(),
-        "ready must not clear an active turn"
-    );
+    world.agent_ready(entity).unwrap();
     assert_eq!(*world.agent_state(entity).unwrap(), AgentState::Running);
     assert_eq!(world.agent_start_turn(entity).unwrap(), turn);
     assert_eq!(
@@ -63,17 +55,11 @@ fn abort_clears_turn_but_keeps_working_until_driver_finishes() {
 fn lifecycle_states_reject_turn_operations_and_old_entities_do_not_resolve() {
     let mut world = World::new();
     let entity = agent(&mut world);
-    for state in [
-        AgentState::Starting,
-        AgentState::Error,
-        AgentState::Stopping,
-    ] {
-        world.agent_transition(entity, state, None).unwrap();
-        assert!(world.agent_start_turn(entity).is_err());
-        assert!(world.agent_abort_turn(entity, "turn").is_err());
-        assert!(world.agent_finish_turn(entity, "turn").is_err());
-        assert_eq!(*world.agent_state(entity).unwrap(), state);
-    }
+    world.agent_begin_close(entity).unwrap();
+    assert!(world.agent_start_turn(entity).is_err());
+    assert!(world.agent_abort_turn(entity, "turn").is_err());
+    assert!(world.agent_finish_turn(entity, "turn").is_err());
+    assert_eq!(*world.agent_state(entity).unwrap(), AgentState::Closing);
     world.despawn(entity);
     let replacement = agent(&mut world);
     assert_ne!(entity, replacement);
@@ -81,10 +67,6 @@ fn lifecycle_states_reject_turn_operations_and_old_entities_do_not_resolve() {
         world.agent_state(entity).unwrap_err().kind,
         AgentErrorKind::AgentMissing
     );
-}
-
-fn test_agent_context() -> agent_core::AgentUpdateContext {
-    agent_core::AgentUpdateContext::new(|_, _, _| Vec::new(), |_, _| {})
 }
 
 #[test]
@@ -106,7 +88,7 @@ fn resource_probe_scope_is_retired_when_actual_agent_runtime_stops() {
     context.notify(
         &mut world,
         owner,
-        agent_core::AgentUpdateKind::RuntimeStopped,
+        agent_core::AgentUpdateKind::SourcesClosing,
     );
     old.update_public(
         owner,

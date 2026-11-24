@@ -1,15 +1,15 @@
 # Inference
 
-本轮共享Client槽位、统一写入口与异步监控已实现，尚未提交。具体函数和边界见本领域DESIGN及[DTO说明](../dto/README.md)；运行进程需使用新构建。
-inference_core定义推理请求、消息、结果、模型配置Resource及错误，目标通过client_core共享发送能力连接网络，仍不依赖DTO或服务器plugin。inference_plugin组合Agent、Client、Tools记录，执行模型请求；不依赖其他plugin。MCL负责消息转换、批次工具调用和显式历史，Inference不维护上下文、不执行工具、不写历史。
+本文描述当前源码中的推理契约，不表示运行中的daemon已经更新。具体入口与线程边界见本领域DESIGN。
+inference_core定义推理请求、消息、结果、ActiveInference、模型配置能力及错误，只依赖mecs和通用库，不依赖client_core或其他业务core。公共模型变化通过ModelChanged与ModelObserverFactory注入通用回调；网络投递在plugin完成。inference_plugin组合Agent、Client、Tools记录，执行模型请求；不依赖其他plugin。MCL负责消息转换、批次工具调用和显式历史，Inference不维护上下文、不执行工具、不写历史。
 
-本文其余业务契约沿用已提交基线，新同步路径以当前实际实现为准。InferenceRequest不再携带tools参数，每次推理直接遍历Agent的Tools，以每条记录的alias、description、input_schema构造模型工具定义；Tools为空时工具定义为空。发出异步闭包前完成HTTP请求编码；闭包不持工具定义或名称集合，不负责工具鉴权。执行侧按请求名称查询当前Tools并校验该记录的schema，缺失或参数无效返回对应调用的工具错误。
+InferenceRequest不携带tools参数。受理时遍历当前Agent的Tools，固定完整alias、description和input_schema快照；Tools为空时无工具定义。真实文件型模型配置在异步监督中重新读取并校验，再按本次路由构造HTTP；显式内存测试才可使用受理时已有路由。工具执行仍按当前Tools和登记Schema校验，推理不负责工具鉴权或执行。
 
 Margatroid领域使用原生Axum装配及普通异步闭包。网络服务归本应用基础设施，mecs提供通用运行、异步事件和闭包能力。
 
 ## 配置与参数
 
-InferencePlugin::open读取models.toml并完整校验模型路由，build安装ModelRoutes及HTTP客户端。provider与api_type分别明确指定，不从URL或模型名推断。请求携带路由选择键及采样参数；受理时取得本次路由快照，后续配置变化不修改在途请求。配置重载归Margatroid整体机制，不增加独立推理重载事件。
+InferencePlugin::open读取models.toml并完整校验模型路由，build安装ModelRoutes及HTTP客户端。provider与api_type分别明确指定，不从URL或模型名推断。请求携带路由选择键及采样参数；每次实际推理开始时通过ModelConfigFile重读来源，损坏、删除或ID缺失均失败，不回退旧路由。已构造的在途请求保持本次快照。ModelRoutes用于最近校验后的安全投影，不作为文件型执行的长期路由缓存。
 
 | provider | api_type |
 | --- | --- |
@@ -22,13 +22,13 @@ InferencePlugin::open读取models.toml并完整校验模型路由，build安装M
 
 ## 推理句柄初始化
 
-Agent初始化时发送InitInference，init_inference_system路由至Handler，在Agent Entity挂载current=None的ActiveInference并通过原oneshot回复；已有组件不覆盖，不在初始化时提交推理。
+新Agent创建System从inference_core同步挂载ActiveInference::default()，无需额外初始化往返。InitInference仍提供显式幂等初始化入口：已有组件不覆盖，未有组件才挂载current=None并通过原reply返回，不提交推理。
 
 ActiveInference归inference_core，单独保存当前InferenceHandle。受理推理时写入本次请求、turn和控制句柄，已有未结束推理时拒绝重叠请求。中止直接取得当前句柄，先关闭StreamGate再取消，不查找或遍历ToolTasks。
 
 ## 输入与工具
 
-InferenceRequest携带完整Agent Entity、turn、消息和oneshot。Handler认领唯一回复端，检查Running及当前非空turn，准备本次请求。System实际受理时当前turn为空或与request.turn不匹配，直接返回空assistant的Completed响应（正文、reasoning、tool_calls、usage均空），不启动HTTP或监督任务。插件仅允许UPDATE或POST_UPDATE，拒绝PRE_UPDATE及无法证明顺序的自定义schedule。
+InferenceRequest携带完整Agent Entity、显式可选turn、消息和唯一reply。Starting/Running允许turn=None的自由调用，不继承当前回合；Some(turn)必须非空、Agent为Running且与当前有效turn一致。失效关联返回空assistant的Completed，不启动HTTP或任务；Closing拒绝新执行。插件仅允许UPDATE或POST_UPDATE，中止控制先于推理受理。
 
 推理消息由本领域独立定义，MCL在plugin层转换并展开Inject；core不引用消息、工具或Agent core。System保留原角色，中止回复作为普通完成消息处理，工具调用与结果必须正确配对。
 
@@ -114,7 +114,7 @@ HTTP/SSE读取任务只向一个有界ProviderFragment通道写入，不直接�
 
 ## 中止与结果
 
-DTO原生WebSocket读循环解析协议后投递自有DtoRequest，UPDATE转换为专属中止事件，下一帧控制处理。保留两帧业务语义，不依赖通用网络事件或新增直接取消通道。
+DTO的WebSocket读取闭包把回合中止转为AbortTurnControl，由PRE_UPDATE同步控制处理；普通请求仍走DtoRequest。网络请求与领域执行通过原reply交接，不引入通用网络转发事件。
 
 后端固定在PRE_UPDATE受理中止，先同步清turn，再调用ActiveInference.current取消句柄关闭本次StreamGate并触发取消；随后ToolTasks仅对未return任务原子强制回复并终止清理，已return后台任务保留。接受分片与关闭门共用同一短锁；门关闭后不再累积或准备发送任何新分片。receiver直接关闭并丢弃剩余队列，不继续排空，不等HTTP退出后才冻结。
 
@@ -122,13 +122,13 @@ DTO原生WebSocket读循环解析协议后投递自有DtoRequest，UPDATE转换�
 
 正常或用户中止的内容结果始终取自通道出口的ResponseAccumulator。上游任务退出后不能用另一份正文补写结果。中止冻结已接受的正文及思考，以completed普通结束，tool_calls为空，usage为空；无内容保持空值，不填充取消文案。
 
-文本冻结与任务清理分开。已确认的provider或流错误立即经oneshot交给MCL转换为error消息，不等待后台join；正常取消在清理预算内按completed普通结束，超预算及时返回CleanupFailed。原监督任务始终保留并等待真实join，ActiveInference不提前释放，下一次重叠推理返回可见错误。清理完成后发送绑定原Agent、VM实例和request_id的内部通知，确认任务真正结束才唤醒Driver重试finish_turn；迟到通知不能唤醒替换实例。不因错误已交付就假称推理退出，超时、根关闭和reply丢失保留各自分类。
+文本冻结与任务清理分开。已确认的provider或流错误立即经oneshot交给MCL转换为error消息，不等待后台join；正常取消在清理预算内按completed普通结束，超预算及时返回CleanupFailed。原监督任务始终保留并等待真实join，ActiveInference不提前释放，下一次重叠推理返回可见错误。清理完成通知绑定完整Agent Entity、Agent.instance、request_id和本次生成租约。若任务实际join尚未完成，独立异步等待wait_finished后提交一次World闭包，不逐帧重发通知；复核同一实例和句柄后唤醒Agent.wake_slot，迟到通知不作用于替换来源。不因错误已交付就假称推理退出，超时、根关闭和reply丢失保留各自分类。
 
 结果经oneshot交回MCL，再由Driver显式history_append；累积器不直接写历史。生成分片使用agent.message.chunk.sync，字段为address、turn、generation、sequence、content和reasoning；后两者均为截至本sequence的完整累计文本。
 
 生成终态使用agent.message.full.sync，带完整内部消息、同一generation、history_sequence=null及nullable error。成功消息包含完整正文、思考、工具调用、用量和停止原因；tool_calls使用tool_name及JSON文本arguments，与MCL内部AgentMessage一致。失败消息为type=error、message及request_id，外层error使用code/message。Inference不确认落库，因此message不带持久sequence、不填history_sequence，不另发旧finished消息。
 
-full不替代oneshot或真实退出证明。流/协议错误及时交付后仍等待worker真实清理；清理超预算若原reply已交付，再向同generation补发CleanupFailed完整error同步纠正状态，不重新回复或创建新生成。中止成功的full只保留接受门关闭前冻结的正文与思考，不能混入晚到分片。
+full不替代oneshot或真实退出证明。流/协议错误及时交付后仍等待worker真实清理；清理超预算若原reply已交付，仅记录诊断并继续真实监督，不向同generation补发第二条终态，不重新回复。中止成功的full只保留接受门关闭前冻结的正文与思考，不能混入晚到分片。
 
 ## 预算
 
@@ -138,11 +138,11 @@ full不替代oneshot或真实退出证明。流/协议错误及时交付后仍�
 
 工具目录不按条目数或单条描述长度截断，统一受HTTP请求总字节预算约束。真实HTTP回归覆盖1024个工具、每条16KiB描述，在三种模型格式中逐条核对完整名称、描述及schema。
 
-推理受理阶段完成Tools到schema的遍历、输入校验和模型HTTP请求编码，闭包仅持已编码请求及网络、流和清理材料。未知工具名只要响应结构合法就保留，不在推理结果层按工具清单拒绝；当前Tools存在性和schema校验由工具调用受理负责。内部取消信号和错误类别保留，正常中止向调用方返回completed，不影响真实清理要求。
+推理受理阶段固定Tools定义、输入及实际Agent身份，文件型配置在监督中重读后编码HTTP。闭包持有本次owned定义、网络、流与清理材料，不跨await借World。未知工具名只要响应结构合法就保留，不在推理结果层按工具清单拒绝；当前Tools存在性和schema校验由工具调用受理负责。内部取消信号和错误类别保留，正常中止向调用方返回completed，不影响真实清理要求。
 
-## chunk.sync累计文本改版（已实现，尚未提交）
+## chunk.sync累计文本快照
 
-本节对应当前工作树的接口改版，后端源码已改用累计文本；旧49c7711产物仍发送delta，前端与参考客户端源码未改，不以本轮后端验收表示客户端已对接。
+当前源码的累计文本出口不提供旧delta别名；实际运行服务和客户端版本须分别确认。
 
 上游ProviderFragment先经接受门写入唯一ResponseAccumulator，实际正文/思考变化后，在同一临界区取得sequence、完整content及完整reasoning的owned快照，锁外发送。前端不再维护字符串累积器，每条chunk替换同generation的正文和思考；生成结束的full.sync保持原结构，负责最终校正、工具调用、usage、结束原因及错误。工具参数和usage仍正常进入后端累积器，但不单独触发文本快照。
 
@@ -154,9 +154,13 @@ full不替代oneshot或真实退出证明。流/协议错误及时交付后仍�
 
 同一generation的full只由推理消费链路交付一次；后续历史持久化不重发带request_id的assistant/error，持久序号通过history查询取得。已交付生成错误后的清理超时只记诊断，继续保留真实监督，不发送第二条终态full。
 
-显式可选turn契约：start_turn取得并返回当前turn，已有回合返回同一标识；推理和工具显式携带turn时严格校验，省略为None自由调用，不自动继承当前turn。自由调用仍受实际会话、权限、生命周期、取消及原有并发限制；Starting允许初始化所需自由调用，Error/Stopping拒绝。回合中止/收尾只作用于明确绑定该turn的请求，Agent关闭仍监督全部调用。详见本域DESIGN。运行中的旧进程仍需使用新构建。
+显式可选turn契约：start_turn取得并返回当前turn，已有回合返回同一标识；推理和工具显式携带turn时严格校验，省略为None自由调用，不自动继承当前turn。自由调用仍受实际会话、权限、生命周期、取消及原有并发限制；Starting允许初始化所需自由调用，Closing拒绝。回合中止/收尾只作用于明确绑定该turn的请求，Agent关闭仍监督全部调用。详见本域DESIGN。运行中的旧进程仍需使用新构建。
 
 MCL边界将推理领域Err转换为Inference结果内的error AgentMessage（stop_reason=error、原request_id），与顶层MCL执行错误区分；推理领域内部仍使用原Result/清理监督，不在失败时假造assistant或自动重试。
 
 models.toml现支持每次推理前有界重读并按id选择，文件损坏/删除或id缺失均失败，不回退启动快照。既有ModelRoutes只服务最近安全公共投影；有效文件改动刷新Agent安全model信息，无效文件清空投影。
 model.config.req/res/sync及model.config.update/update.result已实现，读取/同步原始TOML供编辑，修改完整校验后原子覆盖同一文件并保留权限；外部编辑/原子替换/删除也触发同一来源监控。无需Workspace、Agent或turn，不接收客户端文件路径，不新增持久目录/数据库或领域System/事件。接口遵循原注册、ingress、固定webui目标和id关联规则；前端源码未改。
+
+InferenceHandle持有本次生成的source_alive租约，来源有效性不再从Agent.source_lease取得。Agent实例只有Starting/Running/Closing；内部来源实例不作为网络目标字段。实体地址为绝对节点路径，文件资源type:scope/name:tag定位规则不变。
+
+普通InferenceHandle.cancel只冻结接受门并请求取消，保留共享来源租约，使同generation的终态full能够交付。retire_source单独用于Agent真正关闭或来源替换，淘汰旧实例的已入队帧；调用方随后仍需cancel并等待真实清理。两者不可混同，回合中止不能提前退休终态来源。共享lease取消回归验证冻结文本、一次full、真实join及迟到文本拒绝。

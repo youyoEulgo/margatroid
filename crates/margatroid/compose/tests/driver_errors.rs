@@ -13,7 +13,6 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::sync::oneshot;
-use workspace_core::{WorkspaceExecutionClose, WorkspaceState, spawn_workspace_executor};
 
 const CODER: &str =
     include_str!("../../../../resources/agent-drivers/margatroid/coder/dev/base.lua");
@@ -44,7 +43,6 @@ struct Fixture {
     _root: tempfile::TempDir,
     owner: core_plugin::Entity,
     workspace: core_plugin::Entity,
-    close: WorkspaceExecutionClose,
     commands: Arc<Mutex<Commands>>,
     exits: Arc<Mutex<Vec<DriverLuaVmExited>>>,
 }
@@ -58,10 +56,8 @@ impl Fixture {
             .add_plugin(AsyncRuntimePlugin)
             .add_plugin(LuaRuntimePlugin::new());
         let owner = app.world_mut().spawn();
-        app.world_mut().insert_component(
-            owner,
-            address::Address::new("agent:margatroid/driver-errors:dev").unwrap(),
-        );
+        app.world_mut()
+            .insert_component(owner, address::Address::new("/unit/driver-errors").unwrap());
         let storage = storage_core::open_storage(
             &root.path().join("agent.sqlite"),
             &root.path().join("settings.toml"),
@@ -70,31 +66,31 @@ impl Fixture {
         .unwrap();
         app.world_mut().insert_component(owner, storage);
         let workspace = app.world_mut().spawn();
+        app.world_mut()
+            .insert_component(workspace, address::Address::new("/unit").unwrap());
         app.world_mut().insert_component(
             workspace,
-            address::Address::new("workspace:test/unit:dev").unwrap(),
+            workspace_core::Workspace::new("driver-errors".into(), root.path().to_owned(), {
+                for kind in ["normal", "temporary", "archived"] {
+                    std::fs::create_dir_all(root.path().join("agents").join(kind)).unwrap();
+                }
+                workspace_core::WorkspaceDatabase::create(
+                    root.path().join("workspace.sqlite"),
+                    workspace_core::WorkspaceMetadata {
+                        address: "/unit".into(),
+                        alias: "driver-errors".into(),
+                        project_root: root.path().to_owned(),
+                    },
+                )
+                .unwrap()
+            }),
         );
-        app.world_mut().insert_component(
-            workspace,
-            workspace_core::Workspace::new(
-                "driver-errors".into(),
-                root.path().join("workspace.yaml"),
-                root.path().to_owned(),
-                WorkspaceState::Running,
-                Default::default(),
-                None,
-                crate::test_workspace_context(),
-            ),
-        );
-        let executor = spawn_workspace_executor().unwrap();
-        let close = executor.close.clone();
-        app.world_mut().insert_component(workspace, executor);
         let events = app.world().event_sender();
         let closures = app.world().closure_sender(RuntimePlugin::UPDATE);
         app.world_mut().insert_resource(LuaServices::new(move|identity,method,args|{let events=events.clone();let closures=closures.clone();Box::pin(async move{
             match method.as_str(){
-                "execution_finished"|"tools_register"=>Ok(json!({})),
-                "agent_create"=>Ok(json!({"address":"agent:margatroid/driver-errors:dev"})),
+                "execution_finished"|"tools_register"|"task_return_result"=>Ok(json!({})),
+                "agent_create"=>Ok(json!({"address":"/unit/driver-errors"})),
                 "wait"=>{let(tx,rx)=oneshot::channel();closures.send(move|world|{let _=tx.send(world.get_component::<DriverLuaVm>(owner).unwrap().wake.clone());});let slot=rx.await.unwrap();tokio::select!{_=identity.cancel.cancelled()=>Err(LuaRuntimeError::new(LuaRuntimeErrorKind::Cancelled,"cancelled")),result=DriverWakeSlot::wait(slot)=>{result?;Ok(serde_json::Value::Null)}}},
                 "task_receive"=>std::future::pending::<Result<Value,LuaRuntimeError>>().await,
                 "mcl_execute"=>{let(tx,rx)=oneshot::channel();events.send_event(MclCommand{id:"fixture-mcl".into(),source:identity.source,source_address:identity.address,source_instance:Some(identity.instance),target:owner,instruction:mcl_core::MclInstruction{text:args["instruction"].as_str().unwrap().into(),arguments:serde_json::from_value(args["arguments"].clone()).unwrap()},cancel:identity.cancel,reply:Arc::new(Mutex::new(Some(tx)))});Ok(match rx.await.unwrap().unwrap(){MclValue::Unit=>json!({}),value=>serde_json::to_value(value).unwrap()})},
@@ -194,7 +190,6 @@ impl Fixture {
             _root: root,
             owner,
             workspace,
-            close,
             commands,
             exits,
         }
@@ -211,7 +206,7 @@ impl Fixture {
         self.app.world().send_event(StartDriverLuaVm {
             owner:self.owner, workspace:self.workspace,
             program:LuaProgram {source, origin:PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../resources/agent-drivers/margatroid/coder/dev/shipped-driver.lua"), },
-            environment:LuaEnvironment {globals:BTreeMap::from([("execution_context".into(), LuaBinding::Value(LuaValue::from_json(json!({"workspace":{"address":"workspace:test/unit:dev"},"name":"test","resource_dir":"/tmp"})).unwrap()))]), modules:BTreeMap::new()},
+            environment:LuaEnvironment {globals:BTreeMap::from([("execution_context".into(), LuaBinding::Value(LuaValue::from_json(json!({"workspace":{"address":"/unit"},"arguments":{"node_name":"driver-errors","alias":"Driver fixture","path":"."},"resource_dir":"/tmp"})).unwrap()))]), modules:BTreeMap::new()},
             reply:Arc::new(Mutex::new(Some(sender))),
         });
         self.drive(|| reply.try_recv().ok()).await
@@ -248,7 +243,12 @@ impl Fixture {
         self.app.world().driver_wake(instance).unwrap();
     }
     async fn close(mut self, instance: Option<DriverLuaVmInstance>) {
-        if let Some(instance) = instance {
+        if let Some(instance) = instance.filter(|instance| {
+            self.app
+                .world()
+                .get_component::<DriverLuaVm>(self.owner)
+                .is_some_and(|vm| vm.instance == *instance && vm.ended.is_some())
+        }) {
             let (sender, mut reply) = oneshot::channel();
             self.app.world().send_event(StopDriverLuaVm {
                 instance,
@@ -256,7 +256,16 @@ impl Fixture {
             });
             self.drive(|| reply.try_recv().ok()).await.unwrap();
         }
-        self.close.close_and_join().await.unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while self
+            .app
+            .world()
+            .contains_component::<DriverLuaVm>(self.owner)
+        {
+            self.app.tick();
+            tokio::task::yield_now().await;
+            assert!(Instant::now() < deadline);
+        }
     }
 }
 
@@ -707,8 +716,4 @@ async fn configured_initialization_runs_defaults_before_custom_and_stops_on_cust
             fixture.close(started.ok()).await;
         }
     }
-}
-
-fn test_workspace_context() -> workspace_core::WorkspaceUpdateContext {
-    workspace_core::WorkspaceUpdateContext::new(|_, _| {})
 }

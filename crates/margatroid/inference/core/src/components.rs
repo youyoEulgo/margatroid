@@ -5,10 +5,10 @@ pub struct ActiveInference {
     pub current: Option<InferenceHandle>,
 }
 impl Component for ActiveInference {}
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct AgentInferenceConfig {
     data: AgentInferenceData,
-    updates: client_core::UpdateProbe<Option<PublicModelInfo>>,
+    updates: crate::ModelChanged,
 }
 #[derive(Clone, Debug)]
 pub struct AgentInferenceData {
@@ -21,10 +21,7 @@ impl std::ops::Deref for AgentInferenceConfig {
     }
 }
 impl AgentInferenceConfig {
-    pub fn new(
-        parameters: InferenceParameters,
-        updates: client_core::UpdateProbe<Option<PublicModelInfo>>,
-    ) -> Self {
+    pub fn new(parameters: InferenceParameters, updates: crate::ModelChanged) -> Self {
         Self {
             data: AgentInferenceData { parameters },
             updates,
@@ -35,7 +32,7 @@ impl AgentInferenceConfig {
         self.publish_current(routes);
     }
     pub fn publish_current(&self, routes: &crate::ModelRoutes) {
-        self.updates.publish(
+        (self.updates)(
             routes
                 .get(&self.parameters.model)
                 .map(|route| PublicModelInfo {
@@ -60,4 +57,12 @@ pub struct PublicModelInfo {
     pub context_window_tokens: u64,
     pub thinking: Option<String>,
     pub reasoning_effort: Option<String>,
+}
+
+impl std::fmt::Debug for AgentInferenceConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AgentInferenceConfig")
+            .field("data", &self.data)
+            .finish_non_exhaustive()
+    }
 }

@@ -157,7 +157,7 @@ async fn real_http_backlog_is_discarded_without_entering_a_frozen_gate() {
 }
 
 #[tokio::test]
-async fn handle_cancel_freezes_synchronously_but_reply_waits_for_real_worker_join() {
+async fn handle_cancel_preserves_shared_source_terminal_full_and_waits_for_real_worker_join() {
     let (url, sender, server) = http_server().await;
     let request = request();
     let cancel = request.cancel.clone();
@@ -167,6 +167,7 @@ async fn handle_cancel_freezes_synchronously_but_reply_waits_for_real_worker_joi
     let release = Arc::new(Notify::new());
     let (mut delivery, mut frames) = captured_delivery();
     delivery.turn = Some("turn".into());
+    let source_alive = delivery.source_alive.clone();
     let context = InferenceContext {
         request,
         reply: Some(reply),
@@ -188,6 +189,7 @@ async fn handle_cancel_freezes_synchronously_but_reply_waits_for_real_worker_joi
         cancel,
         stop_stream: Arc::new(move || frozen.lock().unwrap().close()),
         task: Arc::new(inference_core::InferenceTaskState::default()),
+        source_alive: source_alive.clone(),
     };
     handle.attach_task(task).unwrap();
     sender.send(chat("accepted")).await.unwrap();
@@ -199,6 +201,10 @@ async fn handle_cancel_freezes_synchronously_but_reply_waits_for_real_worker_joi
     .await
     .unwrap();
     handle.cancel();
+    assert!(
+        source_alive.load(std::sync::atomic::Ordering::Acquire),
+        "ordinary cancellation must retain terminal delivery"
+    );
     assert!(gate.lock().unwrap().closed);
     tokio::time::timeout(Duration::from_secs(2), entered.notified())
         .await
@@ -271,6 +277,7 @@ async fn provider_error_replies_before_stalled_cleanup_and_retains_active_handle
         cancel,
         stop_stream: Arc::new(move || frozen.lock().unwrap().close()),
         task: Arc::new(inference_core::InferenceTaskState::default()),
+        source_alive: Arc::new(std::sync::atomic::AtomicBool::new(true)),
     };
     handle.attach_task(task).unwrap();
     sender.send("data: invalid-json\n\n".into()).await.unwrap();
@@ -304,14 +311,11 @@ async fn provider_error_replies_before_stalled_cleanup_and_retains_active_handle
     let entity = world.spawn();
     world.insert_component(
         entity,
-        agent_core::Agent::new(
-            "test".into(),
-            entity,
-            AgentState::Running,
-            Some("turn".into()),
-            test_agent_context(),
-        ),
+        agent_core::Agent::new(entity, entity, "driver-task".into(), std::env::temp_dir()),
     );
+    use agent_core::WorldAgentExt;
+    world.agent_ready(entity).unwrap();
+    world.agent_set_turn(entity, Some("turn".into())).unwrap();
     world.insert_component(
         entity,
         ActiveInference {
@@ -372,6 +376,7 @@ async fn cancellation_cleanup_budget_replies_error_and_keeps_real_join_active() 
         cancel,
         stop_stream: Arc::new(move || frozen.lock().unwrap().close()),
         task: Arc::new(inference_core::InferenceTaskState::default()),
+        source_alive: Arc::new(std::sync::atomic::AtomicBool::new(true)),
     };
     handle.attach_task(task).unwrap();
     sender.send(chat("accepted")).await.unwrap();
@@ -408,35 +413,24 @@ async fn cancellation_cleanup_budget_replies_error_and_keeps_real_join_active() 
 
 #[tokio::test]
 async fn real_cleanup_wakes_matching_driver_only_after_supervisor_finishes() {
+    use agent_core::AgentWakeSlot;
     use app_runtime_plugin::RuntimePlugin;
     use core_plugin::App;
-    use lua_runtime_core::{DriverLuaVmInstance, DriverWakeSlot};
 
     let mut app = App::new();
     app.add_plugin(RuntimePlugin::default());
     app.add_system(RuntimePlugin::UPDATE, crate::system::inference_system);
     let agent = app.world_mut().spawn();
-    let instance = DriverLuaVmInstance {
-        owner: agent,
-        start_id: "current-instance".into(),
-    };
-    let wake = DriverWakeSlot::shared();
-    app.world_mut()
-        .insert_component(agent, lua_runtime_core::AgentWaitSlot(wake.clone()));
-    app.world_mut().insert_component(
-        agent,
-        DriverLuaVm {
-            instance: instance.clone(),
-            wake: wake.clone(),
-            ready: Arc::new(Mutex::new(None)),
-            ended: None,
-            cancel: CancellationToken::new(),
-        },
-    );
+    let component =
+        agent_core::Agent::new(agent, agent, "driver-task".into(), std::env::temp_dir());
+    let instance = component.instance().to_owned();
+    let wake = component.wake_slot();
+    app.world_mut().insert_component(agent, component);
     let cleanup = InferenceCleanupFinished {
         agent,
         request_id: "request".into(),
         source: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        instance: instance.clone(),
     };
     let (url, sender, server) = http_server().await;
     let mut input = request();
@@ -471,6 +465,7 @@ async fn real_cleanup_wakes_matching_driver_only_after_supervisor_finishes() {
                     cancel,
                     stop_stream: Arc::new(|| {}),
                     task: Arc::new(inference_core::InferenceTaskState::default()),
+                    source_alive: cleanup.source.clone(),
                 },
                 task,
             )),
@@ -490,7 +485,7 @@ async fn real_cleanup_wakes_matching_driver_only_after_supervisor_finishes() {
         Kind::ResponseInvalid
     );
     assert_eq!(app.world().event_snapshot().normal_event_count, 0);
-    let mut waiting = Box::pin(DriverWakeSlot::wait(wake.clone()));
+    let mut waiting = Box::pin(AgentWakeSlot::wait(wake.clone()));
     assert!(waiting.as_mut().now_or_never().is_none());
 
     // The actual supervisor must not emit its completion event while cleanup
@@ -544,7 +539,7 @@ async fn real_cleanup_wakes_matching_driver_only_after_supervisor_finishes() {
     app.world().send_event(stale_request);
     app.world().send_event(stale_instance);
     app.tick();
-    let mut next_wait = Box::pin(DriverWakeSlot::wait(wake));
+    let mut next_wait = Box::pin(AgentWakeSlot::wait(wake));
     assert!(next_wait.as_mut().now_or_never().is_none());
     app.world().send_event(cleanup);
     app.tick();
@@ -557,32 +552,28 @@ async fn real_cleanup_wakes_matching_driver_only_after_supervisor_finishes() {
 }
 
 #[tokio::test]
-async fn cleanup_event_retries_next_frame_until_actual_handle_finishes() {
+async fn cleanup_waits_async_for_actual_handle_without_self_rescheduling_events() {
+    use agent_core::AgentWakeSlot;
     use app_runtime_plugin::RuntimePlugin;
     use core_plugin::App;
-    use lua_runtime_core::{DriverLuaVmInstance, DriverWakeSlot};
 
     let mut app = App::new();
-    app.add_plugin(RuntimePlugin::default());
+    use closure_plugin::AppClosureExt;
+    app.add_plugin(RuntimePlugin::default())
+        .add_plugin(async_runtime_plugin::AsyncRuntimePlugin)
+        .add_plugin(closure_plugin::ClosurePlugin)
+        .add_closure_system(RuntimePlugin::UPDATE);
+    app.world_mut().insert_resource(HttpRuntime {
+        client: reqwest::Client::new(),
+        schedule: RuntimePlugin::UPDATE.into(),
+    });
     app.add_system(RuntimePlugin::UPDATE, crate::system::inference_system);
     let agent = app.world_mut().spawn();
-    let instance = DriverLuaVmInstance {
-        owner: agent,
-        start_id: "current-instance".into(),
-    };
-    let wake = DriverWakeSlot::shared();
-    app.world_mut()
-        .insert_component(agent, lua_runtime_core::AgentWaitSlot(wake.clone()));
-    app.world_mut().insert_component(
-        agent,
-        DriverLuaVm {
-            instance: instance.clone(),
-            wake: wake.clone(),
-            ready: Arc::new(Mutex::new(None)),
-            ended: None,
-            cancel: CancellationToken::new(),
-        },
-    );
+    let component =
+        agent_core::Agent::new(agent, agent, "driver-task".into(), std::env::temp_dir());
+    let instance = component.instance().to_owned();
+    let wake = component.wake_slot();
+    app.world_mut().insert_component(agent, component);
     let (release, joined) = oneshot::channel();
     let task = tokio::spawn(async move {
         let _ = joined.await;
@@ -597,6 +588,7 @@ async fn cleanup_event_retries_next_frame_until_actual_handle_finishes() {
                     cancel: CancellationToken::new(),
                     stop_stream: Arc::new(|| {}),
                     task: Arc::new(inference_core::InferenceTaskState::default()),
+                    source_alive: Arc::new(std::sync::atomic::AtomicBool::new(true)),
                 },
                 task,
             )),
@@ -605,9 +597,17 @@ async fn cleanup_event_retries_next_frame_until_actual_handle_finishes() {
     app.world().send_event(InferenceCleanupFinished {
         agent,
         request_id: "request".into(),
-        source: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        source: app
+            .world()
+            .get_component::<ActiveInference>(agent)
+            .unwrap()
+            .current
+            .as_ref()
+            .unwrap()
+            .source_lease(),
+        instance: instance.clone(),
     });
-    let mut waiting = Box::pin(DriverWakeSlot::wait(wake));
+    let mut waiting = Box::pin(AgentWakeSlot::wait(wake));
     assert!(waiting.as_mut().now_or_never().is_none());
     app.tick();
     assert!(waiting.as_mut().now_or_never().is_none());
@@ -627,11 +627,19 @@ async fn cleanup_event_retries_next_frame_until_actual_handle_finishes() {
     })
     .await
     .unwrap();
-    app.fast_forward_tick();
-    tokio::time::timeout(Duration::from_secs(1), waiting)
-        .await
-        .unwrap()
-        .unwrap();
+    assert_eq!(app.world().event_snapshot().normal_event_count, 0);
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            app.tick();
+            if let Some(result) = waiting.as_mut().now_or_never() {
+                result.unwrap();
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
 }
 
 #[test]
@@ -1389,6 +1397,7 @@ fn pending_handle() -> InferenceHandle {
         cancel: CancellationToken::new(),
         stop_stream: Arc::new(|| {}),
         task: Arc::new(inference_core::InferenceTaskState::default()),
+        source_alive: Arc::new(std::sync::atomic::AtomicBool::new(true)),
     }
 }
 
@@ -1716,10 +1725,6 @@ async fn full_success_contains_complete_internal_assistant_without_persisted_seq
     );
 }
 
-fn test_agent_context() -> agent_core::AgentUpdateContext {
-    agent_core::AgentUpdateContext::new(|_, _, _| Vec::new(), |_, _| {})
-}
-
 #[tokio::test]
 async fn cumulative_chunks_preserve_both_texts_across_interleaved_and_empty_fragments() {
     let (mut delivery, mut frames) = captured_delivery();
@@ -1784,4 +1789,21 @@ fn cumulative_wire_budget_cancels_delivery_without_changing_accumulated_result()
         .select(&[client_core::ClientSelector::Type("webui".into())])
         .is_empty());
     assert_eq!(gate.accumulator.content, content);
+}
+
+#[test]
+fn retiring_a_source_discards_queued_terminal_frames_without_cancelling_other_execution() {
+    let (mut delivery, mut frames) = captured_delivery();
+    let mut handle = pending_handle();
+    handle.source_alive = delivery.source_alive.clone();
+    push_full(&mut delivery, Ok(&InferenceResponse::empty_completed()));
+    handle.retire_source();
+    assert!(!delivery
+        .source_alive
+        .load(std::sync::atomic::Ordering::Acquire));
+    assert!(!handle.cancel.is_cancelled());
+    assert!(
+        frames.try_recv().is_err(),
+        "retired instance cannot deliver a queued full"
+    );
 }

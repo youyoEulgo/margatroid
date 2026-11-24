@@ -1,850 +1,522 @@
-use workspace_core::{remove_workspace, update_workspace, WorkspaceChange};
-fn reply(
-    sender: &workspace_core::WorkspaceOperationReply,
-    result: Result<workspace_core::WorkspaceOperationOutput, workspace_core::WorkspaceError>,
-) {
-    if let Some(sender) = sender.lock().unwrap_or_else(|e| e.into_inner()).take() {
-        let _ = sender.send(result);
-    }
-}
-use crate::{checked_path, invalid, reject_symlinks, types::*, WorkspaceInstalled};
-use address::Address;
-use agent_core::{Agent, AgentState, StopAgent};
+use crate::types::WorkspaceCleanupResult;
+use address::{Address, WorldAddressExt};
+use agent_core::Agent;
 use app_runtime_plugin::WorldEventExt;
-use async_runtime_plugin::WorldAsyncExt;
-use closure_plugin::WorldClosureExt;
+use async_runtime_plugin::AsyncRuntimeHandle;
 use core_plugin::{Entity, World};
-use futures_util::FutureExt;
-use std::{
-    collections::BTreeSet,
-    panic::AssertUnwindSafe,
-    path::{Path, PathBuf},
-    sync::{Arc, Mutex},
-};
-use tokio::sync::oneshot;
+use std::path::{Path, PathBuf};
+use tool_core::{ToolError, ToolErrorKind, ToolExecuteRequest, ToolExecuteResponse, ToolTasks};
 use workspace_core::*;
-
-fn error(kind: WorkspaceErrorKind, message: impl std::fmt::Display) -> WorkspaceError {
-    WorkspaceError::new(kind, message)
+fn error(kind: WorkspaceErrorKind, e: impl std::fmt::Display) -> WorkspaceError {
+    WorkspaceError::new(kind, e)
 }
-fn valid_id(id: &str) -> Result<(), WorkspaceError> {
-    if id.trim().is_empty() || id.chars().any(char::is_control) {
-        Err(error(
+pub(crate) fn reply<T>(sender: &WorkspaceReply<T>, result: Result<T, WorkspaceError>) {
+    if let Some(tx) = sender.lock().unwrap_or_else(|e| e.into_inner()).take() {
+        let _ = tx.send(result);
+    }
+}
+fn notify(w: &mut World, e: Entity, k: WorkspaceUpdateKind) {
+    if let Some(c) = w.get_resource::<WorkspaceUpdateContext>().cloned() {
+        c.notify(w, e, k);
+    }
+}
+fn claim_reply<T>(original: &WorkspaceReply<T>) -> Option<WorkspaceReply<T>> {
+    let sender = original.lock().unwrap_or_else(|e| e.into_inner()).take()?;
+    Some(std::sync::Arc::new(std::sync::Mutex::new(Some(sender))))
+}
+fn runtime(w: &World) -> &AsyncRuntimeHandle {
+    w.get_resource::<AsyncRuntimeHandle>()
+        .expect("async runtime required")
+}
+fn managed_root(root: &Path) -> Result<PathBuf, WorkspaceError> {
+    if !root.is_absolute() {
+        return Err(error(
             WorkspaceErrorKind::InvalidRequest,
-            "invalid lifecycle request id",
-        ))
+            "Workspace root must be absolute",
+        ));
+    }
+    if root.exists() {
+        root.canonicalize()
+            .map_err(|e| error(WorkspaceErrorKind::InvalidRequest, e))
     } else {
-        Ok(())
+        std::fs::create_dir_all(root).map_err(|e| error(WorkspaceErrorKind::DatabaseFailed, e))?;
+        root.canonicalize()
+            .map_err(|e| error(WorkspaceErrorKind::DatabaseFailed, e))
     }
 }
-fn context(
-    world: &World,
-    id: String,
-    path: PathBuf,
-    workspace: Entity,
-    reply: WorkspaceOperationReply,
-) -> WorkspaceFlowContext {
-    let installed = world.get_resource::<WorkspaceInstalled>().unwrap();
-    WorkspaceFlowContext {
-        state: world.get_component::<Workspace>(workspace).unwrap().state,
-        startup: world
-            .get_component::<StartupBarrier>(workspace)
-            .expect("Workspace startup barrier missing")
-            .0
-            .clone(),
-        id,
-        reply,
-        workspace,
-        path,
-        events: world.event_sender(),
-        definitions: installed.definitions.clone(),
-        program_root: installed.program_root.clone(),
-        world: world.closure_sender(&installed.schedule),
+fn validate_node_name(name: &str) -> Result<(), WorkspaceError> {
+    if name.starts_with("~temporary-") || name.is_empty() || name.contains('/') {
+        return Err(error(
+            WorkspaceErrorKind::InvalidRequest,
+            "invalid ordinary node_name",
+        ));
     }
+    Address::new(&format!("/{name}"))
+        .map(|_| ())
+        .map_err(|e| error(WorkspaceErrorKind::InvalidRequest, e))
 }
-fn fail(
-    context: &WorkspaceFlowContext,
-    error: WorkspaceError,
-    cleanup_completed: bool,
-) -> FlowError {
-    FlowError {
-        reply: context.reply.clone(),
-        workspace: Some(context.workspace),
-        error,
-        cleanup_completed,
-        state: Some(context.state),
+fn workspace_directory(root: &Path, address: &str) -> Result<PathBuf, WorkspaceError> {
+    Address::new(address).map_err(|e| error(WorkspaceErrorKind::InvalidRequest, e))?;
+    let name = address
+        .strip_prefix('/')
+        .filter(|x| !x.is_empty() && !x.contains('/'))
+        .ok_or_else(|| {
+            error(
+                WorkspaceErrorKind::InvalidRequest,
+                "Workspace requires a single root node",
+            )
+        })?;
+    Ok(root.join(name))
+}
+pub(crate) fn create_workspace(w: &mut World, mut r: CreateWorkspace) {
+    let Some(sender) = claim_reply(&r.reply) else {
+        return;
+    };
+    r.reply = sender;
+    let root = w.get_resource::<WorkspaceConfig>().unwrap().root.clone();
+    let events = w.event_sender();
+    let work = w
+        .get_resource::<WorkspacePendingWork>()
+        .unwrap()
+        .begin_create();
+    runtime(w).spawn(async move{
+  let request=r.clone();let result=tokio::task::spawn_blocking(move||{
+   let root=managed_root(&root)?;let directory=workspace_directory(&root,&request.address)?;
+   let project=request.project_root.canonicalize().map_err(|e|error(WorkspaceErrorKind::InvalidRequest,e))?;
+   if !project.is_dir()||project.starts_with(&directory)||directory.starts_with(&project){return Err(error(WorkspaceErrorKind::InvalidRequest,"project and managed directories must be separate"));}
+   std::fs::create_dir(&directory).map_err(|e|error(WorkspaceErrorKind::DatabaseFailed,e))?;
+   let build=(||{for category in ["normal","temporary","archived"]{std::fs::create_dir_all(directory.join("agents").join(category)).map_err(|e|error(WorkspaceErrorKind::DatabaseFailed,e))?;}
+    let metadata=WorkspaceMetadata{address:request.address.clone(),alias:request.alias.clone(),project_root:project.clone()};
+    let database=WorkspaceDatabase::create(directory.join("workspace.sqlite"),metadata)?;Ok(StartWorkspace{address:request.address,alias:request.alias,project_root:project,database,reply:Some(request.reply)})})();
+   if build.is_err(){let verified=root.join(directory.file_name().unwrap());if verified==directory{if let Err(e)=std::fs::remove_dir_all(&directory){tracing::error!(path=%directory.display(),error=%e,"failed to reclaim new Workspace directory");}}}
+   build
+  }).await;
+  match result{Ok(Ok(start))=>events.send_event(start),Ok(Err(e))=>reply(&r.reply,Err(e)),Err(e)=>reply(&r.reply,Err(error(WorkspaceErrorKind::DatabaseFailed,e)))}
+   events.send_event(crate::types::WorkspaceWorkCompleted::new(work));
+ });
+}
+pub(crate) fn load_workspaces(w: &mut World) {
+    let root = w.get_resource::<WorkspaceConfig>().unwrap().root.clone();
+    let events = w.event_sender();
+    let Some(work) = w
+        .get_resource::<WorkspacePendingWork>()
+        .unwrap()
+        .begin_load()
+    else {
+        return;
+    };
+    runtime(w).spawn(async move{
+  let result=tokio::task::spawn_blocking(move||->Result<Vec<StartWorkspace>,WorkspaceError>{
+   if !root.exists(){return Ok(Vec::new());}
+   let root=root.canonicalize().map_err(|e|error(WorkspaceErrorKind::DatabaseFailed,e))?;let mut requests=Vec::new();
+   for entry in std::fs::read_dir(&root).map_err(|e|error(WorkspaceErrorKind::DatabaseFailed,e))?{
+    let entry=match entry{Ok(v)=>v,Err(e)=>{tracing::error!(error=%e,"Workspace directory entry failed");continue;}};
+    let open=(||{if !entry.file_type().map_err(|e|error(WorkspaceErrorKind::DatabaseFailed,e))?.is_dir(){return Ok(None);}
+     let path=entry.path();let database=WorkspaceDatabase::open(path.join("workspace.sqlite"))?;let metadata=database.metadata().clone();
+     if workspace_directory(&root,&metadata.address)?!=path {return Err(error(WorkspaceErrorKind::InvalidRequest,"Workspace directory does not match node"));}
+     Ok(Some(StartWorkspace{address:metadata.address,alias:metadata.alias,project_root:metadata.project_root,database,reply:None}))})();
+    match open{Ok(Some(r))=>requests.push(r),Ok(None)=>{},Err(e)=>tracing::error!(path=%entry.path().display(),error=%e,"Workspace load failed")}
+   }Ok(requests)
+  }).await;
+  match result{Ok(Ok(req))=>for r in req{events.send_event(r);},Ok(Err(e))=>tracing::error!(error=%e,"Workspace scan failed"),Err(e)=>tracing::error!(error=%e,"Workspace scan worker failed")}
+   events.send_event(crate::types::WorkspaceWorkCompleted::new(work));
+ });
+}
+pub(crate) fn start_workspace(w: &mut World, mut r: StartWorkspace) {
+    if let Some(original) = &r.reply {
+        let Some(sender) = claim_reply(original) else {
+            return;
+        };
+        r.reply = Some(sender);
     }
-}
-fn members(world: &World, workspace: Entity) -> Result<BTreeSet<Entity>, WorkspaceError> {
-    let mut members = world
-        .get_component::<Workspace>(workspace)
-        .ok_or_else(|| error(WorkspaceErrorKind::Missing, "workspace is missing"))?
-        .agents
-        .clone();
-    for entity in world.query_with::<Agent>().result() {
-        if world
-            .get_component::<Agent>(entity)
-            .is_some_and(|agent| agent.workspace() == workspace)
-        {
-            members.insert(entity);
-        }
-    }
-    Ok(members)
-}
-pub(crate) fn handle_start_workspace(world: &mut World, request: StartWorkspace) {
+    let shared_in_world = w.query_with::<Workspace>().result().iter().any(|e| {
+        w.get_component::<Workspace>(*e)
+            .is_some_and(|workspace| workspace.database.same_connection(&r.database))
+    });
     let result = (|| {
-        valid_id(&request.id)?;
-        let installed = world.get_resource::<WorkspaceInstalled>().unwrap();
-        let path = checked_path(installed, &request.path)?;
-        if world
-            .query_with::<Workspace>()
-            .result()
-            .into_iter()
-            .any(|entity| {
-                world
-                    .get_component::<Workspace>(entity)
-                    .is_some_and(|w| w.definition_path == path)
-            })
+        let metadata = r.database.metadata();
+        if metadata.address != r.address
+            || metadata.alias != r.alias
+            || metadata.project_root != r.project_root
+            || !r.database.is_open()
         {
             return Err(error(
-                WorkspaceErrorKind::Duplicate,
-                "workspace path is already active",
+                WorkspaceErrorKind::InvalidRequest,
+                "start materials do not match open database",
             ));
         }
-        let root = installed
-            .definitions
-            .source()
-            .filter(|root| root.is_dir())
-            .ok_or_else(|| invalid("Workspace resource root is required"))?;
-        let locator = workspace_core::workspace_address(root, &path)?;
-        let address = Address::new(&locator).map_err(invalid)?;
-        let key = address::ParsedAddress::parse(&locator)
-            .map_err(invalid)?
-            .name;
-        if world
-            .query_with::<Address>()
-            .result()
-            .into_iter()
-            .any(|entity| world.get_component::<Address>(entity) == Some(&address))
-        {
-            return Err(error(
-                WorkspaceErrorKind::Duplicate,
-                "workspace address is already active",
-            ));
-        }
-        installed.definitions.reserve(&path)?;
-        let workspace = world.spawn();
-        world.insert_component(
-            workspace,
-            StartupBarrier(Arc::new(StartupCompletion::default())),
-        );
-        world.insert_component(workspace, address);
-        world.insert_component(
-            workspace,
-            workspace_core::Workspace::new(
-                key.into(),
-                path.clone(),
-                PathBuf::new(),
-                WorkspaceState::Starting,
-                BTreeSet::new(),
-                None,
-                world
-                    .get_resource::<workspace_core::WorkspaceUpdateContext>()
-                    .expect("workspace sync context missing")
-                    .clone(),
-            ),
-        );
-        world
-            .get_component::<Workspace>(workspace)
+        let root = w
+            .get_resource::<WorkspaceConfig>()
             .unwrap()
-            .updates()
-            .notify(world, workspace);
-        Ok(context(
-            world,
-            request.id.clone(),
-            path,
-            workspace,
-            request.reply.clone(),
-        ))
-    })();
-    match result {
-        Err(error) => reply(&request.reply, Err(error)),
-        Ok(context) => {
-            let schedule = world
-                .get_resource::<WorkspaceInstalled>()
-                .unwrap()
-                .schedule
-                .clone();
-            world.send_async_closure(&schedule, move || guarded_start(context));
-        }
-    }
-}
-pub(crate) fn handle_stop_workspace(world: &mut World, request: StopWorkspace) {
-    let result = (|| {
-        valid_id(&request.id)?;
-        let component = world
-            .get_component::<Workspace>(request.workspace)
-            .ok_or_else(|| error(WorkspaceErrorKind::Missing, "workspace is missing"))?;
-        if component.state == WorkspaceState::Stopping {
+            .root
+            .canonicalize()
+            .map_err(|e| error(WorkspaceErrorKind::InvalidRequest, e))?;
+        if r.database.managed_directory() != workspace_directory(&root, &r.address)? {
             return Err(error(
-                WorkspaceErrorKind::StateRejected,
-                "workspace is already stopping",
+                WorkspaceErrorKind::InvalidRequest,
+                "database outside managed Workspace directory",
             ));
         }
-        let path = component.definition_path.clone();
-        if let Some(executor) = world.get_component::<WorkspaceExecutor>(request.workspace) {
-            executor.entry.close_admission();
-        }
-        // A Starting Workspace may still await a Lua startup handoff. Request
-        // cancellation now, then let stop_flow await its actual startup barrier.
-        for entity in world
-            .query_with::<lua_runtime_core::WorkspaceLuaTask>()
-            .result()
-        {
-            let task = world
-                .get_component::<lua_runtime_core::WorkspaceLuaTask>(entity)
-                .unwrap();
-            if task.workspace != request.workspace {
-                continue;
+        let address =
+            Address::new(&r.address).map_err(|e| error(WorkspaceErrorKind::InvalidRequest, e))?;
+        match w.entity_by_address(&r.address) {
+            Ok(entity) => {
+                let existing = w
+                    .get_component::<Workspace>(entity)
+                    .ok_or_else(|| error(WorkspaceErrorKind::DuplicateNode, "node occupied"))?;
+                if existing.database.path() != r.database.path()
+                    || existing.alias != r.alias
+                    || existing.project_root != r.project_root
+                {
+                    return Err(error(
+                        WorkspaceErrorKind::DuplicateNode,
+                        "Workspace metadata mismatch",
+                    ));
+                }
+                if !existing.database.same_connection(&r.database) {
+                    r.database.close()?;
+                }
+                return Ok(entity);
             }
-            if let Some(vm) = world.get_component::<lua_runtime_core::DriverLuaVm>(entity) {
-                vm.cancel.cancel();
-            }
+            Err(address::AddressError::EntityMissing) => {}
+            Err(e) => return Err(error(WorkspaceErrorKind::DuplicateNode, e)),
         }
-        update_workspace(
-            world,
-            request.workspace,
-            WorkspaceChange::State(WorkspaceState::Stopping),
-        )?;
-        Ok(context(
-            world,
-            request.id.clone(),
-            path,
-            request.workspace,
-            request.reply.clone(),
-        ))
+        let entity = w.spawn();
+        w.insert_component(entity, address);
+        w.insert_component(
+            entity,
+            Workspace::new(r.alias.clone(), r.project_root.clone(), r.database.clone()),
+        );
+        w.insert_component(entity, ToolTasks::new());
+        notify(w, entity, WorkspaceUpdateKind::Installed);
+        Ok(entity)
     })();
-    match result {
-        Err(error) => reply(&request.reply, Err(error)),
-        Ok(context) => {
-            let schedule = world
-                .get_resource::<WorkspaceInstalled>()
-                .unwrap()
-                .schedule
-                .clone();
-            world.send_async_closure(&schedule, move || guarded_stop(context));
+    if result.is_err() && !shared_in_world {
+        let _ = r.database.close();
+    }
+    if let Some(sender) = r.reply {
+        reply(&sender, result);
+    } else if let Err(e) = result {
+        tracing::error!(error=%e,"Workspace entity start failed");
+    }
+}
+pub(crate) fn start_agent(w: &mut World, r: StartWorkspaceAgent<ToolExecuteResponse, ToolError>) {
+    let (entity, sender) = match &r {
+        StartWorkspaceAgent::Existing {
+            workspace, reply, ..
+        }
+        | StartWorkspaceAgent::New {
+            workspace, reply, ..
+        } => (*workspace, reply.clone()),
+    };
+    let result = (|| {
+        let workspace = w
+            .get_component::<Workspace>(entity)
+            .ok_or_else(|| error(WorkspaceErrorKind::Missing, "Workspace missing"))?;
+        if workspace.state != WorkspaceState::Running {
+            return Err(error(
+                WorkspaceErrorKind::Closed,
+                "Workspace is not accepting starts",
+            ));
+        }
+        let (initiator, path, args) = match r {
+            StartWorkspaceAgent::Existing { node_name, .. } => {
+                let rec = workspace.database.agent_by_node(&node_name)?;
+                workspace.database.ensure_startable(&rec.id)?;
+                if rec.category != AgentCategory::Normal {
+                    return Err(error(
+                        WorkspaceErrorKind::InvalidRequest,
+                        "Existing requires a normal Agent",
+                    ));
+                }
+                let parent = w
+                    .entity_by_address(&rec.parent_node)
+                    .map_err(|e| error(WorkspaceErrorKind::Missing, e))?;
+                (parent, rec.tool_path, rec.tool_arguments)
+            }
+            StartWorkspaceAgent::New {
+                tool_path,
+                arguments,
+                ..
+            } => {
+                let object = arguments.as_object().ok_or_else(|| {
+                    error(
+                        WorkspaceErrorKind::InvalidRequest,
+                        "Driver arguments must be object",
+                    )
+                })?;
+                if let Some(v) = object.get("node_name").filter(|v| !v.is_null()) {
+                    let name = v.as_str().ok_or_else(|| {
+                        error(
+                            WorkspaceErrorKind::InvalidRequest,
+                            "node_name must be string",
+                        )
+                    })?;
+                    validate_node_name(name)?;
+                    if workspace
+                        .database
+                        .list_agents()?
+                        .iter()
+                        .any(|r| r.node_name.as_deref() == Some(name))
+                    {
+                        return Err(error(
+                            WorkspaceErrorKind::DuplicateNode,
+                            "node already registered",
+                        ));
+                    }
+                }
+                (entity, tool_path, arguments)
+            }
+        };
+        if initiator != entity
+            && w.get_component::<Agent>(initiator).is_none_or(|a| {
+                a.workspace() != entity || a.state() == agent_core::AgentState::Closing
+            })
+        {
+            return Err(error(
+                WorkspaceErrorKind::ParentMismatch,
+                "original parent unavailable",
+            ));
+        }
+        if !path.is_absolute() {
+            return Err(error(
+                WorkspaceErrorKind::InvalidRequest,
+                "Driver path must be absolute",
+            ));
+        }
+        w.send_event(ToolExecuteRequest::Path {
+            initiator,
+            path,
+            arguments: args,
+            reply: sender.clone(),
+        });
+        Ok(())
+    })();
+    if let Err(e) = result {
+        if let Some(tx) = sender.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            let _ = tx.send(Err(ToolError::new(
+                ToolErrorKind::InvalidRequest,
+                e.to_string(),
+            )));
         }
     }
 }
-pub(crate) fn handle_restart_workspace(world: &mut World, request: RestartWorkspace) {
-    let result = (|| {
-        let path = checked_path(
-            world.get_resource::<WorkspaceInstalled>().unwrap(),
-            &request.path,
-        )?;
-        world
-            .query_with::<Workspace>()
-            .result()
-            .into_iter()
-            .find(|entity| {
-                world
-                    .get_component::<Workspace>(*entity)
-                    .is_some_and(|workspace| workspace.definition_path == path)
-            })
-            .ok_or_else(|| error(WorkspaceErrorKind::Missing, "workspace path is not running"))
+pub(crate) fn delete_workspace(w: &mut World, mut r: DeleteWorkspace) {
+    let Some(sender) = claim_reply(&r.reply) else {
+        return;
+    };
+    r.reply = sender;
+    let root = w.get_resource::<WorkspaceConfig>().unwrap().root.clone();
+    let prepare = (|| {
+        let workspace = w
+            .get_component::<Workspace>(r.workspace)
+            .ok_or_else(|| error(WorkspaceErrorKind::Missing, "Workspace missing"))?;
+        if workspace.state == WorkspaceState::Deleting {
+            return Err(error(
+                WorkspaceErrorKind::Busy,
+                "Workspace already deleting",
+            ));
+        }
+        let dir = workspace
+            .database
+            .path()
+            .parent()
+            .ok_or_else(|| {
+                error(
+                    WorkspaceErrorKind::InvalidRequest,
+                    "database parent missing",
+                )
+            })?
+            .to_path_buf();
+        let root = root
+            .canonicalize()
+            .map_err(|e| error(WorkspaceErrorKind::InvalidRequest, e))?;
+        let actual = dir
+            .canonicalize()
+            .map_err(|e| error(WorkspaceErrorKind::InvalidRequest, e))?;
+        let project = if workspace.project_root.exists() {
+            workspace
+                .project_root
+                .canonicalize()
+                .map_err(|e| error(WorkspaceErrorKind::InvalidRequest, e))?
+        } else {
+            workspace.project_root.clone()
+        };
+        if actual != dir
+            || !actual.starts_with(&root)
+            || actual == root
+            || project.starts_with(&actual)
+            || actual.starts_with(&project)
+        {
+            return Err(error(
+                WorkspaceErrorKind::InvalidRequest,
+                "unsafe Workspace delete path",
+            ));
+        }
+        let tasks = w
+            .get_component::<ToolTasks>(r.workspace)
+            .cloned()
+            .ok_or_else(|| error(WorkspaceErrorKind::Missing, "Workspace tasks missing"))?;
+        Ok((dir, workspace.database.clone(), tasks))
     })();
-    let workspace = match result {
-        Ok(workspace) => workspace,
-        Err(failure) => {
-            reply(&request.reply, Err(failure));
+    let (directory, database, tasks) = match prepare {
+        Ok(v) => v,
+        Err(e) => {
+            reply(&r.reply, Err(e));
             return;
         }
     };
-    let (sender, receiver) = oneshot::channel();
-    handle_stop_workspace(
-        world,
-        StopWorkspace {
-            id: request.id.clone(),
-            workspace,
-            reply: Arc::new(Mutex::new(Some(sender))),
-        },
-    );
-    let events = world.event_sender();
-    let schedule = world
-        .get_resource::<WorkspaceInstalled>()
+    w.get_component_mut::<Workspace>(r.workspace)
         .unwrap()
-        .schedule
-        .clone();
-    world.send_async_closure(&schedule, move || async move {
-        match receiver.await {
-            Ok(Ok(_)) => events.send_event(StartWorkspace {
-                id: request.id,
-                path: request.path,
-                reply: request.reply,
-            }),
-            Ok(Err(failure)) => reply(&request.reply, Err(failure)),
-            Err(_) => reply(
-                &request.reply,
-                Err(error(
-                    WorkspaceErrorKind::CleanupFailed,
-                    "workspace stop reply was lost; restart cannot start",
-                )),
-            ),
+        .set_state(WorkspaceState::Deleting);
+    notify(w, r.workspace, WorkspaceUpdateKind::Changed);
+    database.close_admission();
+    tasks.close_admission();
+    let events = w.event_sender();
+    runtime(w).spawn(async move {
+        let mut failure = None;
+        let list = tasks.list();
+        for (_, t) in &list {
+            t.cancel();
         }
-        Ok::<_, async_runtime_plugin::AsyncTaskError>(())
+        for (_, t) in list {
+            if let Err(e) = t.finish().await {
+                failure = Some(error(WorkspaceErrorKind::CloseFailed, e));
+            }
+        }
+        if failure.is_none() {
+            database.wait_idle().await;
+        }
+        events.send_event(Ok::<_, WorkspaceError>(WorkspaceCleanupResult {
+            workspace: r.workspace,
+            directory,
+            reply: r.reply,
+            result: failure.map_or(Ok(()), Err),
+        }));
     });
 }
-fn finish_running(
-    world: &mut World,
-    workspace: Entity,
-    state: WorkspaceState,
-) -> Result<(), WorkspaceError> {
-    let component = world.get_component::<Workspace>(workspace).ok_or_else(|| {
-        error(
-            WorkspaceErrorKind::CleanupFailed,
-            "lifecycle result has lost its workspace host",
-        )
-    })?;
-    if component.state != state {
-        return Err(error(
-            WorkspaceErrorKind::StateRejected,
-            "stale workspace lifecycle result",
-        ));
-    }
-    let all = members(world, workspace)?;
-    update_workspace(world, workspace, WorkspaceChange::Members(all))?;
-    world.remove_component::<WorkspaceFailure>(workspace);
-    update_workspace(world, workspace, WorkspaceChange::Failure(None))?;
-    update_workspace(
-        world,
-        workspace,
-        WorkspaceChange::State(WorkspaceState::Running),
-    )?;
-    Ok(())
-}
-fn failure_result(world: &mut World, failure: &FlowError, state: WorkspaceState) {
-    if let Some(workspace) = failure.workspace {
-        if world
-            .get_component::<Workspace>(workspace)
-            .is_some_and(|w| w.state == failure.state.unwrap_or(state))
-        {
-            world.insert_component(workspace, WorkspaceFailure(failure.error.clone()));
-            let _ = update_workspace(
-                world,
-                workspace,
-                WorkspaceChange::Failure(Some(failure.error.clone())),
-            );
-            if failure.cleanup_completed {
-                let path = world
-                    .get_component::<Workspace>(workspace)
-                    .unwrap()
-                    .definition_path
-                    .clone();
-                world
-                    .get_resource::<WorkspaceInstalled>()
-                    .unwrap()
-                    .definitions
-                    .release(&path);
-                remove_workspace(world, workspace);
-            } else {
-                let _ = update_workspace(
-                    world,
-                    workspace,
-                    WorkspaceChange::State(WorkspaceState::Error),
-                );
-            }
-        }
-    }
-}
-pub(crate) fn handle_start_result(world: &mut World, result: Result<StartOutput, StartError>) {
-    match result {
-        Ok(output) => {
-            if world
-                .get_component::<Workspace>(output.workspace)
-                .is_none_or(|workspace| workspace.state != WorkspaceState::Starting)
-            {
-                reply(
-                    &output.reply,
-                    Err(error(
-                        WorkspaceErrorKind::StateRejected,
-                        "startup superseded by cleanup",
-                    )),
-                );
-                return;
-            }
-            if !output.member_errors.is_empty() {
-                if let Ok(all) = members(world, output.workspace) {
-                    let _ =
-                        update_workspace(world, output.workspace, WorkspaceChange::Members(all));
-                }
-                let failure = error(
-                    WorkspaceErrorKind::MemberFailed,
-                    output
-                        .member_errors
-                        .iter()
-                        .map(|item| format!("{}: {}", item.name, item.error))
-                        .collect::<Vec<_>>()
-                        .join("; "),
-                );
-                let _ = update_workspace(
-                    world,
-                    output.workspace,
-                    WorkspaceChange::Failure(Some(failure.clone())),
-                );
-                let _ = update_workspace(
-                    world,
-                    output.workspace,
-                    WorkspaceChange::State(WorkspaceState::Error),
-                );
-                reply(&output.reply, Err(failure));
-                return;
-            }
-            let result =
-                finish_running(world, output.workspace, WorkspaceState::Starting).map(|()| {
-                    WorkspaceOperationOutput {
-                        workspace: output.workspace,
-                        members: output.members,
-                        member_errors: output.member_errors.clone(),
-                    }
-                });
-            reply(&output.reply, result);
-        }
-        Err(failure) => {
-            failure_result(world, &failure, WorkspaceState::Starting);
-            reply(&failure.reply, Err(failure.error));
-        }
-    }
-}
-pub(crate) fn handle_stop_result(world: &mut World, result: Result<StopOutput, StopError>) {
-    match result {
-        Ok(output) => {
-            let result = if world
-                .get_component::<Workspace>(output.workspace)
-                .is_some_and(|w| w.state == WorkspaceState::Stopping)
-            {
-                let path = world
-                    .get_component::<Workspace>(output.workspace)
-                    .unwrap()
-                    .definition_path
-                    .clone();
-                world
-                    .get_resource::<WorkspaceInstalled>()
-                    .unwrap()
-                    .definitions
-                    .release(&path);
-                remove_workspace(world, output.workspace);
-                Ok(WorkspaceOperationOutput {
-                    workspace: output.workspace,
-                    members: output.members,
-                    member_errors: output.member_errors,
-                })
-            } else {
-                Err(error(
-                    WorkspaceErrorKind::CleanupFailed,
-                    "stop result does not match its live workspace host",
-                ))
-            };
-            reply(&output.reply, result);
-        }
-        Err(failure) => {
-            failure_result(world, &failure, WorkspaceState::Stopping);
-            reply(&failure.reply, Err(failure.error));
-        }
-    }
-}
-async fn with_world<T: Send + 'static>(
-    context: &WorkspaceFlowContext,
-    operation: impl FnOnce(&mut World) -> Result<T, WorkspaceError> + Send + 'static,
-) -> Result<T, WorkspaceError> {
-    let (sender, receiver) = oneshot::channel();
-    context.world.send(move |world| {
-        let _ = sender.send(operation(world));
-    });
-    receiver.await.map_err(|_| {
-        error(
-            WorkspaceErrorKind::CleanupFailed,
-            "workspace World closure did not complete",
-        )
-    })?
-}
-fn prepare_definition(
-    path: &Path,
-    definition: WorkspaceDefinition,
-) -> Result<WorkspaceDefinition, WorkspaceError> {
-    let base = path
-        .parent()
-        .ok_or_else(|| invalid("definition has no workspace home"))?;
-    for member in &definition.members {
-        let directory = base.join("agents").join(&member.name);
-        reject_symlinks(&directory)?;
-        std::fs::create_dir_all(&directory).map_err(invalid)?;
-        reject_symlinks(&directory)?;
-        let database_path = directory.join("state.sqlite");
-        let settings_path = directory.join("setting.toml");
-        for path in [&database_path, &settings_path] {
-            reject_symlinks(path)?;
-            if path.exists() && !path.is_file() {
-                return Err(invalid(
-                    "member database and settings must be regular files",
-                ));
-            }
-        }
-    }
-    Ok(definition)
-}
-async fn fresh_definition(
-    context: &WorkspaceFlowContext,
-) -> Result<WorkspaceDefinition, WorkspaceError> {
-    let path = context.path.clone();
-    let definitions = context.definitions.clone();
-    tokio::task::spawn_blocking(move || {
-        let snapshot = definitions.reload()?;
-        let definition = snapshot.get(&path).cloned().ok_or_else(|| {
+pub(crate) fn delete_result(w: &mut World, r: WorkspaceCleanupResult) {
+    let result = (|| {
+        r.result?;
+        let workspace = w.get_component::<Workspace>(r.workspace).ok_or_else(|| {
             error(
                 WorkspaceErrorKind::Missing,
-                "workspace is absent from reloaded definitions",
+                "Workspace changed during cleanup",
             )
         })?;
-        prepare_definition(&path, definition)
-    })
-    .await
-    .map_err(|e| error(WorkspaceErrorKind::InvalidDefinition, e))?
-}
-async fn mount_executor(
-    context: &WorkspaceFlowContext,
-    definition: &WorkspaceDefinition,
-    state: WorkspaceState,
-) -> Result<(), WorkspaceError> {
-    let executor = tokio::task::spawn_blocking(spawn_workspace_executor)
-        .await
-        .map_err(|e| error(WorkspaceErrorKind::ThreadStartFailed, e))??;
-    let close = executor.close.clone();
-    let workspace = context.workspace;
-    let definition = definition.clone();
-    let result = with_world(context, move |world| {
-        let component = world
-            .get_component::<Workspace>(workspace)
-            .ok_or_else(|| error(WorkspaceErrorKind::Missing, "workspace host is missing"))?;
-        if component.state != state {
+        if workspace.state != WorkspaceState::Deleting {
             return Err(error(
-                WorkspaceErrorKind::StateRejected,
-                "workspace state changed before executor mount",
+                WorkspaceErrorKind::Busy,
+                "Workspace cleanup state changed",
             ));
         }
-        if world
-            .get_component::<WorkspaceExecutor>(workspace)
-            .is_some_and(|existing| !existing.close.is_joined())
-        {
+        let canonical = r
+            .directory
+            .canonicalize()
+            .map_err(|e| error(WorkspaceErrorKind::DeleteFailed, e))?;
+        if canonical != r.directory || workspace.database.managed_directory() != r.directory {
             return Err(error(
-                WorkspaceErrorKind::CleanupFailed,
-                "existing workspace thread has not joined",
+                WorkspaceErrorKind::DeleteFailed,
+                "Workspace delete directory changed",
             ));
         }
-        update_workspace(world, workspace, WorkspaceChange::Definition(definition))?;
-        update_workspace(world, workspace, WorkspaceChange::Members(BTreeSet::new()))?;
-        world.insert_component(workspace, executor);
+        let database = workspace.database.clone();
+        notify(w, r.workspace, WorkspaceUpdateKind::Closing);
+        database.close()?;
+        w.despawn(r.workspace);
+        notify(w, r.workspace, WorkspaceUpdateKind::Removed);
+        std::fs::remove_dir_all(&r.directory).map_err(|e| {
+            let mut e =
+                error(WorkspaceErrorKind::DeleteFailed, e).with_directory(r.directory.clone());
+            e.entity_removed = true;
+            e
+        })?;
         Ok(())
-    })
-    .await;
-    if let Err(error) = result {
-        close.close_and_join().await.map_err(|cleanup| {
-            WorkspaceError::new(
-                WorkspaceErrorKind::CleanupFailed,
-                format!("{error}; new executor cleanup failed: {cleanup}"),
-            )
-        })?;
-        return Err(error);
+    })();
+    if result.is_err() {
+        if let Some(ws) = w.get_component_mut::<Workspace>(r.workspace) {
+            ws.set_state(WorkspaceState::Error);
+            notify(w, r.workspace, WorkspaceUpdateKind::Changed);
+        }
     }
-    Ok(())
+    reply(&r.reply, result);
 }
-async fn start_members(
-    context: &WorkspaceFlowContext,
-    definition: WorkspaceDefinition,
-) -> (Vec<Entity>, Vec<MemberDiagnostic>) {
-    let mut failures = Vec::new();
-    let mut replies = Vec::new();
-    for member in definition.members.into_iter() {
-        let workspace = context.workspace;
-        let name = member.name.clone();
-        let driver = member.driver.clone();
-        let (sender, receiver) = oneshot::channel();
-        let root = context.program_root.clone();
-        let driver = driver.clone();
-        let source = tokio::task::spawn_blocking(move || {
-            let path = address::resolve_file(&root, &driver).map_err(invalid)?;
-            agent_driver_core::read_driver(&path, &Default::default()).map_err(invalid)
-        })
-        .await
-        .map_err(invalid)
-        .and_then(|value| value);
-        let source = match source {
-            Ok(value) => value,
-            Err(error) => {
-                failures.push(MemberDiagnostic {
-                    name: member.name,
-                    error,
-                });
-                continue;
+pub(crate) fn archive_agent(w: &mut World, mut r: ArchiveAgent) {
+    let Some(sender) = claim_reply(&r.reply) else {
+        return;
+    };
+    r.reply = sender;
+    let prepare = (|| {
+        let workspace = w
+            .get_component::<Workspace>(r.workspace)
+            .ok_or_else(|| error(WorkspaceErrorKind::Missing, "Workspace missing"))?;
+        if workspace.state != WorkspaceState::Running {
+            return Err(error(WorkspaceErrorKind::Closed, "Workspace not running"));
+        }
+        let database = workspace.database.clone();
+        let operation = database.try_operation(&r.node_name)?;
+        let record = database.agent_by_node(&r.node_name)?;
+        let task = match w.entity_by_address(&record.address()) {
+            Ok(e) => {
+                let a = w.get_component::<Agent>(e).ok_or_else(|| {
+                    error(
+                        WorkspaceErrorKind::InvalidRequest,
+                        "target node is not Agent",
+                    )
+                })?;
+                if a.workspace() != r.workspace
+                    || w.get_component::<Address>(a.parent())
+                        .is_none_or(|parent| parent.as_str() != record.parent_node)
+                {
+                    return Err(error(
+                        WorkspaceErrorKind::ParentMismatch,
+                        "Agent Workspace or parent mismatch",
+                    ));
+                }
+                if a.parent() != r.workspace
+                    && w.get_component::<Agent>(a.parent())
+                        .is_none_or(|parent| parent.workspace() != r.workspace)
+                {
+                    return Err(error(
+                        WorkspaceErrorKind::ParentMismatch,
+                        "Agent parent outside Workspace",
+                    ));
+                }
+                Some(
+                    w.get_component::<ToolTasks>(a.parent())
+                        .ok_or_else(|| error(WorkspaceErrorKind::Missing, "parent tasks missing"))?
+                        .get(a.task_id())
+                        .map_err(|e| error(WorkspaceErrorKind::Missing, e))?,
+                )
             }
+            Err(address::AddressError::EntityMissing) => None,
+            Err(e) => return Err(error(WorkspaceErrorKind::InvalidRequest, e)),
         };
-        let prepared=with_world(context,move|world|{
-            let component=world.get_component::<Workspace>(workspace).ok_or_else(||error(WorkspaceErrorKind::Missing,"Workspace missing"))?;
-            let path=source.origin;let program=source.program;
-            let workspace_address=world.get_component::<Address>(workspace).unwrap().as_str().to_owned();
-            let execution_address=Address::new(&format!("execution:{}/{}:dev",workspace.index(),name)).map_err(invalid)?;
-            let environment=lua_runtime_core::LuaEnvironment{globals:std::collections::BTreeMap::from([("execution_context".into(),lua_runtime_core::LuaBinding::Value(lua_runtime_core::LuaValue::from_json(serde_json::json!({"workspace":{"address":workspace_address,"name":component.name,"project_root":component.project_root},"name":name,"resource_dir":path.parent().unwrap()})).map_err(invalid)?))]),modules:Default::default()};
-            let owner=world.spawn();world.insert_component(owner,execution_address);world.insert_component(owner,lua_runtime_core::WorkspaceLuaTask{workspace,name});
-            world.send_event(lua_runtime_core::StartDriverLuaVm{owner,workspace,program:lua_runtime_core::LuaProgram{source:program,origin:path,},environment,reply:Arc::new(Mutex::new(Some(sender)))});Ok(owner)
-        }).await;
-        match prepared {
-            Ok(owner) => replies.push((member, owner, receiver)),
-            Err(error) => failures.push(MemberDiagnostic {
-                name: member.name,
-                error,
-            }),
+        Ok((database, operation, record, task))
+    })();
+    let (database, operation, record, task) = match prepare {
+        Ok(v) => v,
+        Err(e) => {
+            reply(&r.reply, Err(e));
+            return;
         }
-    }
-    let outcomes = futures_util::future::join_all(
-        replies
-            .into_iter()
-            .map(|(member, owner, receiver)| async move { (member, owner, receiver.await) }),
-    )
-    .await;
-    for (member, owner, received) in outcomes {
-        match received {
-            Ok(Ok(instance)) if instance.owner == owner => {}
-            other => failures.push(MemberDiagnostic {
-                name: member.name,
-                error: error(
-                    WorkspaceErrorKind::MemberFailed,
-                    format!("Lua task start failed: {other:?}"),
-                ),
-            }),
+    };
+    runtime(w).spawn(async move {
+        if let Some(task) = task {
+            if let Err(e) = task.finish().await {
+                reply(&r.reply, Err(error(WorkspaceErrorKind::CloseFailed, e)));
+                return;
+            }
         }
-    }
-    let workspace = context.workspace;
-    let agents = with_world(context, move |world| {
-        Ok(members(world, workspace)?.into_iter().collect())
-    })
-    .await;
-    match agents {
-        Ok(agents) => (agents, failures),
-        Err(error) => {
-            failures.push(MemberDiagnostic {
-                name: "Workspace".into(),
-                error,
-            });
-            (Vec::new(), failures)
-        }
-    }
-}
-async fn stop_members_and_join(
-    context: &WorkspaceFlowContext,
-    state: WorkspaceState,
-) -> Result<Vec<Entity>, WorkspaceError> {
-    let workspace = context.workspace;
-    let (members, close) = with_world(context, move |world| {
-        let component = world
-            .get_component::<Workspace>(workspace)
-            .ok_or_else(|| error(WorkspaceErrorKind::Missing, "workspace host is missing"))?;
-        if component.state != state {
-            return Err(error(
-                WorkspaceErrorKind::StateRejected,
-                "workspace state changed before stop",
-            ));
-        }
-        let members = members(world, workspace)?;
-        let close = world
-            .get_component::<WorkspaceExecutor>(workspace)
-            .map(|executor| {
-                executor.entry.close_admission();
-                executor.close.clone()
-            });
-        Ok((members.into_iter().collect::<Vec<_>>(), close))
-    })
-    .await?;
-    let executions = with_world(context, move |world| {
-        Ok(world
-            .query_with::<lua_runtime_core::WorkspaceLuaTask>()
-            .result()
-            .into_iter()
-            .filter_map(|entity| {
-                let task = world.get_component::<lua_runtime_core::WorkspaceLuaTask>(entity)?;
-                if task.workspace != workspace {
-                    return None;
-                }
-                Some((
-                    entity,
-                    world
-                        .get_component::<lua_runtime_core::DriverLuaVm>(entity)
-                        .map(|vm| vm.instance.clone()),
-                ))
-            })
-            .collect::<Vec<_>>())
-    })
-    .await?;
-    for (entity, instance) in executions {
-        if let Some(instance) = instance {
-            let (tx, rx) = oneshot::channel();
-            context
-                .events
-                .send_event(lua_runtime_core::StopDriverLuaVm {
-                    instance,
-                    reply: Arc::new(Mutex::new(Some(tx))),
-                });
-            rx.await
-                .map_err(|e| error(WorkspaceErrorKind::CleanupFailed, e))?
-                .map_err(|e| error(WorkspaceErrorKind::CleanupFailed, e))?;
-        }
-        with_world(context, move |world| {
-            world.despawn(entity);
-            Ok(())
-        })
-        .await?;
-    }
-    let mut failures = Vec::new();
-    for member in &members {
-        let member = *member;
-        let id = format!(
-            "{}:stop:{}:{}",
-            context.id,
-            member.index(),
-            member.generation()
+        let result =
+            tokio::task::spawn_blocking(move || database.archive_agent(&operation, &record.id))
+                .await;
+        reply(
+            &r.reply,
+            match result {
+                Ok(v) => v.map(|_| ()),
+                Err(e) => Err(error(WorkspaceErrorKind::ArchivePending, e)),
+            },
         );
-        let pending = with_world(context, move |world| {
-            let Some(agent) = world.get_component::<Agent>(member) else {
-                return Ok(None);
-            };
-            let removal = agent.removal();
-            if agent.state() == AgentState::Stopping {
-                return Ok(Some((removal, None)));
-            }
-            let (sender, receiver) = oneshot::channel();
-            world.send_event(StopAgent {
-                id,
-                agent: member,
-                reply: Arc::new(Mutex::new(Some(sender))),
-            });
-            Ok(Some((removal, Some(receiver))))
-        })
-        .await?;
-        if let Some((mut removal, reply)) = pending {
-            if let Some(reply) = reply {
-                match reply.await {
-                    Ok(Ok(stopped)) if stopped == member => {}
-                    Ok(Ok(_)) => {
-                        failures.push("StopAgent replied with a different Entity".into());
-                        continue;
-                    }
-                    Ok(Err(failure)) => {
-                        let concurrent = if matches!(
-                            failure.kind,
-                            agent_core::AgentErrorKind::StateRejected
-                                | agent_core::AgentErrorKind::AgentMissing
-                        ) {
-                            with_world(context, move |world| {
-                                Ok(world
-                                    .get_component::<Agent>(member)
-                                    .is_none_or(|agent| agent.state() == AgentState::Stopping))
-                            })
-                            .await?
-                        } else {
-                            false
-                        };
-                        if !concurrent {
-                            failures.push(failure.to_string());
-                            continue;
-                        }
-                    }
-                    Err(error) => {
-                        failures.push(format!(
-                            "member stop reply closed without cleanup proof: {error}"
-                        ));
-                        continue;
-                    }
-                }
-            }
-            while !*removal.borrow_and_update() {
-                if let Err(error) = removal.changed().await {
-                    failures.push(format!("member removal unconfirmed: {error}"));
-                    break;
-                }
-            }
-        }
-    }
-    if !failures.is_empty() {
-        return Err(error(
-            WorkspaceErrorKind::CleanupFailed,
-            failures.join("; "),
-        ));
-    }
-    with_world(context, move |world| {
-        update_workspace(world, workspace, WorkspaceChange::Members(BTreeSet::new()))
-    })
-    .await?;
-    if let Some(close) = close {
-        close.close_and_join().await?;
-    }
-    Ok(members)
-}
-async fn start_flow(context: WorkspaceFlowContext) -> Result<StartOutput, StartError> {
-    let definition = fresh_definition(&context)
-        .await
-        .map_err(|e| fail(&context, e, true))?;
-    mount_executor(&context, &definition, WorkspaceState::Starting)
-        .await
-        .map_err(|e| fail(&context, e, false))?;
-    let (members, member_errors) = start_members(&context, definition).await;
-    Ok(StartOutput {
-        reply: context.reply,
-        workspace: context.workspace,
-        members,
-        member_errors,
-    })
-}
-async fn stop_flow(context: WorkspaceFlowContext) -> Result<StopOutput, StopError> {
-    context.startup.wait().await;
-    let members = stop_members_and_join(&context, WorkspaceState::Stopping)
-        .await
-        .map_err(|e| fail(&context, e, false))?;
-    Ok(StopOutput {
-        reply: context.reply,
-        workspace: context.workspace,
-        members,
-        member_errors: Vec::new(),
-    })
-}
-async fn guarded_start(context: WorkspaceFlowContext) -> Result<StartOutput, StartError> {
-    let retained = context.clone();
-    let result = AssertUnwindSafe(start_flow(context))
-        .catch_unwind()
-        .await
-        .unwrap_or_else(|_| {
-            Err(fail(
-                &retained,
-                error(
-                    WorkspaceErrorKind::CleanupFailed,
-                    "workspace start flow panicked; cleanup is not confirmed",
-                ),
-                false,
-            ))
-        });
-    retained.startup.finish();
-    result
-}
-async fn guarded_stop(context: WorkspaceFlowContext) -> Result<StopOutput, StopError> {
-    let retained = context.clone();
-    AssertUnwindSafe(stop_flow(context))
-        .catch_unwind()
-        .await
-        .unwrap_or_else(|_| {
-            Err(fail(
-                &retained,
-                error(
-                    WorkspaceErrorKind::CleanupFailed,
-                    "workspace stop flow panicked; cleanup is not confirmed",
-                ),
-                false,
-            ))
-        })
+    });
 }

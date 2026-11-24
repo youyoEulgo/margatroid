@@ -5,16 +5,14 @@ fn read<T>(
     operation: impl FnOnce(&Connection) -> Result<T, StorageError>,
 ) -> Result<T, StorageError> {
     let state = &storage.database.shared;
-    let db = state
+    let guard = state
         .connection
         .lock()
         .map_err(|_| err(K::Closed, "database lock poisoned"))?;
-    if state.retired.load(Ordering::Acquire) {
-        return Err(err(K::CleanupFailed, "database connection retired"));
-    }
+    let db = open_connection(state, &guard)?;
     db.execute_batch("BEGIN DEFERRED").map_err(read_err)?;
-    let result = operation(&db);
-    finish_transaction(&db, &state.retired, result)
+    let result = operation(db);
+    finish_transaction(db, &state.retired, result)
 }
 
 fn bounds(query: RecordRange) -> Result<(Option<i64>, Option<i64>, i64), StorageError> {

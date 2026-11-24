@@ -14,7 +14,7 @@ use agent_core::{Agent, AgentState};
 use async_runtime_plugin::WorldAsyncExt;
 use closure_plugin::WorldClosureSender;
 use core_plugin::World;
-use futures_util::FutureExt;
+use futures_util::{FutureExt, StreamExt};
 use mlua::{HookTriggers, Lua, LuaSerdeExt, Value as LuaValue, VmState};
 use sandbox_resource_core::{read_sandbox, SandboxReadLimits, Sandboxes, SelectedSandbox};
 use serde::de::DeserializeOwned;
@@ -46,70 +46,111 @@ pub(crate) fn handle_init_tool_tasks(world: &mut World, request: InitToolTasks) 
     let Some(reply) = request
         .reply
         .lock()
-        .unwrap_or_else(|error| error.into_inner())
+        .unwrap_or_else(|e| e.into_inner())
         .take()
     else {
         return;
     };
-    let result =
-        if !world.is_alive(request.agent) || !world.contains_component::<Agent>(request.agent) {
-            Err(error(Kind::AgentMissing, "Agent entity missing"))
-        } else {
-            if !world.contains_component::<ToolTasks>(request.agent) {
-                let address = world
-                    .get_component::<address::Address>(request.agent)
-                    .map(|value| value.as_str().to_owned())
-                    .ok_or_else(|| error(Kind::AgentMissing, "Agent address missing"));
-                let Ok(address) = address else {
-                    let _ = reply.send(Err(address.unwrap_err()));
-                    return;
-                };
-                let binding = world
-                    .get_resource::<ToolPlugin>()
-                    .expect("ToolPlugin missing")
-                    .sync
-                    .clone();
-                world.insert_component(
-                    request.agent,
-                    ToolTasks::new(request.agent, address, binding),
-                );
-            }
-            Ok(())
-        };
+    let result = if !world.is_alive(request.agent) {
+        Err(error(Kind::AgentMissing, "entity missing"))
+    } else {
+        if !world.contains_component::<ToolTasks>(request.agent) {
+            world.insert_component(request.agent, ToolTasks::new());
+        }
+        observe_tasks(world, request.agent);
+        Ok(())
+    };
     let _ = reply.send(result);
 }
+fn observe_tasks(world: &World, owner: core_plugin::Entity) {
+    if let (Some(observer), Some(address), Some(tasks)) = (
+        world
+            .get_resource::<ToolPlugin>()
+            .and_then(|p| p.observe_tasks.as_ref()),
+        world.get_component::<address::Address>(owner),
+        world.get_component::<ToolTasks>(owner),
+    ) {
+        observer(owner, address.as_str().to_owned(), tasks);
+    }
+}
 
-pub(crate) fn handle_tool_execute(world: &mut World, request: ToolExecuteRequest) {
-    let Some(reply) = request
-        .reply
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
-        .take()
-    else {
+pub(crate) fn handle_tool_execute(world: &mut World, event: ToolExecuteRequest) {
+    use crate::types::ToolInvocation;
+    let (request, path, registered, reply) = match event {
+        ToolExecuteRequest::Registered {
+            id,
+            agent,
+            turn,
+            alias,
+            call_id,
+            arguments,
+            reply,
+        } => (
+            ToolInvocation {
+                id,
+                agent,
+                turn,
+                alias,
+                call_id,
+                arguments,
+            },
+            None,
+            true,
+            reply,
+        ),
+        ToolExecuteRequest::Path {
+            initiator,
+            path,
+            arguments,
+            reply,
+        } => {
+            static NEXT: AtomicU64 = AtomicU64::new(1);
+            let id = format!(
+                "tool-path:{}:{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            );
+            (
+                ToolInvocation {
+                    id: id.clone(),
+                    agent: initiator,
+                    turn: None,
+                    alias: path.to_string_lossy().into_owned(),
+                    call_id: id,
+                    arguments,
+                },
+                Some(path),
+                false,
+                reply,
+            )
+        }
+    };
+    let Some(reply) = reply.lock().unwrap_or_else(|e| e.into_inner()).take() else {
         return;
     };
-    let accepted = world
-        .get_component::<Agent>(request.agent)
-        .is_some_and(|agent| {
-            world.is_alive(request.agent)
-                && matches!(agent.state(), AgentState::Starting | AgentState::Running)
-                && request.turn.as_ref().is_none_or(|turn| {
-                    !turn.is_empty()
-                        && agent.state() == AgentState::Running
-                        && agent.turn().as_ref() == Some(turn)
-                })
-        });
-    if !accepted {
+    if registered
+        && !world
+            .get_component::<Agent>(request.agent)
+            .is_some_and(|agent| {
+                world.is_alive(request.agent)
+                    && matches!(agent.state(), AgentState::Starting | AgentState::Running)
+                    && request.turn.as_ref().is_none_or(|turn| {
+                        !turn.is_empty()
+                            && agent.state() == AgentState::Running
+                            && agent.turn().as_ref() == Some(turn)
+                    })
+            })
+    {
         let _ = reply.send(Ok(tool_core::ToolExecuteResponse::aborted(
-            request.call_id.clone(),
-            request.alias.clone(),
+            request.call_id,
+            request.alias,
         )));
         return;
     }
     let prepared = (|| {
-        let agent = world
-            .get_component::<Agent>(request.agent)
-            .ok_or_else(|| error(Kind::AgentMissing, "Agent entity missing"))?;
+        if !world.is_alive(request.agent) {
+            return Err(error(Kind::AgentMissing, "initiator missing"));
+        }
         if request.id.trim().is_empty()
             || request.call_id.trim().is_empty()
             || request.alias.trim().is_empty()
@@ -121,89 +162,159 @@ pub(crate) fn handle_tool_execute(world: &mut World, request: ToolExecuteRequest
         }
         let config = world
             .get_resource::<ToolPlugin>()
-            .expect("ToolPlugin configuration missing")
-            .clone();
-        let tool_entry = world
-            .get_component::<Tools>(request.agent)
-            .and_then(|tools| tools.get(&request.alias))
-            .ok_or_else(|| error(Kind::AliasMissing, "tool alias is not registered"))?
-            .clone();
-        let sandbox_path = world
-            .get_component::<SelectedSandbox>(request.agent)
-            .and_then(|selected| selected.alias.as_deref())
-            .map(|alias| {
-                world
-                    .get_component::<Sandboxes>(request.agent)
-                    .and_then(|sandboxes| sandboxes.get(alias))
-                    .map(Path::to_owned)
-                    .ok_or_else(|| {
-                        error(
-                            Kind::AliasMissing,
-                            "selected sandbox alias is not registered",
-                        )
-                    })
-            })
-            .transpose()?;
-        let project_root = world
-            .get_component::<Workspace>(agent.workspace())
-            .ok_or_else(|| error(Kind::InvalidRequest, "Agent workspace is missing"))?
-            .project_root
+            .expect("ToolPlugin missing")
             .clone();
         let tasks = world
             .get_component::<ToolTasks>(request.agent)
-            .ok_or_else(|| error(Kind::TaskMissing, "ToolTasks not initialized"))?
-            .clone();
-        let storage = world
-            .get_component::<AgentStorage>(request.agent)
-            .ok_or_else(|| {
-                error(
+            .cloned()
+            .ok_or_else(|| error(Kind::TaskMissing, "ToolTasks missing"))?;
+        if !tasks.is_accepting() {
+            return Err(error(Kind::Closed, "initiator no longer accepts tasks"));
+        }
+        let tool_entry = if let Some(path) = path {
+            if !path.is_absolute()
+                || path
+                    .components()
+                    .any(|c| matches!(c, std::path::Component::ParentDir))
+            {
+                return Err(error(
                     Kind::InvalidRequest,
-                    "AgentStorage is required for tool execution",
-                )
-            })?
-            .clone();
-        let agent_name = agent.name().clone();
-        let info = world.get_component::<Workspace>(agent.workspace()).unwrap();
-        let workspace_address = world
-            .get_component::<address::Address>(agent.workspace())
-            .ok_or_else(|| error(Kind::AgentMissing, "Workspace address missing"))?;
-        let workspace = json!({"address":workspace_address.as_str(),"name":info.name,"project_root":info.project_root});
-        let agent_address = world
+                    "tool path must be absolute without traversal",
+                ));
+            }
+            ToolEntry {
+                path,
+                description: String::new(),
+                input_schema: json!({}),
+                owner_task_id: None,
+                owner_agent: None,
+                binding: None,
+            }
+        } else {
+            let entry = world
+                .get_component::<Tools>(request.agent)
+                .and_then(|tools| tools.get(&request.alias))
+                .cloned()
+                .ok_or_else(|| error(Kind::AliasMissing, "tool alias is not registered"))?;
+            validate_arguments(&entry.input_schema, &request.arguments)?;
+            entry
+        };
+        let sandbox_path = world
+            .get_component::<SelectedSandbox>(request.agent)
+            .and_then(|s| s.alias.as_deref())
+            .map(|alias| {
+                world
+                    .get_component::<Sandboxes>(request.agent)
+                    .and_then(|s| s.get(alias))
+                    .map(Path::to_owned)
+                    .ok_or_else(|| error(Kind::AliasMissing, "selected sandbox missing"))
+            })
+            .transpose()?;
+        let workspace_id = workspace_of(world, request.agent).ok();
+        let workspace = workspace_id.and_then(|id| world.get_component::<Workspace>(id).map(|w| {
+            json!({"address": world.get_component::<address::Address>(id).map(|a| a.as_str()), "alias": w.alias, "project_root": w.project_root})
+        })).unwrap_or(Value::Null);
+        let project_root = world
+            .get_component::<Agent>(request.agent)
+            .filter(|a| !a.project_root().as_os_str().is_empty())
+            .map(|a| a.project_root().to_path_buf())
+            .or_else(|| {
+                workspace_id.and_then(|id| {
+                    world
+                        .get_component::<Workspace>(id)
+                        .map(|w| w.project_root.clone())
+                })
+            })
+            .unwrap_or_default();
+        let address = world
             .get_component::<address::Address>(request.agent)
-            .ok_or_else(|| error(Kind::AgentMissing, "Agent address missing"))?
-            .as_str()
-            .to_owned();
-
-        validate_arguments(&tool_entry.input_schema, &request.arguments)?;
+            .map(|a| a.as_str().to_owned())
+            .unwrap_or_default();
+        let storage = world.get_component::<AgentStorage>(request.agent).cloned();
         Ok((
             config,
+            tasks,
             tool_entry,
             sandbox_path,
-            project_root,
-            tasks,
-            storage,
-            agent_name,
-            agent_address,
             workspace,
+            project_root,
+            address,
+            storage,
         ))
     })();
-    let (
-        config,
-        tool_entry,
-        sandbox_path,
-        project_root,
-        tasks,
-        storage,
-        agent_name,
-        agent_address,
-        workspace,
-    ) = match prepared {
-        Ok(prepared) => prepared,
-        Err(error) => {
-            let _ = reply.send(Err(error));
-            return;
+    let (config, tasks, tool_entry, sandbox_path, workspace, project_root, agent_address, storage) =
+        match prepared {
+            Ok(value) => value,
+            Err(failure) => {
+                let _ = reply.send(Err(failure));
+                return;
+            }
+        };
+    let weak = Arc::downgrade(
+        &world
+            .get_resource::<crate::ToolRuntime>()
+            .expect("Tool runtime missing")
+            .0,
+    );
+    let cleanup = Arc::new(tokio::sync::Mutex::new(()));
+    let cleanup_proven = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let finish_proven = cleanup_proven.clone();
+    let finish_tasks = tasks.clone();
+    let finish_id = request.id.clone();
+    let finish_world = weak.clone();
+    let finish: tool_core::TaskFinish = Arc::new(move |handle| {
+        let (tx, rx) = oneshot::channel();
+        let gate = cleanup.clone();
+        let tasks = finish_tasks.clone();
+        let id = finish_id.clone();
+        let world = finish_world.clone();
+        let cleanup_world = world.upgrade();
+        let proof = finish_proven.clone();
+        let cleanup_task = async move {
+            let _gate = gate.lock().await;
+            let result = async {
+                if handle.is_cleanup_complete() {
+                    return Ok(());
+                }
+                handle.wait_execution_ended().await?;
+                if !proof.load(Ordering::Acquire) {
+                    return Err(error(
+                        Kind::CleanupFailed,
+                        "execution exited without runner cleanup proof; task retained",
+                    ));
+                }
+                if let Some(sender) = world.upgrade() {
+                    crate::services::finish_task(sender, handle.clone()).await?;
+                }
+                handle.finish_children().await?;
+                handle.retry_cleanups().await?;
+                if !tasks.complete_cleanup(&id, &handle, None) && !handle.is_cleanup_complete() {
+                    return Err(error(
+                        Kind::CleanupFailed,
+                        "task has pending child or retry cleanup",
+                    ));
+                }
+                Ok(())
+            }
+            .await;
+            if let Err(failure) = &result {
+                handle.set_error(failure.clone());
+            }
+            let _ = tx.send(result);
+        };
+        if let Some(sender) = cleanup_world {
+            sender.send(move |world| {
+                world
+                    .get_resource::<async_runtime_plugin::AsyncRuntimeHandle>()
+                    .expect("AsyncRuntime missing")
+                    .spawn(cleanup_task)
+            });
         }
-    };
+        Box::pin(async move {
+            rx.await
+                .map_err(|_| error(Kind::CleanupFailed, "cleanup supervisor lost"))?
+        })
+    });
     let Ok((handle, input)) = ToolTaskHandle::new(
         &config.limits,
         request.call_id.clone(),
@@ -211,29 +322,35 @@ pub(crate) fn handle_tool_execute(world: &mut World, request: ToolExecuteRequest
         reply,
         tasks.update_context(),
         request.turn.clone(),
+        finish,
     ) else {
-        // Handle construction delivers its validation failure to the original reply.
         return;
     };
     if let Err(failure) = tasks.register(request.id.clone(), handle.clone()) {
         let _ = handle.return_result(Err(failure));
         return;
     }
-    let schedule = config.schedule.clone();
+    observe_tasks(world, request.agent);
+    let trusted_path = crate::services::register_invocation(
+        world,
+        &handle,
+        &request.id,
+        request.agent,
+        &tool_entry.path,
+        &request.arguments,
+    );
     let context = ToolExecutionContext {
         storage,
-        agent_name,
+        agent_name: agent_address.rsplit('/').next().unwrap_or("").to_owned(),
         agent_address,
         workspace,
         diagnostic_received: false,
+        path_entry: !registered,
+        cleanup_proven,
+        trusted_path,
         request,
         tool_entry,
-        world: Arc::downgrade(
-            &world
-                .get_resource::<crate::ToolRuntime>()
-                .expect("Tool runtime missing")
-                .0,
-        ),
+        world: weak,
         sandbox_path,
         project_root,
         runner_path: config.runner_path,
@@ -250,8 +367,9 @@ pub(crate) fn handle_tool_execute(world: &mut World, request: ToolExecuteRequest
         },
         armed: true,
     };
+    let schedule = config.schedule;
     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        world.send_async_closure(&schedule, move || launch_tool(launch));
+        world.send_async_closure(&schedule, move || launch_tool(launch))
     }));
 }
 
@@ -269,6 +387,7 @@ impl ToolLaunchFallback {
             .take()
         {
             complete_reply(&mut context, Err(failure.clone()));
+            context.cleanup_proven.store(true, Ordering::Release);
             context
                 .tasks
                 .complete_cleanup(&context.request.id, &context.handle, Some(failure));
@@ -335,8 +454,21 @@ async fn supervise_tool(mut context: ToolExecutionContext) {
     let result = std::panic::AssertUnwindSafe(async {
         let tool_path = context.tool_entry.path.clone();
         let sandbox_path = context.sandbox_path.clone();
+        let path_entry = context.path_entry;
         let read = tokio::task::spawn_blocking(move || {
-            let program = read_program(&tool_path)?;
+            let definition = if path_entry {
+                Some(
+                    tool_resource_core::read_tool(&tool_path)
+                        .map_err(|e| error(Kind::ReadFailed, e.to_string()))?,
+                )
+            } else {
+                None
+            };
+            let program = if let Some(input) = &definition {
+                input.program.clone()
+            } else {
+                read_program(&tool_path)?
+            };
             let policy = sandbox_path
                 .map(|path| {
                     read_sandbox(&path, &SandboxReadLimits::default())
@@ -344,11 +476,23 @@ async fn supervise_tool(mut context: ToolExecutionContext) {
                         .map_err(|failure| error(Kind::ReadFailed, failure.to_string()))
                 })
                 .transpose()?;
-            Ok::<_, ToolError>((program, policy))
+            Ok::<_, ToolError>((program, policy, definition))
         });
-        let (program, policy) = read
+        let (program, policy, definition) = read
             .await
             .map_err(|_| error(Kind::TaskPanicked, "tool resource reader failed"))??;
+        if let Some(input) = definition {
+            context.tool_entry.input_schema = input.input_schema;
+            context.tool_entry.description = input.description;
+        }
+        let canonical = tokio::fs::canonicalize(&context.tool_entry.path)
+            .await
+            .map_err(|e| error(Kind::ReadFailed, e.to_string()))?;
+        context.tool_entry.path = canonical.clone();
+        *context
+            .trusted_path
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = canonical;
         validate_arguments(&context.tool_entry.input_schema, &context.request.arguments)?;
         if context.handle.cancel_token().is_cancelled() {
             return Err(error(
@@ -390,7 +534,27 @@ async fn supervise_tool(mut context: ToolExecutionContext) {
             },
             limits: context.limits.clone(),
         };
+        #[cfg(test)]
+        if context
+            .request
+            .arguments
+            .get("__test_supervisor_panic")
+            .and_then(Value::as_str)
+            == Some("before")
+        {
+            panic!("before runner");
+        }
         let result = run_runner(&mut context, request, policy).await;
+        #[cfg(test)]
+        if context
+            .request
+            .arguments
+            .get("__test_supervisor_panic")
+            .and_then(Value::as_str)
+            == Some("after")
+        {
+            panic!("after runner");
+        }
         if let Err(failure) = &result {
             report_host_failure(&mut context, failure).await;
             complete_reply(&mut context, Err(failure.clone()));
@@ -438,46 +602,18 @@ async fn supervise_tool(mut context: ToolExecutionContext) {
         complete_reply(&mut context, Err(failure));
         return;
     }
-    let source = context.request.agent;
-    let instance = context.handle.execution_id().to_owned();
-    let cancel = context.handle.cancel_token();
-    if let Ok((services, identity)) = in_world(&context.world, move |world| {
-        let services = world
-            .get_resource::<lua_runtime_core::LuaServices>()
-            .cloned()
-            .ok_or_else(|| error(Kind::InvalidRequest, "Lua services unavailable"))?;
-        let identity = lua_runtime_core::LuaExecutionIdentity {
-            source,
-            workspace: workspace_of(world, source)?,
-            address: world
-                .get_component::<address::Address>(source)
-                .unwrap()
-                .as_str()
-                .into(),
-            instance,
-            cancel,
-        };
-        Ok((services, identity))
-    })
-    .await
-    {
-        let diagnostic=outcome.as_ref().err().filter(|failure|failure.kind!=Kind::Cancelled).map(|failure|serde_json::json!({"message":failure.to_string(),"raw_error":failure.to_string(),"origin":context.tool_entry.path})).unwrap_or(Value::Null);
-        if let Err(failure) = services
-            .call(identity, "execution_finished".into(), diagnostic)
-            .await
-        {
-            tracing::error!(%failure,"tool Agent monitor completion failed");
-            handle.set_error(error(Kind::CleanupFailed, failure.to_string()));
-            return;
-        }
+    if !cleanup_confirmed {
+        handle.set_error(
+            outcome
+                .err()
+                .unwrap_or_else(|| error(Kind::CleanupFailed, "runner cleanup unconfirmed")),
+        );
+        return;
     }
-    if cleanup_confirmed {
-        context
-            .tasks
-            .complete_cleanup(&context.request.id, &handle, outcome.err());
-    } else {
-        handle.set_error(outcome.unwrap_err());
-    }
+    context.cleanup_proven.store(true, Ordering::Release);
+    drop(context);
+    // The independently supervised cleanup waits for this execution task to return.
+    let _completion = handle.finish();
 }
 
 fn validate_arguments(schema: &Value, arguments: &Value) -> Result<(), ToolError> {
@@ -537,6 +673,9 @@ pub(crate) fn workspace_of(
     if let Some(agent) = world.get_component::<Agent>(source) {
         return Ok(agent.workspace());
     }
+    if world.contains_component::<Workspace>(source) {
+        return Ok(source);
+    }
     world
         .get_component::<tool_core::LuaExecutionTask>(source)
         .map(|task| task.workspace)
@@ -569,9 +708,7 @@ fn resolve_agent(
     let agent = world
         .get_component::<Agent>(target)
         .ok_or_else(|| error(Kind::AgentMissing, "target is not an Agent"))?;
-    if agent.workspace() != source_workspace
-        || matches!(agent.state(), AgentState::Stopping | AgentState::Error)
-    {
+    if agent.workspace() != source_workspace || matches!(agent.state(), AgentState::Closing) {
         return Err(error(
             Kind::InvalidRequest,
             "target Agent is not available in this Workspace",
@@ -602,33 +739,27 @@ pub(crate) fn resolve_task_entity(
     source: core_plugin::Entity,
     address: Option<&str>,
 ) -> Result<core_plugin::Entity, ToolError> {
-    if address.is_none()
-        && world
-            .get_component::<tool_core::LuaExecutionTask>(source)
-            .is_some()
-    {
-        return Ok(source);
-    }
-    if let Some(address) = address {
-        let address = address::Address::new(address)
+    let target = if let Some(address) = address {
+        let parsed = address::Address::new(address)
             .map_err(|e| error(Kind::InvalidRequest, e.to_string()))?;
-        if let Some(entity) = world
-            .query_with::<tool_core::LuaExecutionTask>()
+        world
+            .query_with::<address::Address>()
             .result()
             .into_iter()
-            .find(|entity| world.get_component::<address::Address>(*entity) == Some(&address))
-        {
-            if workspace_of(world, entity)? != workspace_of(world, source)? {
-                return Err(error(
-                    Kind::InvalidRequest,
-                    "execution task outside Workspace",
-                ));
-            }
-            return Ok(entity);
-        }
+            .find(|entity| world.get_component::<address::Address>(*entity) == Some(&parsed))
+            .ok_or_else(|| error(Kind::TaskMissing, "task target entity missing"))?
+    } else {
+        source
+    };
+    if !world.contains_component::<ToolTasks>(target) {
+        return Err(error(Kind::TaskMissing, "target task collection missing"));
     }
-    resolve_agent(world, source, address)
+    if target != source && workspace_of(world, target)? != workspace_of(world, source)? {
+        return Err(error(Kind::InvalidRequest, "task target outside Workspace"));
+    }
+    Ok(target)
 }
+
 fn task_target(
     world: &World,
     source: core_plugin::Entity,
@@ -742,7 +873,7 @@ async fn workspace_agents(context: &ToolExecutionContext) -> Result<Value, ToolE
     let invocation = context.handle.clone();
     in_world(&context.world,move|world|{
   ensure_invocation(world,source,&task_id,&invocation)?;let workspace=workspace_of(world,source)?;
-  let agents=world.query_with::<Agent>().result().into_iter().filter_map(|entity|{let agent=world.get_component::<Agent>(entity)?;if agent.workspace()!=workspace{return None;}let address=world.get_component::<address::Address>(entity)?;Some(json!({"address":address.as_str(),"name":agent.name(),"state":format!("{:?}",agent.state()).to_lowercase()}))}).collect::<Vec<_>>();Ok(json!(agents))
+  let agents=world.query_with::<Agent>().result().into_iter().filter_map(|entity|{let agent=world.get_component::<Agent>(entity)?;if agent.workspace()!=workspace{return None;}let address=world.get_component::<address::Address>(entity)?;Some(json!({"address":address.as_str(),"name":world.get_component::<address::Address>(entity).map(|a|a.as_str().rsplit('/').next().unwrap_or("")),"state":format!("{:?}",agent.state()).to_lowercase()}))}).collect::<Vec<_>>();Ok(json!(agents))
  }).await
 }
 
@@ -962,41 +1093,16 @@ async fn host_frame(
             method,
             arguments,
         } => {
-            let source = context.request.agent;
-            let id = context.request.id.clone();
-            let expected = context.handle.clone();
-            let prepared = in_world(&context.world, move |world| {
-                ensure_invocation(world, source, &id, &expected)?;
-                let workspace = workspace_of(world, source)?;
-                let address = world
-                    .get_component::<address::Address>(source)
-                    .unwrap()
-                    .as_str()
-                    .to_owned();
-                let services = world
-                    .get_resource::<lua_runtime_core::LuaServices>()
-                    .ok_or_else(|| error(Kind::InvalidRequest, "Lua services unavailable"))?
-                    .clone();
-                Ok((
-                    services,
-                    lua_runtime_core::LuaExecutionIdentity {
-                        source,
-                        workspace,
-                        address,
-                        instance: expected.execution_id().to_owned(),
-                        cancel: expected.cancel_token(),
-                    },
-                ))
-            })
+            return call_host(
+                context.world.clone(),
+                context.request.agent,
+                context.request.id.clone(),
+                context.handle.clone(),
+                request_id,
+                method,
+                arguments,
+            )
             .await;
-            let result = match prepared {
-                Ok((services, identity)) => services
-                    .call(identity, method, arguments)
-                    .await
-                    .map_err(|failure| error(Kind::ExecutionFailed, failure.to_string())),
-                Err(failure) => Err(failure),
-            };
-            (request_id, result)
         }
         RunnerFrame::WorkspaceAgents { request_id } => {
             let result = workspace_agents(context).await;
@@ -1012,7 +1118,19 @@ async fn host_frame(
             })
             .await;
             let result = match handle {
-                Ok(handle) => handle.finish().await.map(|()| Value::Null),
+                Ok(handle) => {
+                    // Request independent target cleanup before waiting. The target
+                    // may own this invocation through a child Agent, so its cancel
+                    // must be able to release this host request without dropping
+                    // responsibility for the target's cleanup.
+                    let finished = handle.finish();
+                    let caller_cancel = context.handle.cancel_token();
+                    tokio::select! {
+                        biased;
+                        () = caller_cancel.cancelled() => Err(error(Kind::Cancelled, "caller cancelled while finishing target task")),
+                        result = finished => result.map(|()| Value::Null),
+                    }
+                }
                 Err(error) => Err(error),
             };
             (request_id, result)
@@ -1024,6 +1142,46 @@ async fn host_frame(
             ));
         }
     };
+    Ok(HostFrame::Response { request_id, result })
+}
+
+async fn call_host(
+    weak: std::sync::Weak<WorldClosureSender>,
+    source: core_plugin::Entity,
+    id: String,
+    expected: ToolTaskHandle,
+    request_id: String,
+    method: String,
+    arguments: Value,
+) -> Result<HostFrame, ToolError> {
+    let (services, identity) = in_world(&weak, move |world| {
+        ensure_invocation(world, source, &id, &expected)?;
+        let workspace = workspace_of(world, source)?;
+        let address = world
+            .get_component::<address::Address>(source)
+            .ok_or_else(|| error(Kind::InvalidRequest, "host operation needs an address"))?
+            .as_str()
+            .to_owned();
+        let services = world
+            .get_resource::<lua_runtime_core::LuaServices>()
+            .ok_or_else(|| error(Kind::InvalidRequest, "Lua services unavailable"))?
+            .clone();
+        Ok((
+            services,
+            lua_runtime_core::LuaExecutionIdentity {
+                source,
+                workspace,
+                address,
+                instance: expected.execution_id().into(),
+                cancel: expected.cancel_token(),
+            },
+        ))
+    })
+    .await?;
+    let result = services
+        .call(identity, method, arguments)
+        .await
+        .map_err(|failure| error(Kind::ExecutionFailed, failure.to_string()));
     Ok(HostFrame::Response { request_id, result })
 }
 
@@ -1055,8 +1213,12 @@ async fn run_runner(
         command.arg("--sandbox").arg(backend).arg(path);
     }
     filtered_environment(&mut command);
+    command.current_dir(if request.context.project_root.as_os_str().is_empty() {
+        &request.context.temp_dir
+    } else {
+        &request.context.project_root
+    });
     command
-        .current_dir(&request.context.project_root)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1101,6 +1263,7 @@ async fn run_runner(
     let mut result = {
         let exchange = async {
             let mut input_ready = true;
+            let mut pending_hosts = futures_util::stream::FuturesUnordered::new();
             loop {
                 tokio::select! {
                     biased;
@@ -1130,8 +1293,16 @@ async fn run_runner(
                             continue;
                         }
                         if context.configuration.is_none() && !matches!(frame.frame, RunnerFrame::LuaDiagnostic { .. }) { return Err(error(Kind::RunnerProtocolFailed, "worker request before configuration")); }
+                        if let RunnerFrame::Host { request_id, method, arguments } = frame.frame {
+                            pending_hosts.push(call_host(context.world.clone(),context.request.agent,context.request.id.clone(),context.handle.clone(),request_id,method,arguments));
+                            continue;
+                        }
                         let response = host_frame(context, frame.frame).await?;
                         host.send(response).map_err(|_| error(Kind::RunnerProtocolFailed, "runner input closed"))?;
+                    }
+                    response = pending_hosts.next(), if !pending_hosts.is_empty() => {
+                        let response = response.expect("nonempty pending host requests")?;
+                        host.send(response).map_err(|_|error(Kind::RunnerProtocolFailed,"runner input closed"))?;
                     }
                     value = context.input.recv(), if input_ready && context.configuration.is_some() => {
                         let Some(value) = value else { return Err(error(Kind::InputClosed, "task input channel closed")); };
@@ -1141,7 +1312,15 @@ async fn run_runner(
                 }
             }
         };
-        exchange.await
+        std::panic::AssertUnwindSafe(exchange)
+            .catch_unwind()
+            .await
+            .unwrap_or_else(|_| {
+                Err(error(
+                    Kind::TaskPanicked,
+                    "tool host exchange panicked; reclaiming runner",
+                ))
+            })
     };
     if let Err(failure) = &result {
         report_host_failure(context, failure).await;
@@ -2041,6 +2220,29 @@ async fn run_tool_worker<R: AsyncBufRead + Unpin + Send + 'static>(
         .set("process_start", process_start)
         .map_err(lua_failure)?;
     data::install(&lua, &callbacks, request.context.project_root.clone()).map_err(lua_failure)?;
+    if request.context.project_root.as_os_str().is_empty() {
+        for method in [
+            "process_start",
+            "files_read",
+            "files_write",
+            "files_list",
+            "files_info",
+            "files_create_directory",
+        ] {
+            callbacks
+                .set(
+                    method,
+                    lua.create_function(|_, _: mlua::MultiValue| -> mlua::Result<()> {
+                        Err(mlua::Error::external(error(
+                            Kind::InvalidRequest,
+                            "this invocation has no working directory capability",
+                        )))
+                    })
+                    .map_err(lua_failure)?,
+                )
+                .map_err(lua_failure)?;
+        }
+    }
     host::Margatroid::enable(&host, callbacks).map_err(lua_failure)?;
     let arguments = data::to_lua(&lua, request.arguments.clone()).map_err(lua_failure)?;
     let context = data::to_lua(
@@ -2132,37 +2334,16 @@ fn parse_configuration(lua: &Lua, value: LuaValue) -> Result<ToolConfiguration, 
 }
 
 #[cfg(test)]
-fn test_binding() -> tool_core::TaskSyncBinding {
-    tool_core::TaskSyncBinding::new(
-        client_core::Clients::default(),
-        std::sync::Arc::from([]),
-        |snapshot| {
-            serde_json::to_string(&snapshot)
-                .map(|text| std::sync::Arc::new(client_core::ClientFrame::Text(text)))
-                .map_err(|_| client_core::ClientPrepareError::EncodeFailed)
-        },
-    )
-}
 #[cfg(test)]
 fn test_tasks() -> tool_core::ToolTasks {
     let mut app = core_plugin::App::new();
-    let owner = app.world_mut().spawn();
-    tool_core::ToolTasks::new(owner, "agent:test/unit:dev".into(), test_binding())
+    let _owner = app.world_mut().spawn();
+    tool_core::ToolTasks::new()
 }
 
 #[cfg(test)]
 fn test_agent_context() -> agent_core::AgentUpdateContext {
     agent_core::AgentUpdateContext::new(|_, _, _| Vec::new(), |_, _| {})
-}
-
-#[cfg(test)]
-fn test_workspace_context() -> workspace_core::WorkspaceUpdateContext {
-    workspace_core::WorkspaceUpdateContext::new(|_, _| {})
-}
-
-#[cfg(test)]
-fn test_probe<T>() -> client_core::UpdateProbe<T> {
-    client_core::UpdateProbe::new(|_| {})
 }
 
 fn task_reference(lua: &Lua, value: LuaValue) -> mlua::Result<TaskReference> {
@@ -2214,6 +2395,146 @@ mod world_sender_tests {
     }
     impl core_plugin::Resource for TestStorageDirectory {}
 
+    #[tokio::test]
+    async fn ancestor_finish_releases_cancelled_caller_while_target_cleanup_continues() {
+        let (mut app, _sender, mut context) = injection_fixture();
+        let caller_cancel = context.handle.cancel_token();
+        let caller_exited = Arc::new(tokio::sync::Notify::new());
+        let target_finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let exit = caller_exited.clone();
+        let finished = target_finished.clone();
+        let finish: tool_core::TaskFinish = Arc::new(move |_| {
+            let cancel = caller_cancel.clone();
+            let exit = exit.clone();
+            let finished = finished.clone();
+            let (tx, rx) = oneshot::channel();
+            tokio::spawn(async move {
+                // Closing the ancestor cancels this child but cannot finish until
+                // the child's blocked Host call has unwound.
+                cancel.cancel();
+                exit.notified().await;
+                finished.store(true, Ordering::Release);
+                let _ = tx.send(Ok(()));
+            });
+            Box::pin(async move { rx.await.unwrap() })
+        });
+        let (tx, _rx) = oneshot::channel();
+        let (target, _input) = ToolTaskHandle::new(
+            &ToolExecutionLimits::default(),
+            "ancestor".into(),
+            "driver".into(),
+            tx,
+            context.tasks.update_context(),
+            None,
+            finish,
+        )
+        .unwrap();
+        context.tasks.register("ancestor".into(), target).unwrap();
+        let request = host_frame(
+            &mut context,
+            RunnerFrame::Finish {
+                request_id: "finish".into(),
+                target: TaskReference {
+                    agent: None,
+                    task_id: "ancestor".into(),
+                },
+            },
+        );
+        tokio::pin!(request);
+        let deadline = tokio::time::sleep(Duration::from_secs(2));
+        tokio::pin!(deadline);
+        let response = loop {
+            app.tick();
+            tokio::select! {
+                result = &mut request => break result.unwrap(),
+                () = &mut deadline => panic!("ancestor finish deadlocked on its cancelled child"),
+                () = tokio::time::sleep(Duration::from_millis(1)) => {},
+            }
+        };
+        assert!(matches!(
+            response,
+            HostFrame::Response {
+                result: Err(ToolError {
+                    kind: Kind::Cancelled,
+                    ..
+                }),
+                ..
+            }
+        ));
+        assert!(!target_finished.load(Ordering::Acquire));
+        caller_exited.notify_one();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !target_finished.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn supervisor_panics_before_and_after_runner_cannot_complete_unproven_tasks() {
+        use std::os::unix::fs::PermissionsExt;
+        for stage in ["before", "after"] {
+            let (mut app, _sender, mut context) = injection_fixture();
+            let directory = tempfile::tempdir().unwrap();
+            std::fs::write(
+                directory.path().join("tool.toml"),
+                "schema_version=1\ndescription='test'\n",
+            )
+            .unwrap();
+            std::fs::write(directory.path().join("main.lua"), "function execute() end").unwrap();
+            let runner = directory.path().join("fake-runner.py");
+            std::fs::write(
+                &runner,
+                r#"#!/usr/bin/python3
+import json,sys
+json.loads(sys.stdin.readline())
+def emit(frame):
+ print(json.dumps({'protocol_version':1,'frame':frame}),flush=True)
+emit({'type':'configured','configuration':{'timeout_ms':1000}})
+json.loads(sys.stdin.readline())
+emit({'type':'return','request_id':'result','value':'done'})
+json.loads(sys.stdin.readline())
+emit({'type':'stopped','result':{'Ok':None},'cleanup_proven':True})
+"#,
+            )
+            .unwrap();
+            std::fs::set_permissions(&runner, std::fs::Permissions::from_mode(0o700)).unwrap();
+            context.tool_entry.path = directory.path().join("tool.toml");
+            context.runner_path = runner;
+            context.project_root = directory.path().to_path_buf();
+            context.request.arguments = json!({"__test_supervisor_panic":stage});
+            context.configuration = None;
+            let proof = context.cleanup_proven.clone();
+            let handle = context.handle.clone();
+            let tasks = context.tasks.clone();
+            let supervised = supervise_tool(context);
+            tokio::pin!(supervised);
+            let deadline = tokio::time::sleep(Duration::from_secs(3));
+            tokio::pin!(deadline);
+            loop {
+                app.tick();
+                tokio::select! {
+                    () = &mut supervised => break,
+                    () = &mut deadline => panic!("panic cleanup did not return"),
+                    () = tokio::time::sleep(Duration::from_millis(1)) => {},
+                }
+            }
+            assert!(
+                !proof.load(Ordering::Acquire),
+                "{stage}: unwind cannot prove cleanup"
+            );
+            assert!(!handle.is_cleanup_complete());
+            assert!(tasks.get("caller").is_ok());
+            assert_eq!(
+                handle.read().unwrap().error.unwrap().kind,
+                Kind::CleanupFailed
+            );
+        }
+    }
+
     fn injection_fixture() -> (App, Arc<WorldClosureSender>, ToolExecutionContext) {
         use closure_plugin::WorldClosureExt;
 
@@ -2224,12 +2545,12 @@ mod world_sender_tests {
         let workspace = app.world_mut().spawn();
         app.world_mut().insert_component(
             workspace,
-            address::Address::new("workspace:test/unit:dev").unwrap(),
+            address::Address::new("/workspace-test-unit-dev").unwrap(),
         );
         let agent = app.world_mut().spawn();
         app.world_mut().insert_component(
             agent,
-            Agent::new(
+            crate::test_support::agent(
                 "test".into(),
                 workspace,
                 AgentState::Running,
@@ -2239,7 +2560,7 @@ mod world_sender_tests {
         );
         app.world_mut().insert_component(
             agent,
-            address::Address::new("agent:test/source:dev").unwrap(),
+            address::Address::new("/agents/test/source-dev").unwrap(),
         );
         let tasks = test_tasks();
         let (reply, _) = oneshot::channel();
@@ -2250,12 +2571,12 @@ mod world_sender_tests {
             reply,
             tasks.update_context(),
             None,
+            crate::test_support::finish(),
         )
         .unwrap();
         tasks.register("caller".into(), handle.clone()).unwrap();
         app.world_mut().insert_component(agent, tasks.clone());
-        app.world_mut()
-            .insert_component(agent, Tools::new(test_probe()));
+        app.world_mut().insert_component(agent, Tools::new());
         let sender = Arc::new(app.world().closure_sender(RuntimePlugin::UPDATE));
         let storage_root = tempfile::tempdir().unwrap();
         let storage = storage_core::open_storage(
@@ -2268,19 +2589,21 @@ mod world_sender_tests {
             _directory: storage_root,
         });
         let context = ToolExecutionContext {
-            storage,
+            storage: Some(storage),
             agent_name: "test".into(),
-            agent_address: "agent:test/source:dev".into(),
-            workspace: json!({"address":"workspace:test/unit:dev","name":"test","project_root":"/project"}),
+            agent_address: "/agents/test/source-dev".into(),
+            workspace: json!({"address":"/workspace-test-unit-dev","name":"test","project_root":"/project"}),
             diagnostic_received: false,
-            request: ToolExecuteRequest {
+            path_entry: false,
+            cleanup_proven: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            trusted_path: Arc::new(Mutex::new(PathBuf::from("/resource/tool.toml"))),
+            request: crate::types::ToolInvocation {
                 id: "caller".into(),
                 agent,
                 turn: Some("turn".into()),
                 alias: "source".into(),
                 call_id: "call".into(),
                 arguments: serde_json::json!({}),
-                reply: Arc::new(Mutex::new(None)),
             },
             tool_entry: ToolEntry {
                 owner_agent: None,
@@ -2364,6 +2687,7 @@ mod world_sender_tests {
             reply,
             context.tasks.update_context(),
             None,
+            crate::test_support::finish(),
         )
         .unwrap();
         context
@@ -2398,6 +2722,7 @@ mod world_sender_tests {
             reply,
             context.tasks.update_context(),
             None,
+            crate::test_support::finish(),
         )
         .unwrap();
         context
@@ -2458,6 +2783,7 @@ mod world_sender_tests {
             reply,
             context.tasks.update_context(),
             None,
+            crate::test_support::finish(),
         )
         .unwrap();
         context
@@ -2497,17 +2823,17 @@ mod world_sender_tests {
             .add_plugin(AsyncRuntimePlugin)
             .add_plugin(ClosurePlugin)
             .add_closure_system(RuntimePlugin::UPDATE)
-            .add_plugin(ToolPlugin::new(test_binding()));
+            .add_plugin(ToolPlugin::new());
         let root = tempfile::tempdir().unwrap();
         let workspace = app.world_mut().spawn();
         let agent = app.world_mut().spawn();
         app.world_mut().insert_component(
             agent,
-            address::Address::new("agent:test/source:dev").unwrap(),
+            address::Address::new("/agents/test/source-dev").unwrap(),
         );
         app.world_mut().insert_component(
             workspace,
-            address::Address::new("workspace:test/unit:dev").unwrap(),
+            address::Address::new("/workspace-test-unit-dev").unwrap(),
         );
         let storage = storage_core::open_storage(
             &root.path().join("agent.sqlite"),
@@ -2518,7 +2844,7 @@ mod world_sender_tests {
         app.world_mut().insert_component(agent, storage);
         app.world_mut().insert_component(
             agent,
-            agent_core::Agent::new(
+            crate::test_support::agent(
                 "test".into(),
                 workspace,
                 AgentState::Running,
@@ -2528,17 +2854,14 @@ mod world_sender_tests {
         );
         app.world_mut().insert_component(
             workspace,
-            workspace_core::Workspace::new(
+            crate::test_support::workspace(
                 "test".into(),
                 root.path().join("workspace.yaml"),
                 root.path().to_owned(),
                 WorkspaceState::Running,
-                Default::default(),
-                None,
-                test_workspace_context(),
             ),
         );
-        let mut tools = Tools::new(test_probe());
+        let mut tools = Tools::new();
         tools
             .insert(
                 "test".into(),
@@ -2559,7 +2882,7 @@ mod world_sender_tests {
         let (reply, mut receiver) = oneshot::channel();
         handle_tool_execute(
             app.world_mut(),
-            ToolExecuteRequest {
+            ToolExecuteRequest::Registered {
                 id: "queued".into(),
                 agent,
                 turn: Some("turn".into()),
@@ -2583,8 +2906,8 @@ mod world_sender_tests {
     fn optional_context_markers_are_lua_nil_and_present_markers_survive_the_wire() {
         let lua = Lua::new();
         let mut context = ToolContext {
-            agent_address: "agent:test/source:dev".into(),
-            workspace: serde_json::json!({"address":"workspace:test/unit:dev","name":"test","project_root":"/project"}),
+            agent_address: "/agents/test/source-dev".into(),
+            workspace: serde_json::json!({"address":"/workspace-test-unit-dev","name":"test","project_root":"/project"}),
             owner_agent: None,
             agent_name: "test".into(),
             turn: Some("turn".into()),
@@ -2619,7 +2942,7 @@ mod world_sender_tests {
             table.get::<LuaValue>("owner_agent").unwrap(),
             LuaValue::Nil
         ));
-        context.owner_agent = Some("agent:test/lifetime:dev".into());
+        context.owner_agent = Some("/agents/test/lifetime-dev".into());
         context.owner_task_id = Some("owner".into());
         context.binding = Some(serde_json::json!({"method": "echo"}));
         let wire = serde_json::to_vec(&context).unwrap();
@@ -2640,7 +2963,7 @@ mod world_sender_tests {
         assert_eq!(table.get::<String>("project_root").unwrap(), "/project");
         assert_eq!(
             table.get::<String>("owner_agent").unwrap(),
-            "agent:test/lifetime:dev"
+            "/agents/test/lifetime-dev"
         );
         host::Margatroid::install(
             &lua,

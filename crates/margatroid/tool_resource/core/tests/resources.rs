@@ -59,7 +59,7 @@ fn entry(path: &str, owner: Option<&str>) -> ToolEntry {
 
 #[test]
 fn records_reject_conflicts_and_borrow_without_io() {
-    let mut entries = Tools::new(crate::test_probe());
+    let mut entries = Tools::new();
     let alpha = entry("/missing/alpha", None);
     let beta = entry("/missing/beta", Some("task-a"));
     entries.insert("z".into(), alpha.clone()).unwrap();
@@ -107,7 +107,7 @@ fn records_reject_conflicts_and_borrow_without_io() {
 
 #[test]
 fn batches_validate_every_record_before_atomic_publication() {
-    let mut entries = Tools::new(crate::test_probe());
+    let mut entries = Tools::new();
     entries
         .insert("existing".into(), entry("/missing/existing", None))
         .unwrap();
@@ -320,10 +320,6 @@ fn required_files_cannot_follow_symlinks_outside_entry_directory() {
     }
 }
 
-fn test_probe<T>() -> client_core::UpdateProbe<T> {
-    client_core::UpdateProbe::new(|_| {})
-}
-
 #[test]
 fn revocation_targets_exact_registration_and_releases_binding_guards() {
     use std::sync::{
@@ -337,7 +333,7 @@ fn revocation_targets_exact_registration_and_releases_binding_guards() {
         }
     }
     let dropped = Arc::new(AtomicUsize::new(0));
-    let mut tools = Tools::new(test_probe());
+    let mut tools = Tools::new();
     let old = workspace_registration_id();
     tools
         .insert_registered_batch(
@@ -373,4 +369,26 @@ fn revocation_targets_exact_registration_and_releases_binding_guards() {
 }
 fn workspace_registration_id() -> tool_resource_core::RegistrationId {
     tool_resource_core::RegistrationId::fresh()
+}
+
+#[test]
+fn standalone_tools_observe_only_successful_mutations() {
+    let mut tools = Tools::new();
+    tools
+        .insert("before".into(), entry("/tool/before", None))
+        .unwrap();
+    let snapshots = Arc::new(Mutex::new(Vec::new()));
+    let published = snapshots.clone();
+    tools.observe(move |snapshot| published.lock().unwrap().push(snapshot));
+    tools
+        .insert("after".into(), entry("/tool/after", None))
+        .unwrap();
+    assert_eq!(snapshots.lock().unwrap()[0].len(), 2);
+    assert!(tools
+        .insert("after".into(), entry("/tool/duplicate", None))
+        .is_err());
+    tools.remove("missing");
+    assert_eq!(snapshots.lock().unwrap().len(), 1);
+    tools.remove("before");
+    assert_eq!(snapshots.lock().unwrap()[1][0].0, "after");
 }

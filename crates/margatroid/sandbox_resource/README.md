@@ -1,11 +1,11 @@
 # Sandbox Resource
 
-本轮共享Client槽位、统一写入口与异步监控已实现，尚未提交。具体函数和边界见本领域DESIGN及[DTO说明](../dto/README.md)；运行进程需使用新构建。
-sandbox_resource_core定义沙箱路径集合、文件读取方法、导入事件和错误，目标通过client_core共享发送能力连接网络，仍不依赖DTO或服务器plugin。sandbox_resource_plugin负责异步校验和路径登记，不依赖其他领域plugin，也不让core依赖address或其他领域core。
+本文描述当前源码的路径登记与通用观察契约，不表示运行中的daemon已经更新。具体入口见本领域DESIGN。
+sandbox_resource_core定义沙箱路径集合、文件读取方法、导入事件和错误，只依赖mecs与通用库，不依赖client_core、DTO或其他业务core。sandbox_resource_plugin负责异步校验和路径登记，不依赖其他领域plugin，也不让core依赖address或其他领域core。
 
 ## 导入与路径
 
-调用方plugin校验资源种类、Driver依赖和跨类别alias冲突，通过address定位policy.json后发送ImportSandbox。本插件校验文件，成功只登记Sandboxes中的alias与规范路径，不保存来源定位字符串或正文。
+调用方plugin校验资源种类和跨类别alias冲突，通过address定位policy.json后发送ImportSandbox。本插件校验文件，成功只登记Sandboxes中的alias与规范路径，不保存来源定位字符串或正文。
 
 MCL对同一目标的IMPORT串行受理，跨类别alias唯一性由MCL入口协调；各资源core只管理自己的集合，不新增通用绑定表或资源注册表。取消、目标失效或校验失败保留旧路径；发布成功后才通过原oneshot回复，不发送导入结果观察事件。
 
@@ -21,4 +21,6 @@ sandbox_use只选择alias，不缓存policy正文。每次Sandbox活动创建时
 
 异步校验直接返回Result<ImportOutput, ImportError>，System只路由，Handler负责发布及oneshot回复。所有结果保留原owner Entity，迟到结果不写入复用index的新实体。文件读取失败报告alias、实际路径和底层原因，不回显文件正文。
 
-Sandboxes与SelectedSandbox的同步可见变动分别经Sandboxes.insert/remove及SelectedSandbox.set统一入口，均带必需typed UpdateProbe。导入/替换、删除和选择提交成功后同步维护Agent公共沙箱视图并直投agent.sync；路径查询及策略读取不触发同步。
+Sandboxes与SelectedSandbox的同步可见变动分别经Sandboxes.insert/remove及SelectedSandbox.set统一入口，通过构造时注入的通用Arc回调通知。导入/替换、删除和选择提交成功后同步维护Agent公共沙箱视图并直投agent.sync；路径查询及策略读取不触发同步。
+
+SandboxObserverFactory由装配方注入，只提供每owner的列表/选择通用回调，不在core绑定网络身份。首次MCL sandbox_use可据此创建缺失的空集合和选择组件；空选择允许，非空alias仍须真实导入。实体地址使用绝对节点路径；文件资源继续由address解析type:scope/name:tag且tag必填，ImportSandbox携带解析后的真实path。

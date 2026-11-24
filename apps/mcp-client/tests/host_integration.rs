@@ -5,14 +5,13 @@ mod storage_fixture;
 
 #[cfg(target_os = "linux")]
 mod linux {
-    use agent_core::AgentState;
+    use agent_core::WorldAgentExt;
     use app_runtime_plugin::RuntimePlugin;
     use async_runtime_plugin::AsyncRuntimePlugin;
     use closure_plugin::{AppClosureExt, ClosurePlugin};
     use core_plugin::{App, Entity};
     use serde_json::{Value, json};
     use std::{
-        collections::BTreeSet,
         path::PathBuf,
         sync::{Arc, Mutex},
         time::{Duration, Instant},
@@ -23,7 +22,6 @@ mod linux {
     };
     use tool_plugin::ToolPlugin;
     use tool_resource_core::{ToolEntry, Tools, read_tool};
-    use workspace_core::WorkspaceState;
 
     type Reply = oneshot::Receiver<Result<ToolExecuteResponse, ToolError>>;
     const DEADLINE: Duration = Duration::from_secs(30);
@@ -61,7 +59,7 @@ mod linux {
             )
             .unwrap();
             let imported = read_tool(&resource.join("tool.toml")).unwrap();
-            let mut tools = Tools::new(crate::test_probe());
+            let mut tools = Tools::new();
             tools
                 .insert(
                     "mcp_register".into(),
@@ -80,40 +78,45 @@ mod linux {
                 .add_plugin(AsyncRuntimePlugin)
                 .add_plugin(ClosurePlugin)
                 .add_closure_system(RuntimePlugin::UPDATE)
-                .add_plugin(
-                    ToolPlugin::new(crate::test_binding())
-                        .with_runner_path(std::env::current_exe().unwrap()),
-                );
+                .add_plugin(ToolPlugin::new().with_runner_path(std::env::current_exe().unwrap()));
             super::storage_fixture::config_system(&mut app);
             let workspace = app.world_mut().spawn();
+            app.world_mut()
+                .insert_component(workspace, address::Address::new("/mcp").unwrap());
             app.world_mut().insert_component(
                 workspace,
-                address::Address::new("workspace:test/mcp:dev").unwrap(),
-            );
-            app.world_mut().insert_component(
-                workspace,
-                workspace_core::Workspace::new(
-                    "mcp-integration".into(),
-                    root.path().join("workspace.yaml"),
-                    root.path().to_owned(),
-                    WorkspaceState::Running,
-                    BTreeSet::new(),
-                    None,
-                    crate::test_workspace_context(),
-                ),
+                workspace_core::Workspace::new("mcp-integration".into(), root.path().to_owned(), {
+                    for kind in ["normal", "temporary", "archived"] {
+                        std::fs::create_dir_all(root.path().join("agents").join(kind)).unwrap();
+                    }
+                    workspace_core::WorkspaceDatabase::create(
+                        root.path().join("workspace.sqlite"),
+                        workspace_core::WorkspaceMetadata {
+                            address: "/mcp".into(),
+                            alias: "mcp-integration".into(),
+                            project_root: root.path().to_owned(),
+                        },
+                    )
+                    .unwrap()
+                }),
             );
             let agent = app.world_mut().spawn();
             super::storage_fixture::mount(app.world_mut(), agent, root.path());
             app.world_mut().insert_component(
                 agent,
                 agent_core::Agent::new(
-                    "mcp-integration".into(),
                     workspace,
-                    AgentState::Running,
-                    Some("integration-turn".into()),
-                    crate::test_agent_context(),
+                    workspace,
+                    "mcp-driver".into(),
+                    root.path().to_owned(),
                 ),
             );
+            app.world_mut()
+                .insert_component(agent, address::Address::new("/mcp/agent").unwrap());
+            app.world_mut().agent_ready(agent).unwrap();
+            app.world_mut()
+                .agent_set_turn(agent, Some("integration-turn".into()))
+                .unwrap();
             app.world_mut().insert_component(agent, tools);
             let (sender, mut reply) = oneshot::channel();
             app.world().emit_event(InitToolTasks {
@@ -133,7 +136,7 @@ mod linux {
         }
         fn execute(&mut self, id: &str, alias: &str, arguments: Value) -> Reply {
             let (sender, reply) = oneshot::channel();
-            self.app.world().emit_event(ToolExecuteRequest {
+            self.app.world().emit_event(ToolExecuteRequest::Registered {
                 id: id.into(),
                 agent: self.agent,
                 turn: Some("integration-turn".into()),
@@ -655,28 +658,4 @@ fn main() {
     }
     #[cfg(not(target_os = "linux"))]
     println!("host_integration: Linux supervisor test skipped on this platform");
-}
-
-fn test_binding() -> tool_core::TaskSyncBinding {
-    tool_core::TaskSyncBinding::new(
-        client_core::Clients::default(),
-        std::sync::Arc::from([]),
-        |snapshot| {
-            serde_json::to_string(&snapshot)
-                .map(|text| std::sync::Arc::new(client_core::ClientFrame::Text(text)))
-                .map_err(|_| client_core::ClientPrepareError::EncodeFailed)
-        },
-    )
-}
-
-fn test_agent_context() -> agent_core::AgentUpdateContext {
-    agent_core::AgentUpdateContext::new(|_, _, _| Vec::new(), |_, _| {})
-}
-
-fn test_workspace_context() -> workspace_core::WorkspaceUpdateContext {
-    workspace_core::WorkspaceUpdateContext::new(|_, _| {})
-}
-
-fn test_probe<T>() -> client_core::UpdateProbe<T> {
-    client_core::UpdateProbe::new(|_| {})
 }

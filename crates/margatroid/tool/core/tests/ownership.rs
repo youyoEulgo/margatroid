@@ -18,6 +18,7 @@ fn task(
         reply,
         tasks.update_context(),
         Some("test-turn".into()),
+        test_finish(),
     )
     .unwrap();
     tasks.register(id.into(), handle.clone()).unwrap();
@@ -78,19 +79,9 @@ fn abort_and_return_share_one_atomic_reply() {
     }
 }
 
-fn test_binding() -> tool_core::TaskSyncBinding {
-    tool_core::TaskSyncBinding::new(
-        client_core::Clients::default(),
-        std::sync::Arc::from([]),
-        |snapshot| {
-            serde_json::to_string(&snapshot)
-                .map(|text| std::sync::Arc::new(client_core::ClientFrame::Text(text)))
-                .map_err(|_| client_core::ClientPrepareError::EncodeFailed)
-        },
-    )
-}
 fn test_tasks() -> tool_core::ToolTasks {
-    let mut app = core_plugin::App::new();
-    let owner = app.world_mut().spawn();
-    tool_core::ToolTasks::new(owner, "agent:test/unit:dev".into(), test_binding())
+    tool_core::ToolTasks::new()
+}
+fn test_finish() -> tool_core::TaskFinish {
+    std::sync::Arc::new(|handle| Box::pin(async move { handle.wait_finished().await }))
 }

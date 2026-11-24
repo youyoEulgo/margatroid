@@ -1,8 +1,11 @@
-use app_runtime_plugin::WorldEventExt;
+use async_runtime_plugin::AsyncRuntimeHandle;
+use closure_plugin::WorldClosureExt;
 use core_plugin::World;
 use inference_core::{ActiveInference, InferenceRequest, InitInference};
 
-use crate::types::{InferenceCleanupFinished, InferenceLaunchError, InferenceLaunchOutput};
+use crate::types::{
+    HttpRuntime, InferenceCleanupFinished, InferenceLaunchError, InferenceLaunchOutput,
+};
 
 pub(crate) fn init_inference_system(world: &mut World) {
     let requests = world
@@ -16,7 +19,6 @@ pub(crate) fn init_inference_system(world: &mut World) {
 }
 
 pub(crate) fn inference_system(world: &mut World) {
-    // A launch result only closes the handoff; ActiveInference follows the real task.
     for result in world.event_reader::<Result<InferenceLaunchOutput, InferenceLaunchError>>() {
         if let Err(failure) = result {
             if let Some(fallback) = &failure.fallback {
@@ -42,6 +44,37 @@ pub(crate) fn inference_system(world: &mut World) {
     }
 }
 
+fn wake_current(world: &mut World, cleanup: InferenceCleanupFinished) {
+    if !cleanup.source.load(std::sync::atomic::Ordering::Acquire) {
+        return;
+    }
+    let Some(agent) = world
+        .get_component::<agent_core::Agent>(cleanup.agent)
+        .filter(|agent| {
+            agent.instance() == cleanup.instance && agent.state() != agent_core::AgentState::Closing
+        })
+    else {
+        return;
+    };
+    let Some(handle) = world
+        .get_component::<ActiveInference>(cleanup.agent)
+        .and_then(|active| active.current.as_ref())
+        .filter(|handle| {
+            handle.request_id == cleanup.request_id
+                && std::sync::Arc::ptr_eq(&handle.source_lease(), &cleanup.source)
+        })
+    else {
+        return;
+    };
+    if handle.is_finished() {
+        let _ = agent
+            .wake_slot()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .wake();
+    }
+}
+
 pub(crate) fn handle_cleanup_finished(world: &mut World, cleanup: InferenceCleanupFinished) {
     if !cleanup.source.load(std::sync::atomic::Ordering::Acquire) {
         return;
@@ -49,17 +82,30 @@ pub(crate) fn handle_cleanup_finished(world: &mut World, cleanup: InferenceClean
     let Some(handle) = world
         .get_component::<ActiveInference>(cleanup.agent)
         .and_then(|active| active.current.as_ref())
-        .filter(|handle| handle.request_id == cleanup.request_id)
+        .filter(|handle| {
+            handle.request_id == cleanup.request_id
+                && std::sync::Arc::ptr_eq(&handle.source_lease(), &cleanup.source)
+        })
+        .cloned()
     else {
         return;
     };
-    if !handle.is_finished() {
-        // The event may arrive before Tokio marks the supervisor task complete.
-        // Keep the wake pending until finish_turn can observe the real join.
-        world.send_event_after(cleanup, 1);
+    if handle.is_finished() {
+        wake_current(world, cleanup);
         return;
     }
-    if let Some(slot) = world.get_component::<lua_runtime_core::AgentWaitSlot>(cleanup.agent) {
-        let _ = slot.0.lock().unwrap_or_else(|e| e.into_inner()).wake();
-    }
+    let schedule = world
+        .get_resource::<HttpRuntime>()
+        .expect("inference runtime missing")
+        .schedule
+        .clone();
+    let sender = world.closure_sender(&schedule);
+    world
+        .get_resource::<AsyncRuntimeHandle>()
+        .expect("inference async runtime missing")
+        .spawn(async move {
+            if handle.wait_finished().await.is_ok() {
+                sender.send(move |world| wake_current(world, cleanup));
+            }
+        });
 }

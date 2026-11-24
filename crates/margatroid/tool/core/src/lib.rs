@@ -7,8 +7,8 @@ pub use components::ToolTasks;
 pub use error::{ToolError, ToolErrorKind};
 pub use events::{InitToolTasks, InitToolTasksReply, ToolExecuteReply, ToolExecuteRequest};
 pub use types::{
-    TaskReadResult, ToolConfiguration, ToolExecuteResponse, ToolExecutionLimits, ToolImage,
-    ToolTaskHandle, ToolTaskSnapshot,
+    TaskChildClose, TaskChildCloseFuture, TaskFinish, TaskReadResult, ToolConfiguration,
+    ToolExecuteResponse, ToolExecutionLimits, ToolImage, ToolTaskHandle, ToolTaskSnapshot,
 };
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
@@ -133,7 +133,10 @@ impl Write for BoundedCounter {
 }
 
 mod sync;
-pub use sync::{AgentTaskSnapshot, TaskSyncBinding, TaskUpdateContext};
+pub use sync::{
+    AgentTaskSnapshot, TaskChangeObserver, TaskRetireObserver, TaskSnapshotSource,
+    TaskUpdateContext,
+};
 
 mod lifetime;
 pub use lifetime::{TaskBinding, TaskScope};

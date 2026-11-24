@@ -147,17 +147,18 @@ fn fixture(home: &Path, address: std::net::SocketAddr) -> PathBuf {
     );
     write(
         &root,
-        "agent-drivers/margatroid/shutdown/dev/base.lua",
+        "agent-drivers/margatroid/shutdown/dev/main.lua",
         r#"
 function configure()return {timeout_ms=0}end
-function execute(_,context)
-local agent=margatroid.agent:create({name=context.name,config_path=context.resource_dir..'/setting.toml',ui_path=context.resource_dir..'/ui'})
+function execute(arguments,context)
+local agent=margatroid.agent:create({node_name=arguments.node_name,project_root=context.project_root,config_path=context.resource_dir..'/setting.toml',ui_path=context.resource_dir..'/ui'})
 local function command(text)
     local result = margatroid.mcl:execute(agent.address, text)
     assert(type(result)~='table' or not result.Error, 'shutdown fixture MCL failed')
 end
 command('IMPORT TOOL tool:margatroid/shutdown:dev AS shutdown')
 command('EFFECT ready')
+margatroid.task:return_result({address=agent.address})
 while true do margatroid:wait(agent.address) end
 end
 "#,
@@ -223,14 +224,15 @@ wait
     );
     write(
         &root,
-        "workspaces/margatroid/shutdown/dev/workspace.yaml",
-        &format!(
-            "project_root: {}\nmembers:\n  - name: fixture\n    driver: driver:margatroid/shutdown:dev\n    home_root: {}\n",
-            project.display(),
-            home.display()
-        ),
+        "agent-drivers/margatroid/shutdown/dev/tool.toml",
+        "schema_version=1\ndescription='shutdown Driver'\n",
     );
-    root.join("workspaces/margatroid/shutdown/dev/workspace.yaml")
+    write(
+        &root,
+        "agent-drivers/margatroid/shutdown/dev/input.schema.json",
+        r#"{"type":"object","properties":{"node_name":{"type":"string"}},"required":["node_name"],"additionalProperties":false}"#,
+    );
+    root.join("agent-drivers/margatroid/shutdown/dev/tool.toml")
 }
 
 async fn request(socket: &mut Socket, kind: &str, id: &str, message: Value) -> Value {
@@ -337,16 +339,11 @@ async fn shutdown_case(name: &str, repeat: bool) {
         startup.contains(&format!("WebSocket: ws://{address}/ws")),
         "{startup}"
     );
-    let started = request(
-        &mut socket,
-        "workspace.start",
-        "start",
-        json!({"address":"workspace:margatroid/shutdown:dev"}),
-    )
-    .await;
-    assert_eq!(started["type"], "workspace.start.result", "{started}");
+    let created = request(&mut socket, "workspace.create", "create", json!({"address":"/shutdown","alias":"Shutdown test","project_root":home.path().join("project")})).await;
+    assert_eq!(created["success"], true, "{created}");
+    let started = request(&mut socket, "agent.start", "start", json!({"mode":"new","workspace":"/shutdown","tool_path":home.path().join(".margatroid/agent-drivers/margatroid/shutdown/dev/tool.toml"),"arguments":{"node_name":"fixture"}})).await;
+    assert_eq!(started["type"], "agent.start.result", "{started}");
     assert_eq!(started["success"], true, "{started}");
-    assert!(started.get("workspace").is_none());
     let states = request(&mut socket, "agent.req", "agents", json!({})).await;
     assert_eq!(states["type"], "agent.res", "{states}");
     assert_eq!(states["success"], true, "{states}");
@@ -412,7 +409,7 @@ async fn shutdown_case(name: &str, repeat: bool) {
             .iter()
             .filter(|p| p.command.contains("--margatroid-tool-supervisor"))
             .count(),
-        2,
+        3,
         "{:?}",
         daemon.owned
     );
@@ -422,7 +419,7 @@ async fn shutdown_case(name: &str, repeat: bool) {
             .iter()
             .filter(|p| p.command.contains("--margatroid-tool-worker"))
             .count(),
-        2,
+        3,
         "{:?}",
         daemon.owned
     );
@@ -535,19 +532,25 @@ async fn non_running_shutdown_case(starting: bool, name: &str) {
     let program = if starting {
         r#"
 function configure()return {timeout_ms=0}end
-function execute(_,context)
- local agent=margatroid.agent:create({name=context.name,config_path=context.resource_dir..'/setting.toml',ui_path=context.resource_dir..'/ui'})
+function execute(arguments,context)
+ local agent=margatroid.agent:create({node_name=arguments.node_name,project_root=context.project_root,config_path=context.resource_dir..'/setting.toml',ui_path=context.resource_dir..'/ui'})
  local child=margatroid.process:start('/bin/sleep',{'600'})
  margatroid.files:write('initializing','ready')
  margatroid.task:receive()
 end
 "#
     } else {
-        include_str!("../../../resources/agent-drivers/margatroid/coder/dev/base.lua")
+        r#"
+function configure()return {timeout_ms=0}end
+function execute(arguments,context)
+ local agent=margatroid.agent:create({node_name=arguments.node_name,project_root=context.project_root,config_path=context.resource_dir..'/setting.toml',ui_path=context.resource_dir..'/ui'})
+ error('intentional Driver initialization failure')
+end
+"#
     };
     write(
         &home.path().join(".margatroid"),
-        "agent-drivers/margatroid/shutdown/dev/base.lua",
+        "agent-drivers/margatroid/shutdown/dev/main.lua",
         program,
     );
     let log_path = home.path().join("non-running-shutdown.log");
@@ -591,10 +594,12 @@ end
         json!({"client_type":"cli","name":"non-running-shutdown"}),
     )
     .await;
+    let created=request(&mut socket,"workspace.create","create",json!({"address":"/shutdown","alias":"Shutdown test","project_root":home.path().join("project")})).await;
+    assert_eq!(created["success"], true, "{created}");
     if starting {
         socket
             .send(Message::Text(
-                json!({"type":"workspace.start","id":"start","message":{"address":"workspace:margatroid/shutdown:dev"}})
+                json!({"type":"agent.start","id":"start","message":{"mode":"new","workspace":"/shutdown","tool_path":home.path().join(".margatroid/agent-drivers/margatroid/shutdown/dev/tool.toml"),"arguments":{"node_name":"fixture"}}})
                     .to_string()
                     .into(),
             ))
@@ -613,23 +618,25 @@ end
     } else {
         let response = request(
             &mut socket,
-            "workspace.start",
+            "agent.start",
             "start",
-            json!({"address":"workspace:margatroid/shutdown:dev"}),
+            json!({"mode":"new","workspace":"/shutdown","tool_path":home.path().join(".margatroid/agent-drivers/margatroid/shutdown/dev/tool.toml"),"arguments":{"node_name":"fixture"}}),
         )
         .await;
         assert_eq!(response["success"], false, "{response}");
         assert!(
-            response.to_string().contains("EFFECT model_set ?"),
+            response
+                .to_string()
+                .contains("intentional Driver initialization failure"),
             "{response}"
         );
     }
     let state = request(&mut socket, "workspace.req", "state", json!({})).await;
-    assert_eq!(
-        state["workspaces"][0]["status"],
-        if starting { "starting" } else { "error" },
-        "{state}"
-    );
+    assert_eq!(state["workspaces"][0]["status"], "running", "{state}");
+    if starting {
+        let agents = request(&mut socket, "agent.req", "starting-agent", json!({})).await;
+        assert_eq!(agents["agents"][0]["status"], "starting", "{agents}");
+    }
     daemon.owned = descendants(daemon.child.id());
     if starting {
         assert!(
@@ -641,7 +648,7 @@ end
             daemon.owned
         );
     }
-    // No workspace.stop request: the signal must find and clean this state itself.
+    // No Agent close request: the signal must find and clean these tasks itself.
     let began = Instant::now();
     signal(daemon.child.id(), name);
     let deadline = Instant::now() + LIMIT;
