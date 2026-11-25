@@ -25,28 +25,34 @@ pub(crate) fn workspace_agent(record: workspace_core::WorkspaceAgent) -> Workspa
         previous_alias: record.previous_alias,
     }
 }
+pub(crate) fn workspace(world: &World, entity: Entity) -> Option<(WorkspaceInfoDto, u64)> {
+    let value = world.get_component::<Workspace>(entity)?;
+    let changes = value.database.subscribe_changes();
+    let snapshot = changes.borrow();
+    let snapshot = snapshot.as_ref()?;
+    Some((
+        WorkspaceInfoDto {
+            address: address(world, entity)?,
+            alias: snapshot.metadata.alias.clone(),
+            project_root: value.project_root.to_string_lossy().into_owned(),
+            status: format!("{:?}", value.state).to_lowercase(),
+            agents: snapshot
+                .agents
+                .iter()
+                .cloned()
+                .map(workspace_agent)
+                .collect(),
+        },
+        snapshot.revision,
+    ))
+}
+
 pub(crate) fn workspaces(world: &World) -> Vec<WorkspaceInfoDto> {
     let mut rows: Vec<_> = world
         .query_with::<Workspace>()
         .result()
         .into_iter()
-        .filter_map(|entity| {
-            let value = world.get_component::<Workspace>(entity)?;
-            let records = value
-                .database
-                .subscribe_changes()
-                .borrow()
-                .as_ref()
-                .map(|snapshot| snapshot.agents.clone())
-                .unwrap_or_default();
-            Some(WorkspaceInfoDto {
-                address: address(world, entity)?,
-                alias: value.alias.clone(),
-                project_root: value.project_root.to_string_lossy().into_owned(),
-                status: format!("{:?}", value.state).to_lowercase(),
-                agents: records.into_iter().map(workspace_agent).collect(),
-            })
-        })
+        .filter_map(|entity| workspace(world, entity).map(|(row, _)| row))
         .collect();
     rows.sort_by(|a, b| a.address.cmp(&b.address));
     rows

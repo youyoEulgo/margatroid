@@ -116,6 +116,7 @@ export interface SidebarAgent {
   children: SidebarAgent[];
   category?: 'normal' | 'temporary' | 'archived';
   nodeName?: string | null;
+  registrationId?: string;
   running?: boolean;
 }
 export interface SidebarWorkspace {
@@ -456,6 +457,7 @@ export function buildWorkspaceSidebar(
         children: [],
         category: registration?.category ?? 'temporary',
         nodeName: registration?.node_name ?? null,
+        registrationId: registration?.id,
         running: !!state,
       }));
       const byNode = new Map<string, SidebarAgent>();
@@ -1983,15 +1985,14 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     workspaceNotice.value = 'Workspace alias updated.';
     sendQuery('workspace.req');
   }
-  async function renameAgentAlias(address: string, alias: string) {
+  async function renameAgentAlias(workspace: string, agentId: string, alias: string | null) {
     await workspaceRequest({
       type: 'agent.rename',
       id: randomId(),
-      message: { address, alias },
+      message: { workspace, agent_id: agentId, alias },
     });
     workspaceNotice.value = 'Agent alias updated.';
     sendQuery('workspace.req');
-    sendQuery('agent.req');
   }
   async function deleteWorkspace(address: string) {
     await workspaceRequest({ type: 'workspace.delete', id: randomId(), message: { address } });

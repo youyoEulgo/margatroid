@@ -64,9 +64,11 @@ ClientMessage：请求入站枚举，每个variant均为type、id和message信�
     WorkspaceReq { id: String, message: EmptyDto }
     WorkspaceCreate { id:String,message:WorkspaceCreateDto }
     WorkspaceDelete { id:String,message:WorkspaceTargetDto }
+    WorkspaceRename { id: String, message: WorkspaceRenameDto }
     AgentStart { id: String, message: AgentStartInputDto }
     AgentStop { id: String, message: AgentTargetDto }
     AgentArchive { id: String, message: AgentArchiveInputDto }
+    AgentRename { id: String, message: AgentRenameDto }
     AgentReq { id: String, message: EmptyDto }
     AgentUiReq { id: String, message: AgentTargetDto }
     AgentTurnReq { id: String, message: AgentTargetDto }
@@ -87,6 +89,8 @@ ServerMessage：响应及同步出站枚举，type之外的字段位于顶层，
     WorkspaceSync { workspaces: Vec<WorkspaceInfoDto> }
     WorkspaceCreateResult { id:String,success:bool,error:Option<ProtocolErrorDto> }
     WorkspaceDeleteResult { id:String,success:bool,error:Option<ProtocolErrorDto> }
+    WorkspaceRenameResult { id: String, success: bool, error: Option<ProtocolErrorDto> }
+    AgentRenameResult { id: String, success: bool, error: Option<ProtocolErrorDto> }
     AgentStartResult { id: String, success: bool, error: Option<ProtocolErrorDto> }
     AgentStopResult { id: String, success: bool, error: Option<ProtocolErrorDto> }
     AgentArchiveResult { id: String, success: bool, error: Option<ProtocolErrorDto> }
@@ -154,6 +158,15 @@ WorkspaceCreateDto
     address: AddressDto
     alias: String
     project_root: String--绝对目录
+WorkspaceRenameDto
+    address: AddressDto--实际Workspace节点路径
+    alias: String--必填非空、非全空白，无控制字符，不trim、不要求唯一
+AgentRenameDto
+    workspace: AddressDto--实际Workspace节点路径
+    agent_id: String--持久登记记录id，非空，不用运行地址或节点名替代
+    alias: Option<String>--wire必填nullable；null清空，Some遵循上述别名规则
+    行为：严格拒绝未知字段；alias不能通过省略表达清空，空字符串也不等于null。
+    rename只修改展示别名；不重命名节点、目录或地址，成功result仅id/success，失败error，提交后workspace.sync交付同一已提交快照。
 AgentStartInputDto：以mode为判别字段
     Existing { workspace: AddressDto, node_name: String }
     New { workspace: AddressDto, tool_path: String, arguments: serde_json::Value }

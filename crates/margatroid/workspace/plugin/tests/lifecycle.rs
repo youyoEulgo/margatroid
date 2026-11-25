@@ -259,9 +259,9 @@ fn create_prepares_database_then_starts_entity_and_replies_original_once() {
     let entity = receive(&mut app, &mut rx).unwrap();
     assert!(reply.lock().unwrap().is_none());
     let workspace = app.world().get_component::<Workspace>(entity).unwrap();
-    assert_eq!(workspace.alias, "Created");
+    assert_eq!(workspace.database.metadata().unwrap().alias, "Created");
     assert!(workspace.database.is_open());
-    assert_eq!(workspace.database.metadata().address, "/created");
+    assert_eq!(workspace.database.metadata().unwrap().address, "/created");
     assert_eq!(
         workspace.database.path(),
         root.path().join("created/workspace.sqlite")
@@ -337,7 +337,7 @@ fn new_and_existing_start_forward_the_exact_tool_reply_and_arguments() {
     for existing in [false, true] {
         let (sender, mut rx) = tool_reply();
         let args = if existing {
-            record.tool_arguments.clone()
+            json!({"node_name":"coder","alias":"coder","path":"src"})
         } else {
             json!({"node_name":"new-node","alias":"New","path":"custom"})
         };
@@ -975,4 +975,80 @@ fn work_completion_marker_is_consumed_after_workspace_start_installation() {
     let entity = receive(&mut app, &mut receiver).unwrap();
     until(&mut app, |_| pending.is_idle());
     assert_eq!(app.world().entity_by_address("/created").unwrap(), entity);
+}
+
+#[test]
+fn existing_start_rebuilds_identity_from_record_and_retains_driver_parameters() {
+    let root = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let db = disk_workspace(root.path(), "demo", project.path());
+    let op = db.try_operation("coder").unwrap();
+    let original_arguments = json!({"node_name":"stale-node","alias":"Old alias","path":"src","driver_setting":{"mode":"review"}});
+    let record = db
+        .prepare_agent(
+            &op,
+            "/demo".into(),
+            Some("coder".into()),
+            Some("Old alias".into()),
+            "/tools/driver/tool.toml".into(),
+            original_arguments.clone(),
+        )
+        .unwrap();
+    fs::create_dir(db.agent_directory(&record).unwrap()).unwrap();
+    db.commit_agent(&op, record.clone()).unwrap();
+    drop(op);
+    db.close().unwrap();
+    let mut app = app(root.path());
+    let entity = loaded(&mut app, "/demo");
+    let database = app
+        .world()
+        .get_component::<Workspace>(entity)
+        .unwrap()
+        .database
+        .clone();
+    for alias in [Some("Current alias".to_owned()), None] {
+        database
+            .rename_agent_alias(&record.id, alias.clone())
+            .unwrap();
+        let (sender, _rx) = tool_reply();
+        app.world().emit_event(StartWorkspaceAgent::Existing {
+            workspace: entity,
+            node_name: "coder".into(),
+            reply: sender,
+        });
+        until(&mut app, |app| {
+            !app.world().get_resource::<Captured>().unwrap().0.is_empty()
+        });
+        let request = app
+            .world_mut()
+            .get_resource_mut::<Captured>()
+            .unwrap()
+            .0
+            .remove(0);
+        let ToolExecuteRequest::Path {
+            initiator,
+            path,
+            arguments,
+            ..
+        } = request
+        else {
+            panic!("expected path execution")
+        };
+        assert_eq!(initiator, entity);
+        assert_eq!(path, record.tool_path);
+        let mut expected = original_arguments.clone();
+        expected["node_name"] = json!("coder");
+        match alias {
+            Some(value) => expected["alias"] = json!(value),
+            None => {
+                expected.as_object_mut().unwrap().remove("alias");
+            }
+        }
+        assert_eq!(arguments, expected);
+        assert_eq!(
+            database.agent_by_id(&record.id).unwrap().tool_arguments,
+            original_arguments,
+            "dispatch is not itself a successful Driver startup"
+        );
+    }
 }

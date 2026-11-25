@@ -25,7 +25,7 @@ const emit = defineEmits<{
   deleteWorkspace: [address: string];
   startAgent: [workspace: string, nodeName: string];
   stopAgent: [address: string];
-  renameAgent: [address: string, alias: string];
+  renameAgent: [workspace: string, agentId: string, alias: string | null];
   archiveAgent: [workspace: string, nodeName: string];
 }>();
 
@@ -55,8 +55,8 @@ function openRename(workspace: SidebarWorkspace) {
   workspaceMode.value = 'rename';
 }
 function saveRename(workspace: SidebarWorkspace) {
-  const alias = workspaceAlias.value.trim();
-  if (!alias) return;
+  const alias = workspaceAlias.value;
+  if (!alias.trim()) return;
   emit('renameWorkspace', workspace.address, alias);
   closeMenus();
 }
@@ -74,10 +74,11 @@ function toggleAgentMenu(workspace: SidebarWorkspace, agent: SidebarAgent) {
   agentAlias.value = agent.name;
   menuAddress.value = '';
 }
-function saveAgentAlias(agent: SidebarAgent) {
-  const alias = agentAlias.value.trim();
-  if (!alias || !agent.id) return;
-  emit('renameAgent', agent.id, alias);
+function saveAgentAlias(workspace: SidebarWorkspace, agent: SidebarAgent) {
+  if (!agent.registrationId) return;
+  const alias = agentAlias.value;
+  if (alias !== '' && !alias.trim()) return;
+  emit('renameAgent', workspace.address, agent.registrationId, alias === '' ? null : alias);
   closeMenus();
 }
 function toggleAgentRun(workspace: SidebarWorkspace, agent: SidebarAgent) {
@@ -254,7 +255,7 @@ onBeforeUnmount(() => document.removeEventListener('click', closeMenus));
                     <Archive :size="13" /> Archive agent
                   </button>
                 </template>
-                <form v-else @submit.prevent="saveAgentAlias(agent)">
+                <form v-else @submit.prevent="saveAgentAlias(workspace, agent)">
                   <input v-model="agentAlias" class="field-input" placeholder="Agent alias" />
                   <div>
                     <button type="button" @click="agentMode = 'menu'">Cancel</button

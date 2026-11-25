@@ -56,10 +56,8 @@ impl Fixture {
         let workspace = app.world_mut().spawn();
         app.world_mut()
             .insert_component(workspace, Address::new("/demo").unwrap());
-        app.world_mut().insert_component(
-            workspace,
-            Workspace::new("Demo".into(), root.path().into(), database),
-        );
+        app.world_mut()
+            .insert_component(workspace, Workspace::new(root.path().into(), database));
         let tasks = ToolTasks::new();
         let (tx, _) = oneshot::channel();
         let captured = tasks.clone();

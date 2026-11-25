@@ -53,7 +53,7 @@ impl Fixture {
         let workspace = app.world_mut().spawn();
         app.world_mut().insert_component(
             workspace,
-            workspace_core::Workspace::new("test".into(), directory.path().to_owned(), {
+            workspace_core::Workspace::new(directory.path().to_owned(), {
                 for kind in ["normal", "temporary", "archived"] {
                     std::fs::create_dir_all(directory.path().join("agents").join(kind)).unwrap();
                 }

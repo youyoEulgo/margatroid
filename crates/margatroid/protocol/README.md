@@ -2,7 +2,7 @@
 
 Protocol 定义纯 JSON 信封、生命周期请求、分类状态、记录页与消息同步，只依赖标准库、serde 等通用库，不依赖业务 core、plugin、address 或 World。实体所属类型、任务受理、调用权限和真实执行结果由 DTO 与领域实现核对。
 
-当前源码实现46种消息：18种客户端请求、28种服务端消息，其中18种一次性响应、10种主动同步。此说明描述源码契约，不表示运行中的 daemon、客户端或独立 API 仓库中的机器 Schema 已更新。字段说明见[WebSocket API](../../../../doc/api/WS_API.md)，执行链见[API Entry](../../../../doc/api/API_ENTRY.md)。
+当前源码实现52种消息：21种客户端请求、31种服务端消息，其中21种一次性响应、10种主动同步。此说明描述源码契约，不表示运行中的 daemon、客户端或独立 API 仓库中的机器 Schema 已更新。字段说明见[WebSocket API](../../../../doc/api/WS_API.md)，执行链见[API Entry](../../../../doc/api/API_ENTRY.md)。
 
 ## 网络消息
 
@@ -15,6 +15,9 @@ model.config.update / model.config.update.result
 workspace.req / workspace.res / workspace.sync
 workspace.create / workspace.create.result
 workspace.delete / workspace.delete.result
+workspace.rename / workspace.rename.result
+agent.rename / agent.rename.result
+resource.req / resource.res
 agent.req / agent.res / agent.sync
 agent.start / agent.start.result
 agent.stop / agent.stop.result
@@ -30,7 +33,7 @@ agent.message.chunk.sync / agent.message.full.sync
 mcl.execute / mcl.execute.result
 ```
 
-旧 Workspace start/stop/restart/update/rename 及其结果不再接受，也没有 agent.restart、统一 state 包或独立 finished 消息的兼容入口。req/res 为纯查询，sync 由实际变化驱动；两者都不执行目录扫描、安装监控或推进工具输出游标。sync 与命令响应按各自完成时机发送，不能互相替代。
+旧 Workspace start/stop/restart/update 及其结果不再接受；workspace.rename现在只表示别名修改，不提供旧节点或目录重命名语义。也没有 agent.restart、统一 state 包或独立 finished 消息的兼容入口。req/res 为纯查询，sync 由实际变化驱动；两者都不执行目录扫描、安装监控或推进工具输出游标。sync 与命令响应按各自完成时机发送，不能互相替代。
 
 ## 节点与生命周期
 
@@ -38,7 +41,9 @@ mcl.execute / mcl.execute.result
 
 `WorkspaceCreateDto` 携带 address、alias、绝对 project_root；创建地址只允许根下单段节点。`WorkspaceInfoDto` 提供 address、alias、project_root、status、agents，不再提供 YAML 定义或扫描项 path。Workspace 状态为 running/deleting/error；agents 是数据库确认提交的登记记录，类别为 normal/temporary/archived，不表示实体运行状态。
 
-`WorkspaceAgentInfoDto` 保留 id、parent_node、node_name、alias、category、tool_path、tool_arguments、previous_node_name、previous_alias。nullable 字段必须出现；普通节点名非空且在同一 Workspace 内唯一，临时及归档记录的 node_name 为 null。tool_arguments 是完整 Driver 参数对象，保持自定义内容，不被协议递归当成 AgentMessage 解释。
+`WorkspaceAgentInfoDto` 保留 id、parent_node、node_name、alias、category、tool_path、tool_arguments、previous_node_name、previous_alias。nullable 字段必须出现；普通节点名非空且在同一 Workspace 内唯一，临时及归档记录的 node_name 为 null。tool_arguments 是上次实际进入登记提交的完整 Driver 调用记录，保留自定义内容，不被协议递归当成 AgentMessage 解释。Existing 启动将以当前登记的node_name/alias重建同名参数，不把这份历史记录当成别名权威来源。
+
+`WorkspaceRenameDto`使用address和非空alias；`AgentRenameDto`使用workspace、持久agent_id和必填nullable alias，null表示清空。alias必须非空、非全白、无控制字符且最多512字节；不裁剪合法首尾空白。agent_id保留opaque字符串，非空、非全白、无控制且最多512字节，不当作路径解析。严格拒绝Agent旧address定位或省略alias，成功结果只含type/id/success，别名由workspace.sync交付；不改变节点、目录、Driver参数或归档previous_alias。
 
 `AgentStartInputDto` 使用 mode 区分两个互斥变体：
 

@@ -1,62 +1,31 @@
 # Workspace
 
-本轮共享Client槽位、统一写入口与异步监控已实现，尚未提交。具体函数和边界见本领域DESIGN及[DTO说明](../dto/README.md)；运行进程需使用新构建。
-workspace_core定义Workspace组件、状态、事件、定义和专属线程能力，目标通过client_core共享发送能力连接网络，仍不依赖DTO或服务器plugin。workspace_plugin依赖workspace_core、address和所需领域core，负责运行生命周期，不依赖其他plugin。
+Workspace 的权威持久信息保存在 `workspaces/<节点名>/workspace.sqlite`。运行组件只持有 project_root、state 和数据库句柄，不另存展示别名；实体地址由 Address 组件提供。具体结构和函数见 [DESIGN.md](DESIGN.md)。
 
-## 配置与运行实例
+## 加载与生命周期
 
-Margatroid启动时传入配置根目录，调用WorkspacePlugin::open读取并校验全部工作区定义，再安装插件。文件读取在安装前同步调用WorkspaceDefinitions::open完成，失败直接返回启动入口；build安装已加载的WorkspaceDefinitions和共享运行目录，应用启动后在既有异步设施建立定义磁盘监控；文件IO不进入同步System。
+启动时扫描管理根中的 Workspace 目录，读取严格版本数据库并恢复已记录的归档意图，再在 World 挂载 Workspace。状态为 Running、Deleting、Error；创建、删除、Driver 启动及 Agent 归档沿现有事件与异步闭包执行，不建立专属 Workspace 执行线程。
 
-WorkspaceDefinitions是展示和启动共同使用的定义缓存，不再限定为展示目录。所有定义加载只有一条全量重载流程：读取配置根下全部定义、完整校验、原子更新缓存。不提供针对某个Workspace单独读取并启动的旁路。
+创建要求管理目录不存在、项目根为实际目录且与管理目录互不包含。删除先关闭受理门，等待在途操作和所属任务真实清理，关闭数据库，再删除管理目录；项目根不删除。错误保留可诊断状态，不以取消或丢弃 Future 代替真实完成。
 
-全量reload仅为内部能力，公开workspace.reload已删除。Workspace和单独Agent的启动执行同一全量reload，成功后再从缓存读取目标Workspace及成员参数启动；失败即结束操作，不能继续从旧缓存启动。
+## Agent 登记与启动
 
-reload返回同一次发布的不可变缓存快照，后续启动以该快照为数据源，避免并发重载使“刚重载”和“启动使用”的内容分离。Workspace批量启动成员复用这一份快照，不对每个成员重复扫描。单独启动Agent则先完成一次全量reload，从新快照选择所属Workspace与成员，再调用既有Agent生命周期能力。
+数据库记录 id、父节点、普通节点名、别名、目录类别、Driver 工具路径及完整调用参数。普通、临时、归档类别与 Agent 运行状态独立；未运行和归档记录仍可查询和修改展示别名。
 
-重启仅封装普通StopWorkspace和StartWorkspace：先关闭并等待旧实例真实退出销毁，再由普通启动流程全量reload并从新快照启动。启动底层步骤不再重复重载或回源单个文件。运行实例仍以Entity/Address定位，定义缓存不代替实例身份；更新缓存不会自动热改已有实例。Driver程序读取继续由AgentDriver领域完成，不把Lua程序混入Workspace定义缓存。
+Existing 启动以已登记的工具入口和上次实际调用参数为基础，用当前登记的 node_name 和 alias 重新整理参数；alias 已清空时移除旧 alias。其他 Driver 自定义参数保持原值，New 仍原样使用调用参数。Driver 创建注入方法在操作凭证保护下准备文件、连接 AgentStorage、提交登记并等待 StartAgent。已有记录的 alias 始终以数据库列为准，不接受启动参数反向覆盖；tool_arguments 只在实际登记提交时更新为本次调用记录，失败前不预写。普通目录为 `agents/normal/<node_name>`；临时目录使用独立 id；归档移动到新分配的归档目录，保留 previous_node_name 和 previous_alias。
 
-## 生命周期
+## 数据库提交快照与别名
 
-状态为Starting、Running、Error、Stopping，不存在Restarting。关闭受理后立即Stopping，真实清理结束才移除Entity；重启先关闭旧Lua、Agent和线程，随后Starting读取新定义并启动。新启动失败保留Error和诊断，不把旧实例伪装恢复为Running。重启不检查工具任务是否非空；常驻MCP任务也按普通停止路径终止并等待真实清理。
+数据库是别名的唯一权威来源。WorkspaceRecordsSnapshot 在同一版本中提供 metadata（address、alias、project_root）与全部 Agent 登记；metadata() 克隆这份确认快照，不读取启动时固定副本。登记、归档及别名事务均在 COMMIT 后发布完整快照，内容不变不递增 revision。
 
-同一Schedule依次挂载停止、重启、启动System，直接使用mecs添加顺序。System只收集事件并路由，闭包直接返回Result，不增加结果包装事件。
+`rename_workspace_alias(alias)` 只改 Workspace 的展示别名；`rename_agent_alias(agent_id, alias)` 按持久 id 修改当前 Agent 别名，None 表示清空。非空别名必须非全白、无控制字符，保留原始前后空白、不要求唯一。Agent 节点、地址、目录、Driver 参数和 previous_alias 不变，不重启运行实例。
 
-启动创建Workspace实体及专属线程，再按本次文件解析结果为各成员分别创建并发送带独立oneshot回复端的StartAgent；成员文件固定为定义所在目录agents/<成员名>/state.sqlite与setting.toml，不回退到其他设置文件名；闭包先发出全部成员事件，再并发等待每个Agent完整启动回复。成员失败不抹除成功成员；线程建立且成员请求收口后进入Running，并返回成员诊断。
+修改使用数据库操作受理凭证，Agent 别名与创建、归档共用目标操作键，冲突返回 Busy。已受理写入计入 wait_idle，关闭必须等待真实事务结束；关闭受理后拒绝新写入。找不到 Agent 记录返回 AgentRecordMissing；HTTP/WS 边界要求 Workspace 仍为 Running。
 
-关闭等待已受理成员创建收口，停止全部Agent并等待活动及MCL清理，最后退出并join专属线程。全部完成后销毁Workspace；清理未确认时保留宿主并报告失败。重启复用关闭和启动流程，Stopping真实完成后再Starting，旧线程退出后才创建新线程。
+DTO 从同一确认快照取得 Workspace 和 Agent 别名，经原有 workspace.sync 发布，不新增 alias 组件、别名同步事件或逐帧数据库查询。World 读取不执行 SQL；磁盘 SQLite/WAL 文件事件不能替代数据库提交通知。
 
-## 线程管理
+## 边界
 
-WorkspaceExecutor持有提交入口和关闭能力。Send工厂在专属线程中创建可非Send的Future，用于Driver等本地任务；线程不持有ECS World。
+core 只依赖 mecs 与通用库，通过通用回调提供生命周期通知；网络和客户端投影留在 plugin。没有 YAML 定义缓存、旧资源地址 Workspace、旧目录迁移或兼容重命名入口。`workspace.rename` 是展示别名修改，不是节点或目录重命名。
 
-关闭提交入口不终止已有任务，Driver仍能完成退出。需要额外提交的清理工作使用明确的内部能力，不重新开放普通入口。生命周期闭包运行在mecs全局异步设施，不运行在待关闭的Workspace线程上；join不阻塞ECS线程。
-
-
-新API设计将统一缓存定义与自身运行状态由DTO合成Workspace对象，不再提供definitions wire子域。WorkspaceDefinitions::reload是全部重载入口，供内部启动和磁盘监控调用，不再有公开reload接口。全量加载及Workspace生命周期已共用同一core入口，不改变System或公开事件字段。扫描移除但仍运行的实例保留展示，允许停止；重启先停止，后续普通启动要求本次全量重载后的缓存包含目标定义。停止完成后，该来源已移除的项退出列表。
-
-全量reload使用共享串行锁覆盖读取、校验和发布；返回的WorkspaceDefinitionSnapshot持有不可变Arc，后续重载不会改变已取得的启动材料。未配置来源的默认资源reload明确报错，不把旧entries伪装成刚读到的新数据。配置来源保留目录或单文件两种既有装配形式；单文件形式的全量集合就是该配置文件，不新增按请求目标单独读取的旁路。
-
-生命周期请求携带WorkspaceOperationReply，领域操作收口后直接回复原oneshot。Workspace自身持有本次启动使用的完整definition，用于运行快照和扫描来源移除后的展示。req只读取已发布目录与实例定义，来源已移除时停止仍可执行；重启先完成停止，随后普通启动若找不到定义则返回启动失败。领域失败通过WorkspaceFailure投影，成功收口清除对应故障。
-
-一个StartAgent只启动一个Agent。Workspace持有成员启动的并发编排，先发送全部单成员事件，再join_all收齐全部结果；Agent领域只处理自己的单次生命周期操作。
-
-定义监控和内部启动扫描共用全量校验入口，变化后通过update_workspace提交新缓存及workspace.sync；运行状态、成员和故障也从同一入口更新。来源变化不自动改写运行实例定义或执行生命周期动作。监控覆盖父目录上的创建、删除及原子替换，100ms合并写入，失败保留最后有效集合，取消等待真实worker结束。
-
-
-当前工作树已实现统一Lua：复用既有资源挂载、Storage、MCL队列、任务监督、进程回收及同步入口。Workspace先启动独立Lua任务；Agent创建由公共Lua注入能力提交StartAgent，Agent不再启动/持有/终止Lua VM。执行者与目标分开，Agent统一归属Workspace，创建来源由实际任务绑定记录，配置按明确初值文件初始化持久化，UI按创建时传入目录直接监控，模型通过EFFECT model_set配置。公共mcl.execute指定目标，wait(agent)登记本次唤醒句柄；关闭Agent使用margatroid.agent:stop(address)注入方法提交原StopAgent并外部监督，不经过MCL。EFFECT tool_call只接收调用数组。Driver专用manifest依赖裁剪取消；工具发现元数据保持。初始化及全新子代理资源已实现；前端源码不在本轮修改范围内。
-
-四态契约：Agent/Workspace公开starting、running、error、stopping；Agent挂载完成不是ready，MCL允许starting/running，推理和工具显式携带turn时要求running且匹配，省略时为Starting/Running自由调用。Lua创建的Agent在返回信息前绑定创建者真实任务scope与AgentSession；return_result不结束生命周期，任务取消/退出会提交原StopAgent并等待全部绑定Agent实际移除后才确认任务清理。主动停止Agent会解绑；异常日志沿原Agent存储处理，正常结束和取消不误报故障。关闭使用Lua agent.stop注入，不提供MCL agent_stop。
-
-Agent创建注入接口为name/config_path/ui_path，拒绝旧resource_dir创建参数。配置仅首次从config_path初始化至Agent持久setting.toml，后续重启保留已修改配置；ui_path始终直接引用与监控，不创建Agent本地UI，不复制、覆盖、删除已有UI副本，也不把旧副本作为回退来源。Lua程序加载只读取程序文件，不推导或读取同目录配置。
-
-Workspace文件HTTP访问已实现：文件根取实际运行实例project_root，完整Workspace Address唯一定位；Starting/Running/Error可读，Stopping拒绝，实例不存在404。不使用Agent数据目录或ui_path，也不从变更后的定义缓存替换运行根。
-
-## 地址化资源管理
-
-Workspace身份为workspace:<scope>/<name>:<tag>，当前内置scope=margatroid、内置资源显式使用tag=dev，地址不提供默认tag，管理目录workspaces/<scope>/<name>/<tag>/workspace.yaml。定义不保存name，名称只取地址name，更名只能走rename。创建/修改提交结构化definition；create创建目录且不启动，update完整替换定义不改变地址；rename移动整个管理目录及其Agent配置/历史/快照，不合并已存在目标；delete只删除管理目录，绝不删除project_root项目目录。
-
-公开新增workspace.create/update/rename/delete，start/stop/restart改为address参数；旧path和workspace.reload不保留别名。update/rename/delete必须完全停止，starting/running/error/stopping均不允许。definitions.reload_lock与active路径登记共同裁决磁盘操作和启动，停止真实完成才release；修改成功重扫并由同一observer发布sync。磁盘监控覆盖三层资源目录新增/删除/改名及定义替换，不靠客户端reload发现。
-
-旧local/latest资源目录及原单层Workspace布局不自动迁移；本次仅修改源码、内置资源和隔离测试，用户持久配置、历史及项目目录保持原样。Agent地址作用域为Workspace scope-name-tag，例如agent:margatroid-project-dev/coder:dev，冲突明确拒绝，无父地址哈希。
-
-Workspace YAML顶层只保存project_root和成员配置，网络definition只保存project_root及agents；顶层name已删除且作为未知字段拒绝，不自动忽略或迁移。成员name保持原语义。运行实例名称从Workspace地址创建时取得，后续定义安装只更新project_root及成员定义，不覆盖运行名称。
+源码和隔离测试更新不表示用户数据库已被修改，也不表示正在运行的 daemon 已采用新构建。

@@ -48,6 +48,13 @@ pub enum ClientMessage {
         id: String,
         message: WorkspaceTargetDto,
     },
+    #[serde(rename = "workspace.rename")]
+    WorkspaceRename {
+        id: String,
+        message: WorkspaceRenameDto,
+    },
+    #[serde(rename = "agent.rename")]
+    AgentRename { id: String, message: AgentRenameDto },
     #[serde(rename = "agent.req")]
     AgentReq { id: String, message: EmptyDto },
     #[serde(rename = "agent.ui.req")]
@@ -90,6 +97,7 @@ impl ClientMessage {
             Self::AgentStop { id, .. } => id,
             Self::AgentArchive { id, .. } => id,
             Self::WorkspaceCreate { id, .. } | Self::WorkspaceDelete { id, .. } => id,
+            Self::WorkspaceRename { id, .. } | Self::AgentRename { id, .. } => id,
             Self::AgentReq { id, .. } => id,
             Self::AgentUiReq { id, .. } => id,
             Self::AgentTurnReq { id, .. } => id,
@@ -161,6 +169,16 @@ pub enum ServerMessage {
         error: Option<ProtocolErrorDto>,
     },
     WorkspaceDeleteResult {
+        id: String,
+        success: bool,
+        error: Option<ProtocolErrorDto>,
+    },
+    WorkspaceRenameResult {
+        id: String,
+        success: bool,
+        error: Option<ProtocolErrorDto>,
+    },
+    AgentRenameResult {
         id: String,
         success: bool,
         error: Option<ProtocolErrorDto>,
@@ -363,6 +381,20 @@ pub(crate) enum ServerWire {
     },
     #[serde(rename = "workspace.delete.result")]
     WorkspaceDeleteResult {
+        id: String,
+        success: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<ProtocolErrorDto>,
+    },
+    #[serde(rename = "workspace.rename.result")]
+    WorkspaceRenameResult {
+        id: String,
+        success: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<ProtocolErrorDto>,
+    },
+    #[serde(rename = "agent.rename.result")]
+    AgentRenameResult {
         id: String,
         success: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -589,6 +621,12 @@ impl From<ServerMessage> for ServerWire {
             }
             ServerMessage::WorkspaceDeleteResult { id, success, error } => {
                 Self::WorkspaceDeleteResult { id, success, error }
+            }
+            ServerMessage::WorkspaceRenameResult { id, success, error } => {
+                Self::WorkspaceRenameResult { id, success, error }
+            }
+            ServerMessage::AgentRenameResult { id, success, error } => {
+                Self::AgentRenameResult { id, success, error }
             }
             ServerMessage::AgentRes {
                 id,
@@ -831,6 +869,12 @@ impl From<ServerWire> for ServerMessage {
             ServerWire::WorkspaceDeleteResult { id, success, error } => {
                 Self::WorkspaceDeleteResult { id, success, error }
             }
+            ServerWire::WorkspaceRenameResult { id, success, error } => {
+                Self::WorkspaceRenameResult { id, success, error }
+            }
+            ServerWire::AgentRenameResult { id, success, error } => {
+                Self::AgentRenameResult { id, success, error }
+            }
             ServerWire::AgentRes {
                 id,
                 success,
@@ -1051,6 +1095,7 @@ impl ServerMessage {
             Self::AgentStartResult { id, .. } => Some(id),
             Self::AgentStopResult { id, .. } => Some(id),
             Self::AgentArchiveResult { id, .. } => Some(id),
+            Self::WorkspaceRenameResult { id, .. } | Self::AgentRenameResult { id, .. } => Some(id),
             Self::WorkspaceCreateResult { id, .. } | Self::WorkspaceDeleteResult { id, .. } => {
                 Some(id)
             }
@@ -1410,6 +1455,28 @@ pub struct WorkspaceCreateDto {
     pub address: AddressDto,
     pub alias: String,
     pub project_root: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceRenameDto {
+    pub address: AddressDto,
+    pub alias: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentRenameDto {
+    pub workspace: AddressDto,
+    pub agent_id: String,
+    #[serde(deserialize_with = "required_nullable_alias")]
+    pub alias: Option<String>,
+}
+
+fn required_nullable_alias<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error> {
+    Option::<String>::deserialize(deserializer)
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

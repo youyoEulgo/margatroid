@@ -211,9 +211,11 @@ pub(crate) fn handle_tool_execute(world: &mut World, event: ToolExecuteRequest) 
             })
             .transpose()?;
         let workspace_id = workspace_of(world, request.agent).ok();
-        let workspace = workspace_id.and_then(|id| world.get_component::<Workspace>(id).map(|w| {
-            json!({"address": world.get_component::<address::Address>(id).map(|a| a.as_str()), "alias": w.alias, "project_root": w.project_root})
-        })).unwrap_or(Value::Null);
+        let workspace = workspace_id.map(|id| {
+            let workspace = world.get_component::<Workspace>(id).ok_or_else(||error(Kind::InvalidRequest,"Workspace component is missing"))?;
+            let metadata = workspace.database.metadata().map_err(|_|error(Kind::InvalidRequest,"Workspace metadata is unavailable"))?;
+            Ok::<_, ToolError>(json!({"address": world.get_component::<address::Address>(id).map(|a| a.as_str()), "alias": metadata.alias, "project_root": workspace.project_root}))
+        }).transpose()?.unwrap_or(Value::Null);
         let project_root = world
             .get_component::<Agent>(request.agent)
             .filter(|a| !a.project_root().as_os_str().is_empty())
@@ -1836,7 +1838,7 @@ async fn run_tool_worker<R: AsyncBufRead + Unpin + Send + 'static>(
                 failure,
                 Kind::InvalidDefinition,
             )
-            .await)
+            .await);
         }
     };
     let configured: LuaValue = match configure.call((arguments.clone(), context.clone())) {
@@ -1849,7 +1851,7 @@ async fn run_tool_worker<R: AsyncBufRead + Unpin + Send + 'static>(
                 failure,
                 Kind::InvalidDefinition,
             )
-            .await)
+            .await);
         }
     };
     let configuration = match parse_configuration(&lua, configured) {
@@ -1862,7 +1864,7 @@ async fn run_tool_worker<R: AsyncBufRead + Unpin + Send + 'static>(
                 mlua::Error::external(failure),
                 Kind::InvalidDefinition,
             )
-            .await)
+            .await);
         }
     };
     write_json(

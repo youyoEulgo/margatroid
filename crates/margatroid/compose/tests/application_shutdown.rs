@@ -355,7 +355,7 @@ async fn shutdown_before_first_tick_waits_startup_load_and_keeps_existing_data()
     assert!(app.world().query_with::<Workspace>().result().is_empty());
     assert!(managed.join("workspace.sqlite").is_file());
     let reopened = WorkspaceDatabase::open(managed.join("workspace.sqlite")).unwrap();
-    assert_eq!(reopened.metadata().address, "/demo");
+    assert_eq!(reopened.metadata().unwrap().address, "/demo");
     reopened.close().unwrap();
 }
 
@@ -394,6 +394,6 @@ async fn shutdown_settles_already_queued_create_before_closing_its_new_entity() 
     );
     let reopened =
         WorkspaceDatabase::open(root.path().join("workspaces/late/workspace.sqlite")).unwrap();
-    assert_eq!(reopened.metadata().address, "/late");
+    assert_eq!(reopened.metadata().unwrap().address, "/late");
     reopened.close().unwrap();
 }

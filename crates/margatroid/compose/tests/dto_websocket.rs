@@ -134,7 +134,7 @@ impl Harness {
             .insert_component(workspace, Address::new("/demo").unwrap());
         app.world_mut().insert_component(
             workspace,
-            workspace_core::Workspace::new("demo".into(), root.path().into(), database),
+            workspace_core::Workspace::new(root.path().into(), database),
         );
         app.world_mut()
             .insert_component(workspace, ToolTasks::new());
@@ -2191,7 +2191,7 @@ fn workspace_files_use_complete_addresses_when_display_names_are_equal() {
     .unwrap();
     h.app.world_mut().insert_component(
         entity,
-        workspace_core::Workspace::new("demo".into(), second.path().into(), database),
+        workspace_core::Workspace::new(second.path().into(), database),
     );
     assert_eq!(
         h.file_http("GET", &format!("{FILE_ROOT}/same.png"), "")
@@ -2431,7 +2431,6 @@ fn removed_workspace_and_unknown_messages_close_without_dispatching_creation() {
         "workspace.stop",
         "workspace.restart",
         "workspace.update",
-        "workspace.rename",
         "agent.restart",
         "unknown.command",
     ] {
@@ -2980,4 +2979,237 @@ fn resource_res_preserves_internal_alias_paths_and_component_sort_order() {
         reply["resources"][0]["path"],
         real.canonicalize().unwrap().to_str().unwrap()
     );
+}
+
+fn receive_alias_frames_without_world_ticks(
+    h: &Harness,
+    socket: &mut Socket,
+    id: &str,
+    alias: &str,
+) -> Vec<Value> {
+    h.runtime.block_on(async {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let mut frames = Vec::new();
+            loop {
+                if let Some(Ok(Message::Text(text))) = socket.next().await {
+                    let value: Value = serde_json::from_str(&text).unwrap();
+                    frames.push(value);
+                    let replied = frames.iter().any(|v| v["id"] == id && v["success"] == true);
+                    let synced = frames.iter().any(|v| {
+                        v["type"] == "workspace.sync" && v["workspaces"][0]["alias"] == alias
+                    });
+                    if replied && synced {
+                        return frames;
+                    }
+                }
+            }
+        })
+        .await
+        .expect("rename transaction and sync need no additional World frame")
+    })
+}
+
+#[test]
+fn workspace_alias_commits_before_reply_and_syncs_without_additional_world_frames() {
+    let mut h = Harness::new();
+    let mut socket = h.connect();
+    h.register(&mut socket, "webui", "workspace-alias");
+    h.collect(&mut socket, 5);
+    let db = workspace_database(&h);
+    let before_agent = h.app.world().get_component::<Agent>(h.agent).unwrap();
+    let task = before_agent.task_id().to_owned();
+    let instance = before_agent.instance().to_owned();
+    h.request(
+        &mut socket,
+        "workspace.rename",
+        "rename-workspace",
+        json!({"address":"/demo","alias":"Display project"}),
+    );
+    h.ingress_barrier(&mut socket);
+    h.app.tick();
+    receive_alias_frames_without_world_ticks(
+        &h,
+        &mut socket,
+        "rename-workspace",
+        "Display project",
+    );
+    assert_eq!(db.metadata().unwrap().alias, "Display project");
+    let disk = rusqlite::Connection::open_with_flags(
+        db.path(),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    assert_eq!(
+        disk.query_row("SELECT alias FROM workspace", [], |row| row
+            .get::<_, String>(0))
+            .unwrap(),
+        "Display project"
+    );
+    let agent = h.app.world().get_component::<Agent>(h.agent).unwrap();
+    assert_eq!(agent.task_id(), task);
+    assert_eq!(agent.instance(), instance);
+    assert_eq!(
+        h.app
+            .world()
+            .get_component::<Address>(h.workspace)
+            .unwrap()
+            .as_str(),
+        "/demo"
+    );
+    h.collect(&mut socket, 5);
+    let revision = db.subscribe_changes().borrow().as_ref().unwrap().revision;
+    h.request(
+        &mut socket,
+        "workspace.rename",
+        "same-workspace",
+        json!({"address":"/demo","alias":"Display project"}),
+    );
+    assert_eq!(
+        h.next(&mut socket, |v| v["id"] == "same-workspace")["success"],
+        true
+    );
+    assert_eq!(
+        db.subscribe_changes().borrow().as_ref().unwrap().revision,
+        revision
+    );
+    assert!(
+        h.collect(&mut socket, 5)
+            .iter()
+            .all(|v| v["type"] != "workspace.sync")
+    );
+    h.request(&mut socket, "workspace.req", "query-renamed", json!({}));
+    let query = h.next(&mut socket, |v| v["id"] == "query-renamed");
+    assert_eq!(query["workspaces"][0]["alias"], "Display project");
+}
+
+#[test]
+fn agent_alias_uses_record_identity_for_offline_normal_and_archived_records_and_null_clears() {
+    let mut h = Harness::new();
+    let record = register_record(&h, "offline");
+    let db = workspace_database(&h);
+    let mut socket = h.connect();
+    h.register(&mut socket, "webui", "agent-alias");
+    h.collect(&mut socket, 5);
+    let original_path = db.agent_directory(&record).unwrap();
+    h.request(
+        &mut socket,
+        "agent.rename",
+        "rename-offline",
+        json!({"workspace":"/demo","agent_id":record.id,"alias":"Offline label"}),
+    );
+    assert_eq!(
+        h.next(&mut socket, |v| v["id"] == "rename-offline")["success"],
+        true
+    );
+    let changed = db.agent_by_node("offline").unwrap();
+    assert_eq!(changed.alias.as_deref(), Some("Offline label"));
+    assert_eq!(changed.tool_arguments, record.tool_arguments);
+    assert_eq!(db.agent_directory(&changed).unwrap(), original_path);
+    h.collect(&mut socket, 5);
+    h.request(
+        &mut socket,
+        "agent.rename",
+        "clear-offline",
+        json!({"workspace":"/demo","agent_id":record.id,"alias":null}),
+    );
+    assert_eq!(
+        h.next(&mut socket, |v| v["id"] == "clear-offline")["success"],
+        true
+    );
+    assert_eq!(db.agent_by_node("offline").unwrap().alias, None);
+    let operation = db.try_operation("offline").unwrap();
+    let archived = db.archive_agent(&operation, &record.id).unwrap();
+    drop(operation);
+    let archived_path = db.agent_directory(&archived).unwrap();
+    h.collect(&mut socket, 5);
+    h.request(
+        &mut socket,
+        "agent.rename",
+        "rename-archived",
+        json!({"workspace":"/demo","agent_id":record.id,"alias":"Archived label"}),
+    );
+    assert_eq!(
+        h.next(&mut socket, |v| v["id"] == "rename-archived")["success"],
+        true
+    );
+    let row = db
+        .list_agents()
+        .unwrap()
+        .into_iter()
+        .find(|r| r.id == record.id)
+        .unwrap();
+    assert_eq!(row.alias.as_deref(), Some("Archived label"));
+    assert_eq!(row.previous_alias, archived.previous_alias);
+    assert_eq!(row.node_name, None);
+    assert_eq!(db.agent_directory(&row).unwrap(), archived_path);
+    assert!(
+        h.app
+            .world()
+            .query_with::<Agent>()
+            .result()
+            .iter()
+            .all(
+                |e| h.app.world().get_component::<Address>(*e).unwrap().as_str() != "/demo/offline"
+            )
+    );
+}
+
+#[test]
+fn alias_requests_reject_missing_records_invalid_aliases_old_agent_addresses_and_closed_state() {
+    let mut h = Harness::new();
+    let mut socket = h.connect();
+    h.register(&mut socket, "webui", "alias-errors");
+    for (id, kind, message) in [
+        (
+            "missing-workspace",
+            "workspace.rename",
+            json!({"address":"/missing","alias":"ok"}),
+        ),
+        (
+            "missing-record",
+            "agent.rename",
+            json!({"workspace":"/demo","agent_id":"absent","alias":"ok"}),
+        ),
+        (
+            "empty-alias",
+            "workspace.rename",
+            json!({"address":"/demo","alias":""}),
+        ),
+        (
+            "blank-alias",
+            "agent.rename",
+            json!({"workspace":"/demo","agent_id":"absent","alias":"   "}),
+        ),
+        (
+            "old-address",
+            "agent.rename",
+            json!({"address":"/demo/coder","alias":"ok"}),
+        ),
+        (
+            "omitted-alias",
+            "agent.rename",
+            json!({"workspace":"/demo","agent_id":"absent"}),
+        ),
+    ] {
+        h.request(&mut socket, kind, id, message);
+        let response = h.next(&mut socket, |v| v["id"] == id);
+        assert_eq!(response["success"], false, "{response}");
+        assert!(response["error"]["code"].is_string());
+    }
+    h.app
+        .world_mut()
+        .get_component_mut::<workspace_core::Workspace>(h.workspace)
+        .unwrap()
+        .set_state(WorkspaceState::Deleting);
+    h.request(
+        &mut socket,
+        "workspace.rename",
+        "deleting-workspace",
+        json!({"address":"/demo","alias":"not committed"}),
+    );
+    assert_eq!(
+        h.next(&mut socket, |v| v["id"] == "deleting-workspace")["success"],
+        false
+    );
+    assert_eq!(workspace_database(&h).metadata().unwrap().alias, "demo");
 }

@@ -50,7 +50,7 @@ pub fn workspace(
         },
     )
     .unwrap();
-    let mut workspace = workspace_core::Workspace::new(alias, project_root, database);
+    let mut workspace = workspace_core::Workspace::new(project_root, database);
     workspace.state = state;
     workspace
 }

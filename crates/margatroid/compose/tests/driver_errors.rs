@@ -70,7 +70,7 @@ impl Fixture {
             .insert_component(workspace, address::Address::new("/unit").unwrap());
         app.world_mut().insert_component(
             workspace,
-            workspace_core::Workspace::new("driver-errors".into(), root.path().to_owned(), {
+            workspace_core::Workspace::new(root.path().to_owned(), {
                 for kind in ["normal", "temporary", "archived"] {
                     std::fs::create_dir_all(root.path().join("agents").join(kind)).unwrap();
                 }

@@ -112,7 +112,7 @@ pub(crate) fn load_workspaces(w: &mut World) {
    for entry in std::fs::read_dir(&root).map_err(|e|error(WorkspaceErrorKind::DatabaseFailed,e))?{
     let entry=match entry{Ok(v)=>v,Err(e)=>{tracing::error!(error=%e,"Workspace directory entry failed");continue;}};
     let open=(||{if !entry.file_type().map_err(|e|error(WorkspaceErrorKind::DatabaseFailed,e))?.is_dir(){return Ok(None);}
-     let path=entry.path();let database=WorkspaceDatabase::open(path.join("workspace.sqlite"))?;let metadata=database.metadata().clone();
+     let path=entry.path();let database=WorkspaceDatabase::open(path.join("workspace.sqlite"))?;let metadata=database.metadata()?;
      if workspace_directory(&root,&metadata.address)?!=path {return Err(error(WorkspaceErrorKind::InvalidRequest,"Workspace directory does not match node"));}
      Ok(Some(StartWorkspace{address:metadata.address,alias:metadata.alias,project_root:metadata.project_root,database,reply:None}))})();
     match open{Ok(Some(r))=>requests.push(r),Ok(None)=>{},Err(e)=>tracing::error!(path=%entry.path().display(),error=%e,"Workspace load failed")}
@@ -134,7 +134,7 @@ pub(crate) fn start_workspace(w: &mut World, mut r: StartWorkspace) {
             .is_some_and(|workspace| workspace.database.same_connection(&r.database))
     });
     let result = (|| {
-        let metadata = r.database.metadata();
+        let metadata = r.database.metadata()?;
         if metadata.address != r.address
             || metadata.alias != r.alias
             || metadata.project_root != r.project_root
@@ -165,7 +165,7 @@ pub(crate) fn start_workspace(w: &mut World, mut r: StartWorkspace) {
                     .get_component::<Workspace>(entity)
                     .ok_or_else(|| error(WorkspaceErrorKind::DuplicateNode, "node occupied"))?;
                 if existing.database.path() != r.database.path()
-                    || existing.alias != r.alias
+                    || existing.database.metadata()?.alias != r.alias
                     || existing.project_root != r.project_root
                 {
                     return Err(error(
@@ -185,7 +185,7 @@ pub(crate) fn start_workspace(w: &mut World, mut r: StartWorkspace) {
         w.insert_component(entity, address);
         w.insert_component(
             entity,
-            Workspace::new(r.alias.clone(), r.project_root.clone(), r.database.clone()),
+            Workspace::new(r.project_root.clone(), r.database.clone()),
         );
         w.insert_component(entity, ToolTasks::new());
         notify(w, entity, WorkspaceUpdateKind::Installed);
@@ -232,7 +232,20 @@ pub(crate) fn start_agent(w: &mut World, r: StartWorkspaceAgent<ToolExecuteRespo
                 let parent = w
                     .entity_by_address(&rec.parent_node)
                     .map_err(|e| error(WorkspaceErrorKind::Missing, e))?;
-                (parent, rec.tool_path, rec.tool_arguments)
+                let mut arguments = rec.tool_arguments;
+                let object = arguments.as_object_mut().ok_or_else(|| {
+                    error(
+                        WorkspaceErrorKind::InvalidRequest,
+                        "stored Driver arguments must be object",
+                    )
+                })?;
+                object.insert("node_name".into(), serde_json::json!(node_name));
+                if let Some(alias) = rec.alias {
+                    object.insert("alias".into(), serde_json::json!(alias));
+                } else {
+                    object.remove("alias");
+                }
+                (parent, rec.tool_path, arguments)
             }
             StartWorkspaceAgent::New {
                 tool_path,

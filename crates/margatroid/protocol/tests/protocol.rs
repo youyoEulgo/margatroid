@@ -12,7 +12,7 @@ fn error() -> Value {
 }
 
 #[test]
-fn all_nineteen_client_types_round_trip_and_keep_request_ids() {
+fn all_twenty_one_client_types_round_trip_and_keep_request_ids() {
     let cases = vec![
         (
             "connection.register",
@@ -27,6 +27,14 @@ fn all_nineteen_client_types_round_trip_and_keep_request_ids() {
             json!({"address":"/demo","alias":"Demo","project_root":"/project"}),
         ),
         ("workspace.delete", json!({"address":"/demo"})),
+        (
+            "workspace.rename",
+            json!({"address":"/demo","alias":"Demo renamed"}),
+        ),
+        (
+            "agent.rename",
+            json!({"workspace":"/demo","agent_id":"opaque-agent-record","alias":null}),
+        ),
         (
             "agent.start",
             json!({"mode":"existing","workspace":"/demo","node_name":"coder"}),
@@ -52,7 +60,7 @@ fn all_nineteen_client_types_round_trip_and_keep_request_ids() {
             json!({"address":"/demo/coder","command":"CONFIG GET"}),
         ),
     ];
-    assert_eq!(cases.len(), 19);
+    assert_eq!(cases.len(), 21);
     for (kind, payload) in cases {
         let request = parse(kind, payload).unwrap();
         assert_eq!(request.id(), "request-1");
@@ -126,7 +134,7 @@ fn record_queries_use_exclusive_bounds_and_positive_limits() {
 }
 
 #[test]
-fn all_twenty_nine_server_types_round_trip_and_distinguish_sync_ids() {
+fn all_thirty_one_server_types_round_trip_and_distinguish_sync_ids() {
     let mut cases = Vec::new();
     for kind in [
         "agent.start.result",
@@ -134,6 +142,8 @@ fn all_twenty_nine_server_types_round_trip_and_distinguish_sync_ids() {
         "agent.archive.result",
         "workspace.create.result",
         "workspace.delete.result",
+        "workspace.rename.result",
+        "agent.rename.result",
         "agent.turn.abort.result",
         "mcl.execute.result",
     ] {
@@ -163,7 +173,7 @@ fn all_twenty_nine_server_types_round_trip_and_distinguish_sync_ids() {
     cases.push(json!({"type":"agent.log.sync","address":"/demo/coder","records":[{"sequence":1,"created_at_ms":0,"level":"info","source":"driver","stage":"execute","message":"ready","details_json":null,"context_json":null,"origin":null,"raw_error":null,"traceback":null}]}));
     cases.push(json!({"type":"agent.mcl.sync","address":"/demo/coder","records":[{"sequence":2,"created_at_ms":0,"source":"/clients/browser","turn":null,"content":"CONFIG GET","payload":{"text":"CONFIG GET"}}]}));
     cases.push(json!({"type":"resource.res","id":"query","success":true,"resources":[]}));
-    assert_eq!(cases.len(), 29);
+    assert_eq!(cases.len(), 31);
     for raw in cases {
         let message: ServerMessage =
             serde_json::from_value(raw.clone()).unwrap_or_else(|e| panic!("{}: {e}", raw["type"]));
@@ -622,7 +632,7 @@ fn node_addresses_replace_entity_resource_tags_without_normalization() {
 
 #[test]
 fn retired_workspace_lifecycle_requests_and_results_are_rejected() {
-    for operation in ["start", "stop", "restart", "update", "rename"] {
+    for operation in ["start", "stop", "restart", "update"] {
         assert!(
             parse(
                 &format!("workspace.{operation}"),

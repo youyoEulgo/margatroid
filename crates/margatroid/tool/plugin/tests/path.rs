@@ -129,7 +129,7 @@ fn mount_workspace(app: &mut App, root: &Path) -> Entity {
         .insert_component(entity, address::Address::new("/demo").unwrap());
     app.world_mut().insert_component(
         entity,
-        workspace_core::Workspace::new("demo".into(), root.into(), database),
+        workspace_core::Workspace::new(root.into(), database),
     );
     app.world_mut().insert_component(entity, ToolTasks::new());
     entity

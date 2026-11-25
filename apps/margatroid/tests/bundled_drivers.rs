@@ -365,6 +365,14 @@ mod mailbox_compaction {
             let old_task = task["task_id"].clone();
             request(
                 &mut socket,
+                "agent.rename",
+                "rename-before-restart",
+                json!({"workspace":"/probe","agent_id":record_id,"alias":"Renamed before restart"}),
+                &mut seen,
+            )
+            .await;
+            request(
+                &mut socket,
                 "agent.stop",
                 "stop-for-restart",
                 json!({"address":address}),
@@ -379,6 +387,68 @@ mod mailbox_compaction {
                 &mut seen,
             )
             .await;
+            let renamed_catalog = request(
+                &mut socket,
+                "workspace.req",
+                "renamed-after-restart",
+                json!({}),
+                &mut seen,
+            )
+            .await;
+            let renamed_record = renamed_catalog["workspaces"][0]["agents"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|record| record["id"] == record_id)
+                .unwrap();
+            assert_eq!(renamed_record["alias"], "Renamed before restart");
+            assert_eq!(
+                renamed_record["tool_arguments"],
+                json!({"node_name":name,"alias":"Renamed before restart","path":"."})
+            );
+            request(
+                &mut socket,
+                "agent.rename",
+                "clear-alias-before-restart",
+                json!({"workspace":"/probe","agent_id":record_id,"alias":null}),
+                &mut seen,
+            )
+            .await;
+            request(
+                &mut socket,
+                "agent.stop",
+                "stop-for-cleared-alias",
+                json!({"address":address}),
+                &mut seen,
+            )
+            .await;
+            request(
+                &mut socket,
+                "agent.start",
+                "restart-cleared-alias",
+                json!({"mode":"existing","workspace":"/probe","node_name":name}),
+                &mut seen,
+            )
+            .await;
+            let cleared_catalog = request(
+                &mut socket,
+                "workspace.req",
+                "cleared-alias-after-restart",
+                json!({}),
+                &mut seen,
+            )
+            .await;
+            let cleared_record = cleared_catalog["workspaces"][0]["agents"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|record| record["id"] == record_id)
+                .unwrap();
+            assert!(cleared_record["alias"].is_null());
+            assert_eq!(
+                cleared_record["tool_arguments"],
+                json!({"node_name":name,"path":"."})
+            );
             let after = request(
                 &mut socket,
                 "agent.task.req",

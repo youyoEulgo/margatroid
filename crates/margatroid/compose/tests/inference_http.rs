@@ -214,11 +214,7 @@ impl Fixture {
             .insert_component(workspace, Address::new("/demo").unwrap());
         app.world_mut().insert_component(
             workspace,
-            workspace_core::Workspace::new(
-                "demo".into(),
-                root.path().to_owned(),
-                test_database(root.path()),
-            ),
+            workspace_core::Workspace::new(root.path().to_owned(), test_database(root.path())),
         );
         let agent = app.world_mut().spawn();
         app.world_mut().insert_component(

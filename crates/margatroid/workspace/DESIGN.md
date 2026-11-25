@@ -74,7 +74,6 @@ WorkspacePlugin：工作区插件
 公开：
 ```text
 Workspace：工作区组件，定义于workspace_core
-    alias: String--展示名称
     project_root: PathBuf--工作区基础工作目录，供Driver上下文使用
     state: WorkspaceState--当前实体的运行状态，不写入数据库
     database: WorkspaceDatabase--该Workspace数据库的访问句柄，记录所属的全部Agent
@@ -182,7 +181,8 @@ start_agent_system(world: &mut World)
     产出事件：tool_core::ToolExecuteRequest::Path
     行为：接收StartWorkspaceAgent并检查Workspace Running；Existing按Workspace内唯一node_name读取普通记录并调用database.ensure_startable(id)，New使用请求的tool_path和arguments。
         Driver工具参数是对象，专用node_name、alias及相对工作目录path由Driver参数提供；node_name缺省或null为临时，提供时必须为非空单段名且不能使用保留前缀~temporary-。
-        New若arguments.node_name已登记则拒绝；Existing使用数据库原tool_arguments，不覆盖Driver参数。
+        New若arguments.node_name已登记则拒绝；Existing以数据库tool_arguments记录为模板保留其余Driver参数，用当前登记node_name覆盖同名参数，alias非空时覆盖alias、为空时移除旧alias。
+        tool_arguments表示上一次实际进入Agent登记提交的启动调用参数，不作为节点身份或展示别名的权威值；重建参数只在内存中进行，不提前修改数据库。
         Existing读取记录parent_node并定位实际父实体；顶层记录父实体为Workspace，子Agent记录要求原父Agent仍存在且可受理，否则拒绝，不改变节点归属。
         构造ToolExecuteRequest::Path，initiator为选定父实体，path和arguments取自变体材料，原reply直接转交；工具登记必须重新检查initiator的ToolTasks受理门。
         同步阶段不准备Agent文件、不打开Agent数据库、不预登记；工具实际执行agent:create时统一检查Driver归属、准备文件、登记及创建实体。
@@ -212,7 +212,7 @@ crate公开：
 handle_start_workspace(world: &mut World, event: StartWorkspace)
     行为：用event.address构造并校验Address，检查地址；已占用时先按下述复用/拒绝规则完成，不再建立实体。
         地址空闲时建立实体，直接挂载Address组件。
-        用event.alias、event.project_root、event.database构造Workspace，state初始化为Running，并直接挂载到同一实体。
+        校验event.alias与已连接数据库metadata一致；用event.project_root、event.database构造Workspace，state初始化为Running并挂载；组件不另存alias。
         将tool_core公开的ToolTasks::new()挂载到同一实体。
         组件全部就绪后调用WorkspaceUpdateContext::notify(Installed)，由注入探针发布初始Workspace视图并绑定任务集合及数据库提交通知；event.reply为Some时通过原Sender返回Entity。
         地址已占用时若现有Workspace使用同一管理目录且元数据一致，复用现有实体；仅在same_connection为false时关闭本次独立重复连接，绝不关闭现有共享连接，原reply返回该Entity；否则关闭本次连接并回复错误。加载无reply时记录tracing，不重复挂载。
@@ -231,7 +231,7 @@ load_workspaces(root: PathBuf, events: EventSender) -> Future<Output = ()>
     行为：在异步闭包内通过blocking worker检查root下所有Workspace目录。
         每个Workspace目录使用workspace.sqlite；只读写打开已存在文件，校验schema后recover_archives，再取得地址、别名和项目根构造句柄。
         初始化root/agents/normal、temporary、archived布局只由创建流程建立；加载不对不匹配结构静默补齐。
-        初始化数据库句柄时读取一次已提交记录作为changes初始快照；不以SQLite/WAL文件事件冒充数据库提交。
+        初始化数据库句柄时读取WorkspaceMetadata及已提交Agent记录，作为同一changes初始快照；不以SQLite/WAL文件事件冒充数据库提交。
         每发现一个有效Workspace，通过events发送携带address、alias、project_root、database及reply=None的StartWorkspace。
         无效或读取失败的目录记录tracing错误并继续检查其他目录；不创建目录或数据库，不在闭包内建立实体或挂载组件。
 ```
@@ -266,8 +266,13 @@ WorkspaceUpdateKind
     Closing--失效数据库和任务同步来源
     Removed--实体已销毁，从运行视图移除
 
-WorkspaceRecordsSnapshot：数据库确认提交的Agent登记快照
-    revision: u64--进程内来源版本，不是Agent运行状态
+WorkspaceMetadata：数据库元数据的公开owned值
+    address: String
+    alias: String--唯一权威值存数据库，不再同时保存在Workspace组件中
+    project_root: PathBuf
+WorkspaceRecordsSnapshot：数据库确认提交的完整Workspace快照
+    revision: u64--同一来源中元数据或Agent记录变化共同递增
+    metadata: WorkspaceMetadata
     agents: Vec<WorkspaceAgent>--仅已提交的持久记录
 
 WorkspaceState：工作区实体状态，定义于workspace_core
@@ -281,7 +286,7 @@ WorkspaceAgent：Workspace数据库中的Agent记录，定义于workspace_core
     parent_node: String--实际创建者的完整节点路径；用于按原层级重启，不是运行Entity
     id: String--记录的唯一标识
     tool_path: PathBuf--实际工具入口文件路径
-    tool_arguments: serde_json::Value--宿主捕获的Driver完整调用参数，含其专用参数
+    tool_arguments: serde_json::Value--上次实际进入Agent登记提交的完整启动调用参数；只是历史记录及下次业务参数模板，当前node_name和alias以登记列为准
     node_name: Option<String>--当前普通节点名；临时及归档记录为None
     alias: Option<String>--当前展示别名
     category: AgentCategory--持久目录类别，不代表实时运行状态
@@ -315,8 +320,20 @@ WorkspaceDatabase：工作区数据库访问句柄，定义于workspace_core
     changes: Arc<watch::Sender<Option<WorkspaceRecordsSnapshot>>>--共享确认快照；None表示来源已关闭
     subscribe_changes(&self) -> watch::Receiver<Option<WorkspaceRecordsSnapshot>>
         行为：返回共享提交来源的独立接收端，当前值为最近确认快照；只建立进程内观察，不查询、写入数据库或发送网络消息。
-    publish_committed(&self, agents: Vec<WorkspaceAgent>)
-        行为：私有，调用方持数据库操作锁，在事务确认提交后提交owned快照；内容相同不推进revision；先更新来源快照再释放操作锁，避免迟到旧快照覆盖新提交。
+    metadata(&self) -> Result<WorkspaceMetadata, WorkspaceError>
+        行为：从同一已提交共享快照克隆最新元数据，不返回启动时固定引用；关闭来源返回Closed。
+    publish_committed(&self, metadata: WorkspaceMetadata, agents: Vec<WorkspaceAgent>)
+        行为：私有，持数据库操作锁在确认提交后更新同一完整快照；同时比较metadata与agents，相同内容不推进revision。
+            先提交快照再释放操作锁，登记、归档及别名更新都从当前事务读取完整值，不能用旧元数据或旧Agent列表覆盖其他已提交变更。
+    rename_workspace_alias(&self, alias: String) -> Result<(), WorkspaceError>
+        行为：同步事务函数，异步调用方在blocking worker中执行；先认领在途写操作凭证，关闭受理门时拒绝，退出wait_idle须等待该凭证释放。
+            校验alias为非空、非全空白且无控制字符，不trim、不要求唯一；只UPDATE workspace.alias，同值成功但不发布。
+            确认提交后publish_committed最新metadata及agents，再返回Ok；失败回滚，不修改组件、路径或启动材料。
+    rename_agent_alias(&self, agent_id: &str, alias: Option<String>) -> Result<(), WorkspaceError>
+        行为：按持久记录id精确定位，缺失返回AgentRecordMissing；Normal、Temporary、Archived均可编辑，None明确清空alias。
+            Some遵循上述非空规则，不与归档时的previous_alias混用，不改变tool_arguments中的Driver参数。
+            使用与该记录创建、归档一致的操作受理键；冲突返回Busy，不能在prepare_agent之后抢先更新又被旧候选覆盖。已受理操作纳入wait_idle，关闭数据库前必须释放。
+            事务仅UPDATE agents.alias，同值成功不发布；提交后发布当前完整快照，再回复，不增设运行Agent.alias字段。
     path(&self) -> &Path
         行为：返回数据库文件路径。
     same_connection(&self, other: &Self) -> bool
@@ -332,7 +349,8 @@ WorkspaceDatabase：工作区数据库访问句柄，定义于workspace_core
             无记录时分配唯一id并构造候选记录，不提交agents行；临时id由本次临时操作键的随机部分确定，普通目录为node_name，临时目录为id及~temporary-<id>运行名。
             在节点凭证保护下把该候选记录交给注入方法准备文件；新记录的目录若已经存在但无对应数据库记录，返回UnregisteredDirectory，不复用未知归属文件、不自动删除修补。
     commit_agent(&self, operation: &WorkspaceOperation, record: WorkspaceAgent) -> Result<WorkspaceAgent, WorkspaceError>
-        行为：确认凭证与目标节点一致，事务重新核对原记录Driver/父节点及id，插入新记录或更新原工具参数和显式alias；并发冲突拒绝，不覆盖其他记录。
+        行为：确认凭证与目标节点一致，事务重新核对原记录Driver/父节点及id；首次插入保存创建别名，复用已有记录只更新本次实际调用参数，保留当前数据库alias。
+            参数重建后至prepare之间若发生rename，以prepare读取的最新别名为准，不允许旧Driver参数回滚；并发冲突拒绝，不覆盖其他记录。
             确认提交后publish_committed，相同值不通知；文件准备、StartAgent回复及子Agent绑定都持有同一operation，跨await不持SQL锁。
     agent_by_node(&self, node_name: &str) -> Result<WorkspaceAgent, WorkspaceError>
         行为：优先按普通node_name，保留前缀节点按临时runtime_name返回记录，缺失返回错误。读到归档中原记录不代表它可启动；Existing只允许Normal且ensure_startable通过，临时不重放成另一实例。
@@ -380,6 +398,8 @@ WorkspaceError：工作区操作错误
 WorkspaceErrorKind：Clone
     InvalidRequest | Missing | Busy | Closed | DriverMismatch | ParentMismatch | DuplicateNode
     UnregisteredDirectory | DatabaseFailed | CloseFailed | ArchivePending | RecoveryFailed | DeleteFailed
+    AgentRecordMissing--按持久记录id修改别名时不存在
+    StateRejected--Workspace不是Running时拒绝别名写入
 ```
 
 # 持有关系
@@ -398,7 +418,6 @@ Workspace实体
 ├── Address（address定义）
 ├── ToolTasks（tool_core定义）
 └── Workspace
-    ├── alias: String
     ├── project_root: PathBuf
     ├── state: WorkspaceState
     └── database: WorkspaceDatabase

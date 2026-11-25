@@ -268,7 +268,11 @@ export type ClientMessage =
     }
   | { type: 'workspace.delete'; id: string; message: { address: string } }
   | { type: 'workspace.rename'; id: string; message: { address: string; alias: string } }
-  | { type: 'agent.rename'; id: string; message: { address: string; alias: string } }
+  | {
+      type: 'agent.rename';
+      id: string;
+      message: { workspace: string; agent_id: string; alias: string | null };
+    }
   | {
       type: 'agent.start';
       id: string;

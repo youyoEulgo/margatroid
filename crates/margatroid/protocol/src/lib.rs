@@ -82,6 +82,25 @@ pub fn parse_client_message(text: &str) -> Result<ClientMessage, ProtocolError> 
         ClientMessage::WorkspaceDelete { message, .. } => {
             validate_address(&message.address, "workspace")?
         }
+        ClientMessage::WorkspaceRename { message, .. } => {
+            validate_address(&message.address, "workspace")?;
+            if !valid_request_id(&message.alias) {
+                return Err(invalid("invalid Workspace alias"));
+            }
+        }
+        ClientMessage::AgentRename { message, .. } => {
+            validate_address(&message.workspace, "workspace")?;
+            if !valid_request_id(&message.agent_id) {
+                return Err(invalid("invalid Agent record id"));
+            }
+            if message
+                .alias
+                .as_deref()
+                .is_some_and(|alias| !valid_request_id(alias))
+            {
+                return Err(invalid("invalid Agent alias"));
+            }
+        }
         ClientMessage::AgentStart { message, .. } => match message {
             AgentStartInputDto::Existing {
                 workspace,
@@ -387,6 +406,7 @@ pub(crate) fn validate_server_value(value: &Value) -> Result<(), ProtocolError> 
                 | "agent.start.result"
                 | "agent.stop.result"
                 | "agent.archive.result"
+                | "agent.rename.result"
                 | "workspace.create.result"
                 | "workspace.update.result"
                 | "workspace.rename.result"

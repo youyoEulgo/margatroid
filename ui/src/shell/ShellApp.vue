@@ -235,8 +235,8 @@ function stopSidebarAgent(address: string) {
     workspaceNotice.value = 'Agent stop failed';
   });
 }
-function renameSidebarAgent(address: string, alias: string) {
-  void store.renameAgentAlias(address, alias).catch(() => {
+function renameSidebarAgent(workspace: string, agentId: string, alias: string | null) {
+  void store.renameAgentAlias(workspace, agentId, alias).catch(() => {
     workspaceNotice.value = 'Agent rename failed';
   });
 }

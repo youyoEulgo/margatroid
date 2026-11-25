@@ -456,6 +456,7 @@ fn ambiguous_archive_recovery_refuses_to_guess_or_overwrite() {
 fn database_open_does_not_create_migrate_or_read_yaml() {
     let f = Fixture::new();
     let path = f.db.path().to_owned();
+    let metadata = f.db.metadata().unwrap();
     f.db.close().unwrap();
     let c = Connection::open(&path).unwrap();
     c.execute_batch("PRAGMA user_version=99").unwrap();
@@ -476,7 +477,7 @@ fn database_open_does_not_create_migrate_or_read_yaml() {
     assert!(!missing.exists());
     assert!(WorkspaceDatabase::open(f.db.managed_directory().join("workspace.yaml")).is_err());
     assert_eq!(
-        kind(WorkspaceDatabase::create(&path, f.db.metadata().clone())),
+        kind(WorkspaceDatabase::create(&path, metadata)),
         WorkspaceErrorKind::DatabaseFailed
     );
 }
@@ -580,7 +581,7 @@ fn public_events_retain_original_reply_without_business_core_dependencies() {
     let entity = world.spawn();
     world.insert_component(
         entity,
-        Workspace::new("Demo".into(), Path::new("/srv/project").into(), f.db),
+        Workspace::new(Path::new("/srv/project").into(), f.db),
     );
     let notifications = Arc::new(Mutex::new(vec![]));
     let target = notifications.clone();
@@ -649,4 +650,158 @@ fn lifecycle_work_is_idle_only_after_startup_and_all_create_tokens_settle() {
     assert!(!pending.is_idle());
     drop(second);
     assert!(pending.is_idle());
+}
+
+#[test]
+fn alias_transactions_publish_complete_snapshots_and_persist_without_rewriting_arguments() {
+    let f = Fixture::new();
+    let normal = f.register("coder");
+    let mut watcher = f.db.subscribe_changes();
+    let initial = watcher.borrow_and_update().clone().unwrap();
+    assert_eq!(initial.metadata.alias, "Demo");
+    f.db.rename_workspace_alias("  新项目  ".into()).unwrap();
+    let changed = watcher.borrow_and_update().clone().unwrap();
+    assert_eq!(changed.metadata.alias, "  新项目  ");
+    assert_eq!(changed.agents, initial.agents);
+    assert_eq!(changed.revision, initial.revision + 1);
+    assert_eq!(f.db.metadata().unwrap(), changed.metadata);
+    f.db.rename_workspace_alias("  新项目  ".into()).unwrap();
+    assert!(!watcher.has_changed().unwrap());
+    f.db.rename_agent_alias(&normal.id, Some("  名称  ".into()))
+        .unwrap();
+    let changed = watcher.borrow_and_update().clone().unwrap();
+    assert_eq!(changed.metadata.alias, "  新项目  ");
+    assert_eq!(changed.agents[0].alias.as_deref(), Some("  名称  "));
+    assert_eq!(changed.agents[0].tool_arguments, normal.tool_arguments);
+    f.db.rename_agent_alias(&normal.id, Some("  名称  ".into()))
+        .unwrap();
+    assert!(!watcher.has_changed().unwrap());
+    let reopen = WorkspaceDatabase::open(f.db.path()).unwrap();
+    assert_eq!(reopen.metadata().unwrap(), changed.metadata);
+    assert_eq!(reopen.list_agents().unwrap(), changed.agents);
+    f.db.rename_agent_alias(&normal.id, None).unwrap();
+    assert!(watcher.borrow_and_update().as_ref().unwrap().agents[0]
+        .alias
+        .is_none());
+    f.db.rename_agent_alias(&normal.id, None).unwrap();
+    assert!(!watcher.has_changed().unwrap());
+}
+
+#[test]
+fn alias_updates_cover_temporary_archived_and_missing_records() {
+    let f = Fixture::new();
+    let key = "~temporary-0123456789abcdef0123456789abcdef";
+    let op = f.db.try_operation(key).unwrap();
+    let temporary = f.prepare(&op, None, "/tools/driver/tool.toml", json!({}));
+    fs::create_dir(f.db.agent_directory(&temporary).unwrap()).unwrap();
+    f.db.commit_agent(&op, temporary.clone()).unwrap();
+    drop(op);
+    f.db.rename_agent_alias(&temporary.id, Some("临时".into()))
+        .unwrap();
+    let op = f.db.try_operation(key).unwrap();
+    let archived = f.db.archive_agent(&op, &temporary.id).unwrap();
+    drop(op);
+    assert_eq!(archived.previous_alias.as_deref(), Some("临时"));
+    f.db.rename_agent_alias(&temporary.id, Some("归档".into()))
+        .unwrap();
+    let archived = f.db.list_agents().unwrap().pop().unwrap();
+    assert_eq!(archived.alias.as_deref(), Some("归档"));
+    assert_eq!(archived.previous_alias.as_deref(), Some("临时"));
+    assert_eq!(archived.category, AgentCategory::Archived);
+    f.db.rename_agent_alias(&temporary.id, None).unwrap();
+    assert_eq!(
+        kind(f.db.rename_agent_alias("missing", Some("name".into()))),
+        WorkspaceErrorKind::AgentRecordMissing
+    );
+    for invalid in ["", " ", "\t", "line\nbreak", "name\0"] {
+        assert_eq!(
+            kind(f.db.rename_workspace_alias(invalid.into())),
+            WorkspaceErrorKind::InvalidRequest
+        );
+        assert_eq!(
+            kind(f.db.rename_agent_alias(&temporary.id, Some(invalid.into()))),
+            WorkspaceErrorKind::InvalidRequest
+        );
+    }
+    f.db.close().unwrap();
+    assert_eq!(kind(f.db.metadata()), WorkspaceErrorKind::Closed);
+    assert_eq!(
+        kind(f.db.rename_workspace_alias("closed".into())),
+        WorkspaceErrorKind::Closed
+    );
+    assert_eq!(
+        kind(f.db.rename_agent_alias(&temporary.id, None)),
+        WorkspaceErrorKind::Closed
+    );
+}
+
+#[test]
+fn alias_update_cannot_race_a_prepared_registration_or_archive() {
+    let f = Fixture::new();
+    let record = f.register("coder");
+    let op = f.db.try_operation("coder").unwrap();
+    let prepared = f.prepare(
+        &op,
+        Some("coder"),
+        "/tools/driver/tool.toml",
+        record.tool_arguments.clone(),
+    );
+    assert_eq!(
+        kind(f.db.rename_agent_alias(&record.id, Some("lost".into()))),
+        WorkspaceErrorKind::Busy
+    );
+    f.db.rename_workspace_alias("metadata during prepare".into())
+        .unwrap();
+    f.db.commit_agent(&op, prepared).unwrap();
+    drop(op);
+    assert_eq!(f.db.metadata().unwrap().alias, "metadata during prepare");
+    f.db.rename_agent_alias(&record.id, Some("committed".into()))
+        .unwrap();
+    let op = f.db.try_operation("coder").unwrap();
+    assert_eq!(
+        kind(f.db.rename_agent_alias(&record.id, None)),
+        WorkspaceErrorKind::Busy
+    );
+    f.db.archive_agent(&op, &record.id).unwrap();
+    drop(op);
+    let snapshot = f.db.subscribe_changes().borrow().clone().unwrap();
+    assert_eq!(snapshot.metadata.alias, "metadata during prepare");
+    assert_eq!(
+        snapshot.agents[0].previous_alias.as_deref(),
+        Some("committed")
+    );
+    assert_eq!(snapshot.agents[0].alias.as_deref(), Some("committed"));
+}
+
+#[test]
+fn reused_record_keeps_authoritative_alias_but_records_actual_start_arguments() {
+    let f = Fixture::new();
+    let record = f.register("coder");
+    for alias in [Some("Renamed authoritative alias".to_owned()), None] {
+        f.db.rename_agent_alias(&record.id, alias.clone()).unwrap();
+        let op = f.db.try_operation("coder").unwrap();
+        let arguments = json!({"node_name":"coder","alias":"stale dispatched alias","path":"src","driver_setting":42});
+        let candidate =
+            f.db.prepare_agent(
+                &op,
+                "/demo".into(),
+                Some("coder".into()),
+                Some("stale dispatched alias".into()),
+                record.tool_path.clone(),
+                arguments.clone(),
+            )
+            .unwrap();
+        assert_eq!(
+            candidate.alias, alias,
+            "existing record alias must not be overwritten by Driver arguments"
+        );
+        assert_eq!(candidate.tool_arguments, arguments);
+        let committed = f.db.commit_agent(&op, candidate).unwrap();
+        assert_eq!(committed.alias, alias);
+        assert_eq!(
+            committed.tool_arguments, arguments,
+            "persist the actual invocation, not a rewritten reconstruction"
+        );
+        assert_eq!(committed.id, record.id);
+    }
 }

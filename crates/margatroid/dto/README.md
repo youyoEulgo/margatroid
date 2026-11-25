@@ -1,12 +1,14 @@
 # DTO
 
-DTO 提供统一 `/ws` 入口、HTTP 工作目录文件读取，以及48种 WebSocket 消息：19种请求、19种一次性响应、10种主动同步。字段和信息流见本领域 [DESIGN.md](DESIGN.md) 及独立 API 仓库。源码与测试通过不代表正在运行的 daemon 已更新。
+DTO 提供统一 `/ws` 入口、HTTP 工作目录文件读取，以及52种 WebSocket 消息：21种请求、21种一次性响应、10种主动同步。字段和信息流见本领域 [DESIGN.md](DESIGN.md) 及独立 API 仓库。源码与测试通过不代表正在运行的 daemon 已更新。
 
 ## 请求与回复
 
 客户端先注册连接，后续请求由 `DtoRequest` 交给 `dto_route_system`；回合中止使用 PRE_UPDATE 的 `AbortTurnControl`。领域请求沿原 oneshot 交给实际执行方，网络闭包等待原结果并返回专属 `res` 或 `result`，不另发网络完成事件。
 
 Workspace 创建／删除分别调用对应生命周期事件；Agent 启动转为 `StartWorkspaceAgent::Existing/New`，最终调用 Driver 工具；关闭按 Agent 的父实体与任务 ID 找实际创建任务，归档等待真实清理及目录和数据库提交。网络层不准备 Agent 存储连接或直接装配实体。
+
+`workspace.rename` 接受 address 和非空 alias；`agent.rename` 接受 workspace、持久 agent_id 和必填 nullable alias，null 清空别名。前置校验要求已注册连接和 Running Workspace，随后在受监督异步闭包及 blocking worker 中调用数据库事务，完成后回复原 oneshot；不新增业务事件，不依赖运行 Agent，不改节点、目录或 Driver 参数。数据库确认快照的 metadata.alias 与 agents 一并驱动 workspace.sync，提交成功的 result 与 sync 可能按不同顺序到达，同值不重复发布。
 
 ## 资源查询
 
@@ -49,7 +51,7 @@ Workspace 初始化只扫描一次管理目录。数据库提交后发布 owned 
 
 ## HTTP 与模型配置
 
-GET/HEAD `/{workspace}/{path}` 使用编码后的完整 Workspace 节点路径，核对实际组件后读取其 project_root 内普通文件；拒绝越界、链接、目录和特殊文件，GET 返回字节流，HEAD 仅头部。此 HTTP 接口不计入48种 WebSocket 消息，也不建立文件监控。
+GET/HEAD `/{workspace}/{path}` 使用编码后的完整 Workspace 节点路径，核对实际组件后读取其 project_root 内普通文件；拒绝越界、链接、目录和特殊文件，GET 返回字节流，HEAD 仅头部。此 HTTP 接口不计入52种 WebSocket 消息，也不建立文件监控。
 
 模型配置 req/res/sync 读取完整 TOML，update 校验后原子替换；实际推理开始时重新加载路由，不用启动快照掩盖损坏文件。来源监控只刷新安全公共投影；凭据不进入 Agent 模型视图。
 

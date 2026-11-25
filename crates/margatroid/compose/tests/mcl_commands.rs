@@ -1915,7 +1915,6 @@ async fn bundled_drivers_record_inference_error_messages_and_keep_running_while_
             fixture.app.world_mut().insert_component(
                 workspace,
                 workspace_core::Workspace::new(
-                    "bundled-driver".into(),
                     fixture.root.path().to_owned(),
                     workspace_database(fixture.root.path()),
                 ),

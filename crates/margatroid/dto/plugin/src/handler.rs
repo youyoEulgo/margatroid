@@ -291,6 +291,8 @@ pub(crate) fn handle_dto_request(world: &mut World, request: DtoRequest) {
         "resource.req" => resources(world, object),
         "workspace.create" => dispatch::<CreateWorkspaceDto>(world, object),
         "workspace.delete" => dispatch::<DeleteWorkspaceDto>(world, object),
+        "workspace.rename" => rename_alias(world, object, false),
+        "agent.rename" => rename_alias(world, object, true),
         "agent.start" => dispatch::<AgentStartDto>(world, object),
         "agent.stop" => dispatch::<AgentStopDto>(world, object),
         "agent.archive" => dispatch::<AgentArchiveDto>(world, object),
@@ -492,6 +494,89 @@ fn query<T: Send + 'static, R: Send + 'static>(
         deliver(&r.reply, result);
     }
 }
+pub(crate) fn rename_alias(world: &World, object: Box<dyn Any + Send>, agent: bool) {
+    enum Rename {
+        Workspace(String),
+        Agent { id: String, alias: Option<String> },
+    }
+    let (ticket, workspace, rename, reply) = if agent {
+        let Ok(request) =
+            object.downcast::<Prepared<AgentRenameDto, (), workspace_core::WorkspaceError>>()
+        else {
+            return;
+        };
+        (
+            request.ticket,
+            request.input.workspace,
+            Rename::Agent {
+                id: request.input.agent_id,
+                alias: request.input.alias,
+            },
+            request.reply,
+        )
+    } else {
+        let Ok(request) =
+            object.downcast::<Prepared<WorkspaceRenameDto, (), workspace_core::WorkspaceError>>()
+        else {
+            return;
+        };
+        (
+            request.ticket,
+            request.input.address,
+            Rename::Workspace(request.input.alias),
+            request.reply,
+        )
+    };
+    let database = (|| {
+        client(world, ticket.connection).map_err(workspace_core::WorkspaceError::boundary)?;
+        let entity = world.entity_by_address(&workspace).map_err(|_| {
+            workspace_core::WorkspaceError::new(
+                workspace_core::WorkspaceErrorKind::WorkspaceMissing,
+                "Workspace is not loaded",
+            )
+        })?;
+        let workspace = world.get_component::<Workspace>(entity).ok_or_else(|| {
+            workspace_core::WorkspaceError::new(
+                workspace_core::WorkspaceErrorKind::WorkspaceMissing,
+                "target is not a Workspace",
+            )
+        })?;
+        if workspace.state != workspace_core::WorkspaceState::Running {
+            return Err(workspace_core::WorkspaceError::new(
+                workspace_core::WorkspaceErrorKind::StateRejected,
+                "Workspace is not running",
+            ));
+        }
+        Ok(workspace.database.clone())
+    })();
+    let database = match database {
+        Ok(database) => database,
+        Err(error) => {
+            deliver(&reply, Err(error));
+            return;
+        }
+    };
+    let guard = world.get_resource::<DtoState>().unwrap().lifetime.track();
+    world
+        .get_resource::<async_runtime_plugin::AsyncRuntimeHandle>()
+        .unwrap()
+        .spawn(async move {
+            let _guard = guard;
+            let result = tokio::task::spawn_blocking(move || match rename {
+                Rename::Workspace(alias) => database.rename_workspace_alias(alias),
+                Rename::Agent { id, alias } => database.rename_agent_alias(&id, alias),
+            })
+            .await
+            .unwrap_or_else(|_| {
+                Err(workspace_core::WorkspaceError::new(
+                    workspace_core::WorkspaceErrorKind::DatabaseFailed,
+                    "alias update worker failed",
+                ))
+            });
+            deliver(&reply, result);
+        });
+}
+
 pub(crate) fn resources(world: &World, object: Box<dyn Any + Send>) {
     let Ok(request) = object.downcast::<Prepared<ResourceQueryDto, Vec<ResourceInfoDto>>>() else {
         return;
@@ -789,6 +874,12 @@ async fn prepare_request(
             build!(message, Entity, workspace_core::WorkspaceError, minimal)
         }
         ClientMessage::WorkspaceDelete { message, .. } => {
+            build!(message, (), workspace_core::WorkspaceError, minimal)
+        }
+        ClientMessage::WorkspaceRename { message, .. } => {
+            build!(message, (), workspace_core::WorkspaceError, minimal)
+        }
+        ClientMessage::AgentRename { message, .. } => {
             build!(message, (), workspace_core::WorkspaceError, minimal)
         }
         ClientMessage::AgentStart { message, .. } => build!(
@@ -1238,6 +1329,7 @@ fn invalid_reply(text: &str) -> Option<Value> {
             | "workspace.rename"
             | "workspace.delete"
             | "agent.req"
+            | "agent.rename"
             | "agent.ui.req"
             | "agent.turn.req"
             | "agent.turn.abort"

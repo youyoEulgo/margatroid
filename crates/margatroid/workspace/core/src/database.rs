@@ -88,7 +88,6 @@ impl Drop for WorkspaceOperation {
 #[derive(Clone)]
 pub struct WorkspaceDatabase {
     path: PathBuf,
-    metadata: WorkspaceMetadata,
     connection: Arc<Mutex<Option<Connection>>>,
     admission: Arc<Mutex<Admission>>,
     idle: Arc<Notify>,
@@ -175,11 +174,11 @@ impl WorkspaceDatabase {
         }
         let (changes, _) = watch::channel(Some(WorkspaceRecordsSnapshot {
             revision: 0,
+            metadata,
             agents,
         }));
         Ok(Self {
             path,
-            metadata,
             connection: Arc::new(Mutex::new(Some(conn))),
             admission: Arc::new(Mutex::new(Admission {
                 accepting: true,
@@ -192,8 +191,92 @@ impl WorkspaceDatabase {
     pub fn path(&self) -> &Path {
         &self.path
     }
-    pub fn metadata(&self) -> &WorkspaceMetadata {
-        &self.metadata
+    pub fn metadata(&self) -> Result<WorkspaceMetadata, WorkspaceError> {
+        self.changes
+            .borrow()
+            .as_ref()
+            .map(|snapshot| snapshot.metadata.clone())
+            .ok_or_else(|| error(K::Closed, "workspace database is closed"))
+    }
+    pub fn rename_workspace_alias(&self, alias: String) -> Result<(), WorkspaceError> {
+        validate_alias(Some(&alias))?;
+        let _operation = self.admit_operation(":workspace-alias")?;
+        let mut connection = self.conn()?;
+        let tx = connection
+            .as_mut()
+            .unwrap()
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(db_error)?;
+        let mut metadata = read_metadata(&tx)?;
+        if metadata.alias == alias {
+            return Ok(());
+        }
+        tx.execute("UPDATE workspace SET alias=?1 WHERE singleton=1", [&alias])
+            .map_err(db_error)?;
+        metadata.alias = alias;
+        let agents = read_agents(&tx)?;
+        tx.commit().map_err(db_error)?;
+        self.publish_committed(metadata, agents);
+        Ok(())
+    }
+    pub fn rename_agent_alias(
+        &self,
+        agent_id: &str,
+        alias: Option<String>,
+    ) -> Result<(), WorkspaceError> {
+        validate_alias(alias.as_deref())?;
+        if agent_id.trim().is_empty() || agent_id.chars().any(char::is_control) {
+            return Err(error(K::InvalidRequest, "invalid Agent record id"));
+        }
+        if !self.is_accepting() {
+            return Err(error(K::Closed, "workspace no longer accepts operations"));
+        }
+        // Read the committed identity without holding the SQL lock while taking admission.
+        // The transaction below rechecks it after admission, covering archive/reuse races.
+        let key = self
+            .changes
+            .borrow()
+            .as_ref()
+            .ok_or_else(|| error(K::Closed, "workspace database is closed"))?
+            .agents
+            .iter()
+            .find(|record| record.id == agent_id)
+            .map(|record| {
+                record
+                    .node_name
+                    .as_deref()
+                    .unwrap_or(&record.runtime_name)
+                    .to_owned()
+            })
+            .ok_or_else(|| error(K::AgentRecordMissing, "Agent record missing"))?;
+        let _operation = self.try_operation(&key)?;
+        let mut connection = self.conn()?;
+        let tx = connection
+            .as_mut()
+            .unwrap()
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(db_error)?;
+        let record = by_id(&tx, agent_id)?
+            .ok_or_else(|| error(K::AgentRecordMissing, "Agent record missing"))?;
+        if record.node_name.as_deref().unwrap_or(&record.runtime_name) != key {
+            return Err(error(K::Busy, "Agent record changed during admission"));
+        }
+        if read_intent(&tx, agent_id)?.is_some() {
+            return Err(error(K::ArchivePending, "Agent archive is pending"));
+        }
+        if record.alias == alias {
+            return Ok(());
+        }
+        tx.execute(
+            "UPDATE agents SET alias=?1 WHERE id=?2",
+            params![alias, agent_id],
+        )
+        .map_err(db_error)?;
+        let metadata = read_metadata(&tx)?;
+        let agents = read_agents(&tx)?;
+        tx.commit().map_err(db_error)?;
+        self.publish_committed(metadata, agents);
+        Ok(())
     }
     pub fn managed_directory(&self) -> &Path {
         self.path.parent().unwrap()
@@ -218,6 +301,9 @@ impl WorkspaceDatabase {
     }
     pub fn try_operation(&self, key: &str) -> Result<WorkspaceOperation, WorkspaceError> {
         validate_operation_key(key)?;
+        self.admit_operation(key)
+    }
+    fn admit_operation(&self, key: &str) -> Result<WorkspaceOperation, WorkspaceError> {
         let mut admission = lock(&self.admission)?;
         if !admission.accepting {
             return Err(error(K::Closed, "workspace no longer accepts operations"));
@@ -295,7 +381,7 @@ impl WorkspaceDatabase {
         arguments: serde_json::Value,
     ) -> Result<WorkspaceAgent, WorkspaceError> {
         self.validate_operation(operation)?;
-        validate_parent(&parent_node, &self.metadata.address)?;
+        validate_parent(&parent_node, &self.metadata()?.address)?;
         validate_absolute(&tool_path)?;
         if !arguments.is_object() {
             return Err(error(
@@ -353,10 +439,9 @@ impl WorkspaceDatabase {
                 ));
             }
             let mut updated = old.clone();
+            // Existing identity/display values are authoritative in the registry.
+            // A Driver invocation may have captured older arguments before a rename.
             updated.tool_arguments = arguments;
-            if alias.is_some() {
-                updated.alias = alias;
-            }
             updated
         } else {
             let id = if node_name.is_none() {
@@ -399,7 +484,7 @@ impl WorkspaceDatabase {
             }
             candidate
         };
-        validate_record(&candidate, &self.metadata.address)?;
+        validate_record(&candidate, &self.metadata()?.address)?;
         *prepared = Some(Prepared {
             before,
             candidate: candidate.clone(),
@@ -419,7 +504,7 @@ impl WorkspaceDatabase {
         if prepared.candidate != record {
             return Err(error(K::InvalidRequest, "prepared Agent materials changed"));
         }
-        validate_record(&record, &self.metadata.address)?;
+        validate_record(&record, &self.metadata()?.address)?;
         // Files have been prepared by the caller, but the candidate cannot be
         // committed if its root has become an unsafe link or disappeared.
         let dir = self.agent_directory(&record)?;
@@ -443,12 +528,13 @@ impl WorkspaceDatabase {
         }
         tx.execute("INSERT INTO agents(id,parent_node,node_name,alias,category,directory_name,runtime_name,tool_path,tool_arguments,previous_node_name,previous_alias) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11) ON CONFLICT(id) DO UPDATE SET alias=excluded.alias,tool_arguments=excluded.tool_arguments", params![record.id,record.parent_node,record.node_name,record.alias,record.category.as_str(),record.directory_name,record.runtime_name,path_text(&record.tool_path)?,record.tool_arguments.to_string(),record.previous_node_name,record.previous_alias]).map_err(db_error)?;
         let agents = read_agents(&tx)?;
+        let metadata = read_metadata(&tx)?;
         tx.commit().map_err(db_error)?;
-        self.publish_committed(agents);
+        self.publish_committed(metadata, agents);
         Ok(record)
     }
     pub fn agent_directory(&self, record: &WorkspaceAgent) -> Result<PathBuf, WorkspaceError> {
-        validate_record(record, &self.metadata.address)?;
+        validate_record(record, &self.metadata()?.address)?;
         let base = self
             .managed_directory()
             .join("agents")
@@ -502,7 +588,7 @@ impl WorkspaceDatabase {
         let moved = self.finish_archive(c, &intent, false);
         match moved {
             Ok(record) => {
-                self.publish_committed(read_agents(c)?);
+                self.publish_committed(read_metadata(c)?, read_agents(c)?);
                 Ok(record)
             }
             Err(e) => Err(e),
@@ -534,7 +620,7 @@ impl WorkspaceDatabase {
             let intent = read_intent(c, &id)?.unwrap();
             self.finish_archive(c, &intent, true)?;
         }
-        self.publish_committed(read_agents(c)?);
+        self.publish_committed(read_metadata(c)?, read_agents(c)?);
         Ok(())
     }
     fn finish_archive(
@@ -664,22 +750,41 @@ impl WorkspaceDatabase {
         }
         Ok(c)
     }
-    fn publish_committed(&self, agents: Vec<WorkspaceAgent>) {
+    fn publish_committed(&self, metadata: WorkspaceMetadata, agents: Vec<WorkspaceAgent>) {
         self.changes.send_if_modified(|slot| {
             let Some(snapshot) = slot else {
                 return false;
             };
-            if snapshot.agents == agents {
+            if snapshot.agents == agents && snapshot.metadata == metadata {
                 return false;
             }
             snapshot.revision = snapshot
                 .revision
                 .checked_add(1)
                 .expect("Workspace snapshot revision exhausted");
+            snapshot.metadata = metadata;
             snapshot.agents = agents;
             true
         });
     }
+}
+
+fn read_metadata(c: &Connection) -> Result<WorkspaceMetadata, WorkspaceError> {
+    let metadata = c
+        .query_row(
+            "SELECT address,alias,project_root FROM workspace WHERE singleton=1",
+            [],
+            |row| {
+                Ok(WorkspaceMetadata {
+                    address: row.get(0)?,
+                    alias: row.get(1)?,
+                    project_root: PathBuf::from(row.get::<_, String>(2)?),
+                })
+            },
+        )
+        .map_err(db_error)?;
+    validate_metadata(&metadata)?;
+    Ok(metadata)
 }
 
 #[derive(Debug)]
@@ -962,10 +1067,10 @@ fn validate_segment(s: &str) -> Result<(), WorkspaceError> {
     Ok(())
 }
 fn validate_alias(s: Option<&str>) -> Result<(), WorkspaceError> {
-    if s.is_some_and(|s| s.chars().any(char::is_control)) {
+    if s.is_some_and(|s| s.trim().is_empty() || s.chars().any(char::is_control)) {
         return Err(error(
             K::InvalidRequest,
-            "alias contains control characters",
+            "alias must be nonempty, not all whitespace, and contain no control characters",
         ));
     }
     Ok(())
@@ -1129,4 +1234,45 @@ fn lock<T>(mutex: &Mutex<T>) -> Result<MutexGuard<'_, T>, WorkspaceError> {
     mutex
         .lock()
         .map_err(|_| error(K::DatabaseFailed, "Workspace lock was poisoned"))
+}
+
+#[cfg(test)]
+mod alias_admission_tests {
+    use super::*;
+    #[test]
+    fn accepted_alias_write_blocks_close_and_idle_until_transaction_finishes() {
+        let directory = tempfile::tempdir().unwrap();
+        for kind in ["normal", "temporary", "archived"] {
+            fs::create_dir_all(directory.path().join("agents").join(kind)).unwrap();
+        }
+        let db = WorkspaceDatabase::create(
+            directory.path().join("workspace.sqlite"),
+            WorkspaceMetadata {
+                address: "/demo".into(),
+                alias: "Demo".into(),
+                project_root: "/project".into(),
+            },
+        )
+        .unwrap();
+        let connection = db.conn().unwrap();
+        let worker = db.clone();
+        let join = std::thread::spawn(move || worker.rename_workspace_alias("renamed".into()));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while lock(&db.admission).unwrap().nodes.is_empty() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "write did not acquire admission"
+            );
+            std::thread::yield_now();
+        }
+        let mut idle = Box::pin(db.wait_idle());
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(std::future::Future::poll(idle.as_mut(), &mut context).is_pending());
+        assert_eq!(db.close().unwrap_err().kind, K::Busy);
+        drop(connection);
+        join.join().unwrap().unwrap();
+        assert!(std::future::Future::poll(idle.as_mut(), &mut context).is_ready());
+        assert_eq!(db.metadata().unwrap().alias, "renamed");
+        db.close().unwrap();
+    }
 }

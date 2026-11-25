@@ -60,6 +60,7 @@ crate公开：
 dto_route_system(world: &mut World)
     处理事件：DtoRequest
     接收闭包结果：None
+    提交闭包：rename_alias内部一次性异步数据库操作--workspace.rename / agent.rename
     产出事件：RegisterClient、CreateWorkspace、DeleteWorkspace、StartWorkspaceAgent、StopAgent、ArchiveAgent、MclCommand
     回复：各请求原oneshot
     行为：逐条受理普通请求，业务更新由所属领域统一入口直接同步，不在此轮询投影。
@@ -103,13 +104,16 @@ ws_handler(State(state): State<DtoState>, ConnectInfo(peer): ConnectInfo<SocketA
     行为：评估入口策略和退出状态，通过state.clients.allocate取得真实连接、唯一ClientReceiver及取消能力；升级任务持有AxumWorkGuard。
 
 handle_dto_request(world: &mut World, request: DtoRequest)
-    行为：取出具体owned对象，resource.req交给resources进行异步只读查询，其余按route转换领域请求或只读查询；原reply继续沿领域执行链回复；agent.start/stop/archive按新事件分派，不接受restart旧接口。
+    行为：取出具体owned对象，resource.req交给resources进行异步只读查询，workspace.rename/agent.rename交给rename_alias进行数据库别名事务，其余按route转换领域请求或只读查询；原reply继续沿领域执行链回复；agent.start/stop/archive按新事件分派，不接受restart旧接口。
 
 handle_abort_control(world: &mut World, event: AbortTurnControl)
     行为：认领原请求，校验真实Client、Agent及turn，调用WorldAgentExt的统一turn入口及相关领域取消能力；原oneshot回复。
 
 projection::address(world: &World, entity: Entity) -> Option<String>
+projection::workspace(world: &World, entity: Entity) -> Option<(WorkspaceInfoDto, u64)>
+    行为：一次borrow数据库提交快照，投影metadata.alias与agents并返回同一revision；地址、project_root和运行state由同一实体组件读取，不执行SQL。
 projection::workspaces(world: &World) -> Vec<WorkspaceInfoDto>
+    行为：遍历Workspace，调用workspace投影并按地址排序，不从独立Workspace.alias字段读取或回写。
 projection::agents(world: &World) -> Vec<AgentStateDto>
     行为：读取当前Agent组件的workspace/state/turn及已挂载的Tools、ToolTasks、推理公共信息；状态来自Starting/Running/Closing，不从目录类别或任务returned推断运行状态。turn独立发布，creator取Agent.parent地址和task_id，运行会话取Agent.instance，不依赖旧任务绑定组件；error仅从parent任务的公开错误投影，Agent自身不新增fault字段。
 projection::turn(world: &World, entity: Entity) -> Option<AgentTurnStateDto>
@@ -156,6 +160,14 @@ ModelConfigView::refresh_locked(&self) -> Future<Output=Result<String,ProtocolEr
     行为：operations锁统一串行监控/查询/修改；调用inference的read/load能力取得原文与最近校验路由，通过既有WorldClosureSender将ModelRoutes::replace和AgentInferenceConfig安全投影提交回World；无效来源清空路由投影，不回退旧模型。
         原文读取成功即可供编辑，不要求当前文本语义有效；读取失败发布content=None及error。视图实际变化经update直接提交SyncContext，初始None/None表示尚未读取。
         replace先await inference的完整校验和原子写入能力，成功后refresh_locked，再完成请求；校验/写入失败返回原错误，不伪造成功。
+rename_alias(world: &World, object: Box<dyn Any + Send>, agent: bool)
+    行为：workspace.rename认领Prepared<WorkspaceRenameDto, (), WorkspaceError>；agent.rename认领Prepared<AgentRenameDto, (), WorkspaceError>，校验真实Client和完整Workspace实体。
+        Workspace必须Running；克隆database、owned参数及AxumWorkGuard，提交AsyncRuntimeHandle::spawn，再在spawn_blocking调用rename_workspace_alias或rename_agent_alias。
+        Agent只按所属Workspace数据库中的agent_id定位，不查运行Agent实体；normal、temporary、archived及未运行登记都可修改。
+        通过原reply回复数据库确认结果，不发送新业务事件、完成事件或增加System；客户端断开不取消已受理事务，worker及guard真实完成后释放。
+        成功只返回()；失败映射InvalidRequest、WorkspaceMissing、AgentRecordMissing、StateRejected或实际数据库错误。sync不代替原result，先后按实际调度到达。
+        Agent别名为必填nullable参数，None清空；不修改node、目录、Driver参数或任务状态；相同值不重复发布同步。
+
 resources(world: &World, object: Box<dyn Any + Send>)
     行为：认领Prepared<ResourceQueryDto, Vec<ResourceInfoDto>>，校验真实已注册Client，克隆address::ResourceRoots及AxumWorkGuard。
         以AsyncRuntimeHandle::spawn提交闭包，再用spawn_blocking调用address::query_resources；将owned条目转为协议字段，显式提供nullable tool_path。
@@ -166,7 +178,8 @@ model_config(world: &World, object: Box<dyn Any+Send>, write:bool)
 install_workspace_monitor(world: &mut World)
     行为：DTO首次安装时，对已有Workspace调用Installed并发布当前rows；后续依赖领域探针，不按帧扫描。
 Workspace Installed回调中的spawn异步闭包
-    行为：subscribe_changes后先borrow_and_update当前确认快照，再等待changes.changed/cancel/lifetime；只更新当前owner的登记列表并publish，不修改运行状态字段。
+    行为：subscribe_changes后先borrow_and_update当前确认快照，再等待changes.changed/cancel/lifetime；在同一视图锁下更新owner的metadata.alias及agents并publish，不修改运行state。
+        组件Changed投影也读取同一数据库确认快照，禁止用启动时旧alias或旧登记列表回滚已提交更名；整个Workspace快照按同来源revision拒绝迟到值。
         WorkspaceWatch保存实际database、active及cancel；Closing/Removed移除watch时先失效active再cancel。工作Future持AxumWorkGuard，退出后释放。
 run_settings_watch(context: SettingsContext) -> Future<Output = ()>
     行为：绑定实际AgentStorage的settings_path，目录不存在时观察可用的父来源并报告读取状态；观察父目录以覆盖原子替换、删除及恢复；先订阅再读取，过滤Access与无关路径，读取在blocking worker执行。
@@ -195,7 +208,7 @@ prepare_request(state: &DtoState, connection: ConnectionId, message: ClientMessa
         普通请求包装DtoRequest，中止包装AbortTurnControl；注册只携带ConnectionId及自报标签，不复制sender或网络注册表。
         注册成功后Client领域已经原子发布身份；一次性回复不绕回DTO完成事件。
         workspace.create/delete按原reply转交CreateWorkspace/DeleteWorkspace；agent.start按Existing/New构造StartWorkspaceAgent<ToolExecuteResponse, ToolError>并原样转交reply，agent.stop/archive对应StopAgent/ArchiveAgent。
-        不再接收workspace.start/stop/restart/update/rename；agent.start只发起Driver工具调用，不在网络层准备Agent持久化组件或创建实体。
+        不再接收workspace.start/stop/restart/update；workspace.rename只修改展示别名，不恢复旧地址重命名语义；agent.start只发起Driver工具调用，不在网络层准备Agent持久化组件或创建实体。
         客户端断开仅结束网络等待，已受理业务由所属监督收口，不能丢弃已打开连接或待绑定实体。
         UI查询沿原oneshot返回观察状态；base64和wire编码保持在网络边界。
 
@@ -385,10 +398,18 @@ TurnView
     view: View<AgentTurnStateDto>
     sync: SyncContext<AgentTurnStateDto>
 WorkspaceViews
-    rows: Mutex<BTreeMap<Entity, WorkspaceInfoDto>>
+    rows: Mutex<BTreeMap<Entity, WorkspaceView>>
     view: View<Vec<WorkspaceInfoDto>>
     sync: SyncContext<Vec<WorkspaceInfoDto>>
     sources: Mutex<BTreeMap<Entity, WorkspaceWatch>>
+WorkspaceView
+    database: workspace_core::WorkspaceDatabase
+    revision: u64
+    row: WorkspaceInfoDto
+    project(&mut self, database: WorkspaceDatabase, row: WorkspaceInfoDto, revision: u64)
+        行为：保存World投影；同连接旧revision只更新运行字段，保留较新的alias、agents和revision。
+    apply_snapshot(&mut self, database: &WorkspaceDatabase, snapshot: WorkspaceRecordsSnapshot)
+        行为：仅相同连接且版本不旧时更新alias、agents和revision，保留运行字段。
 WorkspaceWatch
     database: workspace_core::WorkspaceDatabase
     active: Arc<AtomicBool>

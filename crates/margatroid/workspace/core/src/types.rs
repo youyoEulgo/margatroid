@@ -64,6 +64,7 @@ impl WorkspaceAgent {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WorkspaceRecordsSnapshot {
     pub revision: u64,
+    pub metadata: WorkspaceMetadata,
     pub agents: Vec<WorkspaceAgent>,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]

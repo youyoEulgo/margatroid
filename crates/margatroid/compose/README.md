@@ -8,7 +8,7 @@ Compose 位于业务 plugin 之上，负责装配多个 plugin 和 core；领域
 
 Workspace 使用绝对节点路径，例如 `/demo`，管理目录为数据根下的 `workspaces/demo`。`workspace.create` 创建 `workspace.sqlite` 和 `agents/normal`、`temporary`、`archived` 三类目录，并挂载 Workspace 实体；`project_root` 是独立的实际项目目录，不可与管理目录互相包含。
 
-Agent 启动先调用 Driver 工具。`agent.start` 的 `new` 变体传入 Workspace、实际工具清单路径和完整参数；`existing` 变体只传 Workspace 和已登记节点名，从数据库读取原工具路径和参数。节点名、别名及工作目录参数由 Driver 使用，不另设宿主隐式参数通道。
+Agent 启动先调用 Driver 工具。`agent.start` 的 `new` 变体传入 Workspace、实际工具清单路径和完整参数；`existing` 变体只传 Workspace 和已登记节点名，从数据库读取工具路径及上次启动参数，再用当前登记node_name/alias整理本次参数；alias清空就移除旧参数。节点名、别名及工作目录参数由 Driver 使用，不另设宿主隐式参数通道。
 
 Driver 的 `margatroid.agent:create` 统一检查节点的 Driver 和父节点归属，取得节点操作凭证，准备文件并打开存储连接。随后提交登记，再把已连接的 `AgentStorage`、实际父实体和任务 ID 交给 Agent System。System 同步挂载 Agent、地址、MCL 队列、工具集合、任务集合、推理句柄和存储组件，将返回的关闭能力绑定到创建任务。
 

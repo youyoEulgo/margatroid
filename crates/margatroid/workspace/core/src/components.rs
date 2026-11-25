@@ -4,15 +4,13 @@ use std::path::PathBuf;
 
 #[derive(Clone, Debug)]
 pub struct Workspace {
-    pub alias: String,
     pub project_root: PathBuf,
     pub state: WorkspaceState,
     pub database: WorkspaceDatabase,
 }
 impl Workspace {
-    pub fn new(alias: String, project_root: PathBuf, database: WorkspaceDatabase) -> Self {
+    pub fn new(project_root: PathBuf, database: WorkspaceDatabase) -> Self {
         Self {
-            alias,
             project_root,
             state: WorkspaceState::Running,
             database,

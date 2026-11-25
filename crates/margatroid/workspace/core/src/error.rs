@@ -4,6 +4,9 @@ use std::{fmt, path::PathBuf};
 pub enum WorkspaceErrorKind {
     InvalidRequest,
     Missing,
+    AgentRecordMissing,
+    WorkspaceMissing,
+    StateRejected,
     Busy,
     Closed,
     DriverMismatch,
