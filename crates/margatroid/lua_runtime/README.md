@@ -64,3 +64,40 @@ Lua 值桥接区分数组、对象与 null；嵌套空数组保持身份，混�
 files 保留原始字节及实际工作范围，process 子进程归属本次执行 registry，取消与退出等待真实回收。工具注册和子 Agent 的生命周期绑定由实际任务监督，不由 Lua userdata 的 Drop 伪造异步完成。
 
 当前测试覆盖独立线程、自然退出 join、重复停止、旧实例拒绝、启动超时、CPU hook 取消、子进程回收、任务集合不被替换、MCL 错误值、值桥接及诊断持久化。
+
+
+## 通用 HTTP 能力
+
+已实现只读命名空间 `margatroid.http`，只提供一个异步方法 `request(options)`，不引入厂商专用 API。HTTP 由 Rust reqwest/rustls 实现，无需 curl、Python 或 shell。共享代码属于 lua_runtime_core 的 host/http；独立 VM 和工具 worker 各自安装，后者必须在原沙箱内直接联网，不能借 daemon 代发绕过网络限制。新能力不使现有 Linux 工具沙箱与进程回收自动获得其他平台支持。
+
+```lua
+-- execute 阶段；api_key和arguments由上层工具取得。
+local response = margatroid.http:request({
+    url = "https://api.example.com/search",
+    method = "POST",
+    headers = {
+        { name = "Content-Type", value = "application/json" },
+        { name = "Authorization", value = "Bearer " .. api_key },
+    },
+    body = margatroid.data:encode("json", { query = arguments.query }),
+    timeout_ms = 30000,
+    max_response_bytes = 8 * 1024 * 1024,
+})
+-- 所有HTTP状态都返回response，由工具解释业务失败。
+if response.status < 200 or response.status >= 300 then
+    error("search service returned HTTP " .. response.status)
+end
+local result = margatroid.data:decode("json", response.body)
+```
+
+入参只有 url、method、headers、body、timeout_ms、max_response_bytes，未知字段或错误类型拒绝。method 默认 GET，支持 GET/HEAD/POST/PUT/PATCH/DELETE/OPTIONS；GET/HEAD 不允许 body。headers 为 `{name,value}` 连续数组，body 为原始 Lua 字节字符串，既不自动 JSON 编码也不转换为 base64。HTTP 返回 `{status, headers, body}`，响应头保留重复项及字节值，正文是完整原始实体字节，HEAD 正文为空。
+
+默认总超时30秒，可选1至120000毫秒，连接最多10秒，均不能延长调用执行本身的deadline。请求正文最多8MiB；响应默认8MiB，可降低或提升到16MiB；请求、响应headers各最多128项、64KiB。每次执行最多8个并发请求，超出即Busy，不建立无界排队；响应按读取过程限长，失败不返回截断伪完整数据。并发还受现有Lua内存及执行资源预算约束。
+
+URL 仅接受明确 http/https，拒绝URL内嵌账号密码和fragment。TLS必须验证证书。默认不开代理环境读取、cookie会话、自动重试、自动重定向或自动解压；3xx返回调用方，压缩正文仍是原始字节。Host、Content-Length及其他传输控制头由客户端管理，脚本不可覆盖。私网/公网地址是否可连接取决于原执行环境的网络权限；本能力不是额外授权通道，不根据任意厂商名字放宽权限。
+
+每次执行拥有一个HttpContext和在途计数。请求直接await，没有脱离执行生命周期的后台网络任务；取消、超时或wait_any淘汰该Future会释放请求及body流。退出关闭受理并等待在途Future释放后才确认本地收口，不承诺远端已经中止或回滚。传输异常使用固定分类安全错误，不直接输出含URL、query或header的原始reqwest错误；所有HTTP状态（包括4xx/5xx）则保留响应供工具判断。
+
+通用HTTP层不自动读取任何Agent配置或API Key，不把凭据放进进程参数、默认日志、历史或诊断。上层search/fetch工具负责从真实调用Agent配置读取凭据、构造Authorization，并筛选可返回的业务内容。不能将原始错误响应、认证头或配置直接拼入工具错误；脚本显式输出敏感值仍是工具层责任。通用能力不包含DeepSeek分支；专用search/fetch资源和web.deepseek.api_key配置见Tool说明，不修改前端或模型推理适配器。
+
+回归测试覆盖：两种执行环境同一请求行为；configure拒绝及只读命名空间；JSON与二进制往返；重复头；非2xx/3xx正常返回；非法URL拒绝；压缩保持原字节；重定向不跟随、凭据不跨地址发送；连接及读体超时；未知长度和谎报长度响应限流；并发Busy；取消、wait_any淘汰及退出无在途请求；工具worker内直接HTTP而非daemon转发。测试使用本地隔离HTTP，不访问用户真实服务或修改用户配置。TLS使用rustls默认验证与系统根证书，未添加关闭验证选项；未进行外部TLS服务或自签名证书握手测试。

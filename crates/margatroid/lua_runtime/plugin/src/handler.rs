@@ -891,6 +891,14 @@ async fn execute_lua(
         )
         .map_err(lua_error)?;
     let callbacks = lua.create_table().map_err(lua_error)?;
+    let http = host::http::HttpContext::new(cancel.clone(), deadline)
+        .map_err(|error| failure(LuaRuntimeErrorKind::EnvironmentFailed, error.to_string()))?;
+    callbacks
+        .set(
+            "http_request",
+            host::http::install_http(&lua, http.clone()).map_err(lua_error)?,
+        )
+        .map_err(lua_error)?;
     if let Some(services) = context.services.clone() {
         let identity = lua_runtime_core::LuaExecutionIdentity {
             source: context.instance.owner,
@@ -996,7 +1004,7 @@ async fn execute_lua(
         .get::<mlua::Function>("execute")
         .map_err(lua_error)?;
     let public_context = host::data::to_lua(&lua, execution_context).map_err(lua_error)?;
-    tokio::select! {
+    let result = tokio::select! {
         biased;
         () = cancel.cancelled() => Err(failure(LuaRuntimeErrorKind::Cancelled, "Lua execution cancelled")),
         () = async {if let Some(deadline)=deadline{tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await;}else{std::future::pending::<()>().await;}}=>Err(failure(LuaRuntimeErrorKind::ExecutionFailed,"Lua execution deadline exceeded")),
@@ -1004,7 +1012,9 @@ async fn execute_lua(
             if cancel.is_cancelled() { Err(failure(LuaRuntimeErrorKind::Cancelled, "Driver cancelled")) }
             else { result.map_err(|error| logger.capture(error, LuaRuntimeErrorKind::ExecutionFailed)) }
         }
-    }
+    };
+    http.close_and_wait().await;
+    result
 }
 
 fn lua_error(error: mlua::Error) -> LuaRuntimeError {

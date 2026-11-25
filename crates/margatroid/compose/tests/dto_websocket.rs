@@ -2622,7 +2622,14 @@ fn registered_and_new_starts_dispatch_actual_path_requests_and_duplicate_new_is_
     };
     assert_eq!(initiator, h.workspace);
     assert_eq!(path, record.tool_path);
-    assert_eq!(arguments, record.tool_arguments);
+    let mut expected_arguments = record.tool_arguments.clone();
+    expected_arguments["node_name"] = json!(record.node_name);
+    if let Some(alias) = &record.alias {
+        expected_arguments["alias"] = json!(alias);
+    } else {
+        expected_arguments.as_object_mut().unwrap().remove("alias");
+    }
+    assert_eq!(arguments, expected_arguments);
     reply
         .lock()
         .unwrap()

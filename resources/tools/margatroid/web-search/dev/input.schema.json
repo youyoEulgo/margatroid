@@ -1,0 +1,14 @@
+{
+  "type": "object",
+  "properties": {
+    "queries": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 10,
+      "items": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "\\S" },
+      "description": "1–10 search queries; their results are merged. Each query must contain 1–128 Unicode characters and cannot be blank. Supports site:, -site:, quoted phrases, lang:, after: and before:."
+    }
+  },
+  "required": ["queries"],
+  "additionalProperties": false
+}

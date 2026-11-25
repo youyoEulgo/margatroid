@@ -8,10 +8,16 @@ keep_messages = 16
 model = "deepseek-v4.1-flash"
 temperature = 0.2
 
+[web.deepseek]
+# Fill in this Agent configuration before using web_search or web_fetch.
+api_key = ""
+
 [initialization]
 # Run defaults first, then user-defined commands.
 default = [
     { command = "IMPORT TOOL tool:margatroid/skill-register:dev AS skill_register", arguments = [] },
+    { command = "IMPORT TOOL tool:margatroid/web-search:dev AS web_search", arguments = [] },
+    { command = "IMPORT TOOL tool:margatroid/web-fetch:dev AS web_fetch", arguments = [] },
     { command = "IMPORT TOOL tool:margatroid/mcp-register:dev AS mcp_register", arguments = [] },
     { command = "IMPORT MESSAGE prompt:margatroid/coder-soul:dev AS soul", arguments = [] },
     { command = "IMPORT MESSAGE prompt:margatroid/compact:dev AS compact", arguments = [] },

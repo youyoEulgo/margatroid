@@ -7,6 +7,7 @@ use serde_json::Value;
 use std::sync::{Arc, Mutex};
 pub mod data;
 pub mod diagnostic;
+pub mod http;
 pub mod process;
 pub use diagnostic::{LuaFailureClass, LuaFailureDiagnostic};
 
@@ -94,6 +95,7 @@ enum NamespaceKind {
     Data,
     Text,
     Process,
+    Http,
     Tools,
     Task,
     Workspace,
@@ -101,11 +103,12 @@ enum NamespaceKind {
     Agent,
 }
 impl NamespaceKind {
-    const ALL: [Self; 9] = [
+    const ALL: [Self; 10] = [
         Self::Files,
         Self::Data,
         Self::Text,
         Self::Process,
+        Self::Http,
         Self::Tools,
         Self::Task,
         Self::Workspace,
@@ -118,6 +121,7 @@ impl NamespaceKind {
             Self::Data => "data",
             Self::Text => "text",
             Self::Process => "process",
+            Self::Http => "http",
             Self::Tools => "tools",
             Self::Task => "task",
             Self::Workspace => "workspace",
@@ -152,6 +156,7 @@ const NAMESPACE_METHODS: &[(NamespaceKind, &str, &str, bool)] = &[
     (NamespaceKind::Data, "decode", "data_decode", false),
     (NamespaceKind::Text, "search", "text_search", false),
     (NamespaceKind::Process, "start", "process_start", true),
+    (NamespaceKind::Http, "request", "http_request", true),
     (NamespaceKind::Tools, "register", "tools_register", true),
     (
         NamespaceKind::Task,

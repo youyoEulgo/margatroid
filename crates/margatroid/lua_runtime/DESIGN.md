@@ -14,7 +14,7 @@ System区分事件、闭包结果、提交闭包和oneshot回复，使用Rust名
 # components lua_runtime/core/src/components.rs                        DriverLuaVm组件
 # events     lua_runtime/core/src/events.rs                            VM启停请求及退出通知
 # system     lua_runtime/plugin/src/system.rs                          请求及闭包结果路由
-# handler    lua_runtime/plugin/src/handler.rs                         VM提交、宿主注入、等待和回复
+# handler    lua_runtime/plugin/src/handler.rs；core/src/host/http.rs    VM提交、宿主注入与共享HTTP执行
 # types      lua_runtime/plugin/src/types.rs                           闭包上下文及结果
 # types pub  lua_runtime/core/src/types.rs                             程序、环境及通知能力
 # error      lua_runtime/core/src/error.rs                             LuaRuntimeError
@@ -169,7 +169,8 @@ execute_lua(context, environment, logger, processes) -> Future<Output = Result<(
         从宿主环境execution_context.arguments固定取得原始参数，省略时为空对象；configure与execute均接收该参数及本次可信context，不硬传nil。
         enable_execution加载同一标准库并恢复保存全局，Margatroid.enable安装相同公共方法；读取execute并异步调用，配置超时同时约束CPU及等待。
         source为实际执行Entity/执行instance，目标由方法显式指定；context含workspace/resource_dir/task_id/task_address和独立arguments副本，不预造Agent，不从Lua副本判定Driver身份。
-        公共服务回调通过LuaServices，文件/data/text/process沿既有共享安装器；全程不按HostKind裁剪API。
+        公共服务回调通过LuaServices，文件/data/text/process/http沿共享安装器；全程不按HostKind裁剪API。
+        创建本次HttpContext并安装http_request回调；HTTP在执行者线程的异步runtime内执行，不经World或业务服务代理。execute_lua返回前close并等待HTTP在途Future释放，之后才能完成VM退出。
 
 ```
 
@@ -270,6 +271,7 @@ Margatroid：共享Lua userdata
     data: 数据转换子对象--encode、decode及null标记
     text: 文本搜索子对象--search
     process: 子进程子对象--start
+    http: HTTP子对象--request，只有execute阶段可调用
     mcl: execute--明确Agent目标
     agent: create--无需Agent MCL队列
     workspace: agents--实时成员
@@ -278,7 +280,7 @@ Margatroid：共享Lua userdata
     task: 运行任务子对象--return_result、finish、append_output、replace_output、read_output、send、receive
 
 HostNamespace：只读子对象
-    namespace: Files | Data | Text | Process | Tools | Task | Workspace | Mcl | Agent
+    namespace: Files | Data | Text | Process | Http | Tools | Task | Workspace | Mcl | Agent
     callbacks: Arc<Mutex<Option<BTreeMap<String, Function>>>>--execute阶段冻结，不暴露可写表
 
 HostDefinition：两种执行环境共用的宿主定义
@@ -323,14 +325,14 @@ Margatroid::install(lua: &Lua, definition: HostDefinition) -> Result<AnyUserData
     行为：
         两种运行时复用同一userdata、字段getter和值转换，不在plugin间互相调用
         强制context.kind匹配宿主身份，context及其arguments返回独立副本
-        files、data、text、process、mcl、agent、workspace、tools、task均为不可替换子对象，未enable时方法均明确拒绝
+        files、data、text、process、http、mcl、agent、workspace、tools、task均为不可替换子对象，未enable时方法均明确拒绝
         data.null保留空值身份，根对象不再提供version、arguments或null字段
         不保留旧全局mcl、wait、agent_info、顶层文件编解码方法或tool命名空间作为兼容入口
 
 Margatroid::enable(object: &AnyUserData, callbacks: Table) -> Result<(), LuaError>
     行为：
         选取统一公共方法，冻结为不向Lua公开的私有回调集合
-        公共方法按files、data、text、process绑定，log、wait和wait_any保留在根对象
+        公共方法按files、data、text、process、http绑定，log、wait和wait_any保留在根对象
         mcl/agent/workspace与tools/task对所有Lua执行者同等开放，缺失实际目标或任务能力明确失败
         tools只登记定义，task只控制运行任务，不能因owner字段或命名重叠隐式联动
         拒绝重复enable；HostKind只用于来源元数据，不决定能力集合
@@ -349,6 +351,28 @@ margatroid:log(level: String, message: String, details: Option<LuaValue>) -> Fut
         脚本不能指定或覆盖可信关联；不追加历史、不触发推理、不结束回合
         失败返回写入错误，不递归log；工具configure阶段不开放该IO方法
 
+margatroid.http:request(options: HttpRequestOptions) -> Future<HttpResponse>
+    行为：绑定core/src/host/http.rs的共享安装器，回调名http_request；先取得执行能力并释放userdata借用，再校验请求、认领在途槽位并异步执行。
+        只在execute阶段开放；Driver工具worker与独立嵌入VM使用同一实现，HttpContext属于实际执行者，不能通过Lua伪造或切换。
+        不读取Agent配置、API Key或环境凭据，不添加厂商参数、鉴权或固定地址；上层工具自行从真实调用Agent配置读取并构造请求。
+        返回2xx至5xx等所有有效HTTP最终响应，状态码失败不是传输错误；3xx也原样返回，不自动跳转。HEAD返回空body。
+        请求、读响应和取消均不持World或阻塞VM线程；无后台脱离执行的HTTP任务、无进度事件、无自动历史或任务输出写入。
+
+install_http(lua: &Lua, context: HttpContext) -> Result<Function, LuaError>
+    行为：共享安装器返回异步http_request回调，严格解析Lua表和原始Lua字符串；不经serde_json转换body，不依赖业务core或外部curl。
+HttpContext::request(&self, options: HttpRequestOptions) -> Future<Result<HttpResponse, HttpError>>
+    行为：拒绝已关闭执行；最多8个并发请求，超过立即Busy，不创建无限等待队列。认领槽位后建立RAII guard，所有返回、取消、panic释放槽位并通知idle。
+        每次发送前校验绝对http/https URL、host及端口，拒绝userinfo、fragment及其他scheme；保留query而不写日志，不猜测厂商。允许目标地址范围仍受实际执行者的OS网络权限约束，不绕过沙箱。
+        TLS正常验证系统信任根，不能通过options关闭；Client关闭自动redirect、retry、cookie持久化和环境proxy，不自动携带Basic认证；不调用shell或外部程序。
+        校验method及headers后设置显式正文；Content-Length由实际字节数计算，拒绝调用者设置Host、Content-Length、Transfer-Encoding、Connection、Upgrade、Proxy-Authorization等传输/代理控制头。
+        header name严格HTTP token、value拒绝CR/LF/NUL；请求headers总计最多64KiB、最多128项，超过在发送前失败。响应header限制相同，名称规范化小写并保留重复项和实际值字节。
+        超时覆盖DNS、连接、TLS、发送、响应头和完整body；有效deadline取request timeout、执行整体deadline及执行cancel三者最早者，connect至多10秒且不延长总deadline。
+        响应Content-Length提前超过上限可立即失败；实际按分片累积并检查字节上限，不靠Content-Length证明大小，不截断后冒充完整响应。
+        不请求或自动解压gzip/br/deflate/zstd，默认Accept-Encoding: identity；若调用方显式要求压缩，返回原始压缩字节，由工具自行解码。协议重组去掉chunk framing，不更改实体正文。
+        取消/超时立即丢弃当前reqwest请求或body流并停止本地读取，释放响应和槽位；不等待远端业务回滚，也不声称远端未执行副作用。默认不重试任何方法。
+HttpContext::close_and_wait(&self) -> Future<Output = ()>
+    行为：关闭受理并cancel本次上下文，等active计数归零。调用Future被wait_any淘汰时由Drop释放请求流，不留下后台HTTP；整体执行退出先完成此收口再发退出确认。
+
 margatroid.mcl:execute(target: String, instruction: String, arguments: Option<Vec<Value>>) -> Future<Value>
     行为：公共服务固定真实source身份，以明确目标提交原MclCommand，原oneshot/审计/取消保留；nil参数等价省略，目标仅Starting/Running可用。
         成功始终返回结果对象，Unit返回空JSON对象{}，在Lua中保留object标记；MCL执行失败返回Error对象，可由Lua检查后继续。
@@ -363,8 +387,43 @@ HostNamespace::callback(name: &str) -> Result<Function, LuaError>
     行为：
         根据命名空间和固定执行身份查找冻结的回调，具体共享方法签名见Tool设计
         所有公共namespace共享可用方法，执行阶段确认后按宿主能力调用
-        文件、数据、文本、进程和日志沿真实执行环境的权限和阶段启用
+        文件、数据、文本、进程、HTTP和日志沿真实执行环境的权限和阶段启用
         缺失能力或错误namespace明确失败，TaskHandle和取消归属由宿主真实注入
+
+HttpRequestOptions：core/src/host/http.rs共享Lua HTTP请求值，不是网络DTO或新的ECS事件
+    url: String--必填绝对http/https URL
+    method: String--可选，默认GET；只接受GET、HEAD、POST、PUT、PATCH、DELETE、OPTIONS大写值
+    headers: Vec<HttpHeader>--可选，默认[]；严格连续Lua数组
+    body: Option<Vec<u8>>--可选原始Lua字节字符串；省略为无正文，空字符串为零字节正文；GET/HEAD禁止提供body
+    timeout_ms: u64--可选默认30000；1..=120000，不能越过执行整体deadline
+    max_response_bytes: usize--可选默认8MiB，1..=16MiB；请求body固定最多8MiB
+    行为：未知字段、非法类型、null冒充省略、稀疏/混合数组均拒绝；options不能指定TLS/proxy/redirect/retry配置。
+HttpHeader
+    name: String
+    value: Vec<u8>--Lua原始字符串，敏感值只存在本次请求，不自动记录
+HttpResponse
+    status: u16
+    headers: Vec<HttpHeader>--Lua连续数组，重复header不丢失
+    body: Vec<u8>--完整响应实体的Lua字节字符串，不自动JSON解析、不自动base64
+HttpContext：每个执行实例创建一个，共享安装器使用，非World Resource
+    client: reqwest::Client--rustls跨平台TLS，池只在本次执行生命周期内复用
+    cancel: CancellationToken--本次执行cancel的child，不可反向取消父执行
+    deadline: Option<Instant>
+    shared: Arc<Shared>
+    new(cancel: CancellationToken, deadline: Option<Instant>) -> Result<Self, HttpError>
+    行为：只依赖通用HTTP与异步库，无Agent/Workspace/Tool业务类型；被工具worker及lua_runtime_plugin各自安装，不互相依赖plugin。
+Shared：HTTP模块私有
+    admission: Mutex<Admission>
+    idle: Notify
+Admission
+    accepting: bool
+    active: usize
+RequestGuard(Arc<Shared>)：私有RAII在途计数凭证
+    Drop：释放active并唤醒idle；不spawn异步收尾。
+HttpError：共享类型化错误，不在全局保存响应或认证材料
+    kind: InvalidRequest | Busy | Closed | Cancelled | Timeout | Transport | ResponseTooLarge | HeadersTooLarge
+    message: &'static str--固定分类说明，原始reqwest错误不直接展示，避免URL query或凭据进入日志
+    行为：用mlua ExternalError传播，Lua可pcall处理；未处理沿现有宿主故障链。HTTP状态码本身不抛此错误，不自动打印body或headers。
 
 HostFuture：公开类型别名
     Pin<Box<dyn Future<Output = Result<LuaValue, LuaRuntimeError>> + Send>>

@@ -149,6 +149,7 @@ async fn every_group_dispatches_plain_callbacks_and_rejects_wrong_capabilities()
         ("data", &["encode", "decode"]),
         ("text", &["search"]),
         ("process", &["start"]),
+        ("http", &["request"]),
         ("mcl", &["execute"]),
         ("agent", &["create"]),
         ("workspace", &["agents"]),
@@ -166,13 +167,13 @@ async fn every_group_dispatches_plain_callbacks_and_rejects_wrong_capabilities()
             ],
         ),
     ];
-    assert_eq!(groups.len(), 9);
+    assert_eq!(groups.len(), 10);
     assert_eq!(
         groups
             .iter()
             .map(|(_, methods)| methods.len())
             .sum::<usize>(),
-        21
+        22
     );
     for kind in [HostKind::Driver, HostKind::Tool] {
         let (lua, object) = host(kind);

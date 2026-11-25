@@ -281,6 +281,9 @@ run_tool_worker(request: RunnerRequest) -> Result<(), ToolError>
         异步方法同步取得内部共享句柄并释放userdata借用，再执行等待，支持同一对象并发调用。
         安装共享Margatroid对象定义，按tool身份、configure阶段和当前执行边界绑定允许的能力
         配置经Configured帧往返确认后启用公共执行方法与margatroid.tools与margatroid.task方法，再运行execute(arguments, context)，不重新加载脚本
+        创建执行级HttpContext并用lua_runtime_core共享install_http绑定http_request；HTTP在当前受沙箱约束的worker直接执行，不通过HostFrame/LuaServices转发到权限更大的daemon。
+        HttpContext使用当前执行cancel和整体deadline；worker自然退出先close_and_wait释放在途请求流，再进入原进程与任务清理。worker被强制终止时由OS关闭socket，父监督仍等待原worker真实退出。
+        无新增System、事件或进程协议，HTTP的输入、响应、固定预算与错误定义使用Lua Runtime设计，不复制另一套HTTP实现。
         margatroid.driver方法始终拒绝，执行身份在宿主绑定时固定，不接受arguments或可写Lua表覆盖
         执行阶段os.execute和io.popen报错并提示使用margatroid.process:start。自然退出也进入清理；
         task_finish自身以控制退出终止后续Lua语句，不等待自身JoinHandle。
@@ -305,6 +308,7 @@ Margatroid：共享Rust userdata，Lua全局对象名margatroid
     data: 数据格式转换子对象，含null空值标记
     text: 通用文本搜索子对象
     process: 子进程启动子对象
+    http: 通用HTTP子对象--request，execute阶段开放；实现和类型由lua_runtime_core共享
     driver: Driver协调子对象
     tools: 工具定义注册子对象
     task: ToolTask执行及交互子对象

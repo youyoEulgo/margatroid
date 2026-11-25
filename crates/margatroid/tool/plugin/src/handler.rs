@@ -2215,6 +2215,14 @@ async fn run_tool_worker<R: AsyncBufRead + Unpin + Send + 'static>(
             host::install_wait_any(&lua).map_err(lua_failure)?,
         )
         .map_err(lua_failure)?;
+    let http = host::http::HttpContext::new(finish.clone(), execution_deadline)
+        .map_err(|failure| error(Kind::ExecutionFailed, failure.to_string()))?;
+    callbacks
+        .set(
+            "http_request",
+            host::http::install_http(&lua, http.clone()).map_err(lua_failure)?,
+        )
+        .map_err(lua_failure)?;
     let (processes, process_start) =
         process::install_process(&lua, request.context.project_root.clone())
             .map_err(lua_failure)?;
@@ -2279,6 +2287,7 @@ async fn run_tool_worker<R: AsyncBufRead + Unpin + Send + 'static>(
         },
         _ = wait_deadline(execution_deadline.map(tokio::time::Instant::from_std)) => Err(error(Kind::Timeout, "Lua execution deadline exceeded")),
     };
+    http.close_and_wait().await;
     host_reader.abort();
     let _ = host_reader.await;
     processes

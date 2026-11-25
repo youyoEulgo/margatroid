@@ -996,3 +996,200 @@ async fn standalone_configure_and_execute_receive_real_arguments_and_context() {
     drive(&mut fixture.app, &mut reply).await.unwrap();
     fixture.close().await;
 }
+
+#[tokio::test]
+async fn standalone_http_posts_raw_bytes_and_preserves_non_success_response() {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}/binary", listener.local_addr().unwrap());
+    let (tx, rx) = std::sync::mpsc::channel();
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        let mut header = Vec::new();
+        let mut one = [0];
+        while !header.ends_with(b"\r\n\r\n") {
+            stream.read_exact(&mut one).unwrap();
+            header.push(one[0]);
+        }
+        let header = String::from_utf8(header).unwrap();
+        let length = header
+            .lines()
+            .find_map(|line| {
+                line.to_ascii_lowercase()
+                    .strip_prefix("content-length:")
+                    .map(|value| value.trim().parse::<usize>().unwrap())
+            })
+            .unwrap();
+        let mut body = vec![0; length];
+        stream.read_exact(&mut body).unwrap();
+        tx.send((header, body)).unwrap();
+        stream.write_all(b"HTTP/1.1 418 Teapot\r\nContent-Length: 4\r\nX-Test: one\r\nX-Test: two\r\nConnection: close\r\n\r\n\x00\xffok").unwrap();
+    });
+    let mut fixture = Fixture::new(LuaRuntimeConfig::default());
+    let source = format!(
+        r#"
+        assert(not pcall(function() margatroid.http={{}} end))
+        assert(not pcall(function() margatroid.http.request=function()end end))
+        local response=margatroid.http:request({{url={url:?},method='POST',headers={{{{name='X-Token',value='test-only-token'}}}},body=string.char(0,255)..'hi'}})
+        assert(response.status==418)
+        assert(response.body==string.char(0,255)..'ok')
+        local values={{}}
+        for _,header in ipairs(response.headers)do if header.name=='x-test' then values[#values+1]=header.value end end
+        assert(#values==2 and values[1]=='one' and values[2]=='two')
+        margatroid.mcl:execute('/test/runtime','EFFECT ready')
+        margatroid:wait('/test/runtime')
+    "#
+    );
+    let instance = fixture.start(&source).await.unwrap();
+    let (header, body) = rx.recv_timeout(Duration::from_secs(1)).unwrap();
+    assert!(header.starts_with("POST /binary HTTP/1.1"));
+    assert!(
+        header
+            .to_ascii_lowercase()
+            .contains("x-token: test-only-token")
+    );
+    assert_eq!(body, b"\x00\xffhi");
+    server.join().unwrap();
+    fixture.stop(instance).await.unwrap();
+    fixture.close().await;
+}
+
+#[tokio::test]
+async fn standalone_http_timeout_releases_request() {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}/stalled", listener.local_addr().unwrap());
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        let mut header = Vec::new();
+        let mut one = [0];
+        while !header.ends_with(b"\r\n\r\n") {
+            stream.read_exact(&mut one).unwrap();
+            header.push(one[0]);
+        }
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\nx")
+            .unwrap();
+        match stream.read(&mut one) {
+            Ok(0) => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted
+                ) => {}
+            other => panic!("timed-out HTTP response must release connection: {other:?}"),
+        }
+    });
+    let mut fixture = Fixture::new(LuaRuntimeConfig::default());
+    let (tx, mut rx) = oneshot::channel();
+    let source = format!(
+        r#"
+        function configure()
+            assert(margatroid.http ~= nil)
+            local ok=margatroid.http.request
+            assert(ok ~= nil)
+            -- configure has no enabled network capability.
+            return {{timeout_ms=30000}}
+        end
+        function execute()
+            local ok,error=pcall(function() return margatroid.http:request({{url={url:?},timeout_ms=100}}) end)
+            assert(not ok and tostring(error):lower():find('timeout'))
+            margatroid.mcl:execute('/test/runtime','EFFECT ready')
+            margatroid:wait('/test/runtime')
+        end
+    "#
+    );
+    fixture.app.world().send_event(StartDriverLuaVm {
+        owner: fixture.owner,
+        workspace: fixture.workspace,
+        program: LuaProgram {
+            source,
+            origin: "http-test.lua".into(),
+        },
+        environment: fixture.environment(),
+        reply: Arc::new(Mutex::new(Some(tx))),
+    });
+    let instance = drive(&mut fixture.app, &mut rx).await.unwrap();
+    server.join().unwrap();
+    fixture.stop(instance).await.unwrap();
+    fixture.close().await;
+}
+
+#[tokio::test]
+async fn standalone_http_is_unavailable_during_configure() {
+    let mut fixture = Fixture::new(LuaRuntimeConfig::default());
+    let (tx, mut rx) = oneshot::channel();
+    fixture.app.world().send_event(StartDriverLuaVm {
+        owner:fixture.owner,workspace:fixture.workspace,
+        program:LuaProgram{source:"function configure() margatroid.http:request({url='http://127.0.0.1:1/'}) return {timeout_ms=1000} end function execute() end".into(),origin:"http-configure.lua".into()},
+        environment:fixture.environment(),reply:Arc::new(Mutex::new(Some(tx))),
+    });
+    let error = drive(&mut fixture.app, &mut rx).await.unwrap_err();
+    assert!(
+        error.to_string().contains("configure") || error.to_string().contains("unavailable"),
+        "{error}"
+    );
+    fixture.close().await;
+}
+
+#[tokio::test]
+async fn stopping_standalone_vm_releases_inflight_http_response() {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}/cancel", listener.local_addr().unwrap());
+    let (sent, received) = std::sync::mpsc::channel();
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        let mut head = Vec::new();
+        let mut byte = [0];
+        while !head.ends_with(b"\r\n\r\n") {
+            stream.read_exact(&mut byte).unwrap();
+            head.push(byte[0]);
+        }
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 1000\r\n\r\nx")
+            .unwrap();
+        sent.send(()).unwrap();
+        match stream.read(&mut byte) {
+            Ok(0) => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted
+                ) => {}
+            other => panic!("stopped VM retained HTTP response: {other:?}"),
+        }
+    });
+    let mut fixture = Fixture::new(LuaRuntimeConfig::default());
+    let instance = fixture
+        .start(&format!(
+            r#"
+        margatroid.mcl:execute('/test/runtime','EFFECT ready')
+        margatroid.http:request({{url={url:?},timeout_ms=30000}})
+        error('cancelled request resumed normally')
+    "#
+        ))
+        .await
+        .unwrap();
+    let until = Instant::now() + Duration::from_secs(3);
+    loop {
+        if received.try_recv().is_ok() {
+            break;
+        }
+        fixture.app.tick();
+        assert!(Instant::now() < until, "HTTP request was not sent");
+        tokio::task::yield_now().await;
+    }
+    fixture.stop(instance).await.unwrap();
+    server.join().unwrap();
+    fixture.close().await;
+}

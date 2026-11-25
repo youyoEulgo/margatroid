@@ -204,3 +204,17 @@ Agent创建注入接口为name/config_path/ui_path，拒绝旧resource_dir创建
 Agent创建已提交后，Lua取消不能丢弃启动oneshot：宿主持有创建交接监督，创建完成后仍绑定并按已关闭scope清理，finish也先等待所有在途创建。停止无法确认时不宣称任务finish成功，不删除用户持久库，不增加专用子代理接口。该能力不实现子代理Driver分流、继承或输出策略。
 
 Bundled skill/MCP registrars now save successful registration commands to the target Agent initialization.custom using CONFIG GET then whole-key SET. Identical commands are not written again, including on startup replay; differing commands append, with no upsert or multi-command isolation. Skill saves canonical SKILL.md, MCP saves server/prefix, neither saves task handles. Failed persistence clearly reports current registration versus missing startup persistence; MCP keeps the existing serving task alive. The Tool host supplies no registration-specific persistence API.
+
+
+## 通用 Lua HTTP
+
+工具执行阶段已提供 `margatroid.http:request(options)`，共享契约见 [Lua Runtime说明](../lua_runtime/README.md)。由lua_runtime_core提供同一异步HTTP安装器，在工具worker原有沙箱内执行，不调用外部程序、不新增HostFrame或daemon代发通道；配置阶段不可用。请求超时不得超过工具整体deadline，取消或worker退出沿原生命周期清理连接。完整请求/响应类型、并发及大小预算由共享HTTP能力定义，不在tool_plugin重复实现。后续DeepSeek search/fetch只是使用此能力的普通Lua工具，不在通用层读取Agent配置、注入API Key或增加厂商分支。通用方法已接入真实worker并通过本地HTTP回归，DeepSeek专用search/fetch资源使用下节配置。
+
+
+## DeepSeek 搜索与抓取资源
+
+`tool:margatroid/web-search:dev` 的模型参数为 `queries` 数组（1–10条，每条1–128个Unicode字符），`tool:margatroid/web-fetch:dev` 只接受 `url`。使用共享Lua HTTP能力访问固定DeepSeek Search/Fetch端点，逐次从可信调用Agent的CONFIG读取 `web.deepseek.api_key`，不使用父Agent、环境变量或模型路由密钥。
+
+内置coder/reviewer配置模板加入空的 `[web.deepseek] api_key = ""` 及 `web_search`、`web_fetch` 导入。已有Agent持久配置不会被资源模板覆盖，须由用户在该Agent配置中填写和导入；不自动向子代理复制父配置。API Key不进入工具Schema、输出、持久任务缓存或失败诊断。
+
+脚本不重试付费请求、不自动跳转，也不更改当前沙箱。默认禁止联网的workspace-write/read-only策略仍然禁止这些请求。此次只进行离线模拟验证，真实API测试等用户配置凭据及允许联网后再进行。使用细节见资源各自README。
