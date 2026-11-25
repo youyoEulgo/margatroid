@@ -1408,3 +1408,73 @@ fn model_configuration_api_reads_replaces_and_syncs_external_edits_without_agent
     );
     runtime.block_on(socket.close(None)).unwrap();
 }
+
+#[test]
+fn responses_continuation_projects_reasoning_only_per_vendor_over_real_http() {
+    for content in [None, Some(String::new())] {
+        let server = HttpServer::new(trace("responses"));
+        let mut fixture = Fixture::new(&server.url, "openai", "responses");
+        let config_path = fixture.root.path().join("models.toml");
+        let config = std::fs::read_to_string(&config_path).unwrap();
+        let history = vec![
+            InferenceMessage::User {
+                content: "start reasoning".into(),
+                images: vec![],
+            },
+            InferenceMessage::Assistant {
+                reasoning: Some("reasoning accepted before interruption".into()),
+                content,
+                tool_calls: vec![],
+            },
+            InferenceMessage::User {
+                content: "continue after interruption".into(),
+                images: vec![],
+            },
+        ];
+        let original = serde_json::to_value(&history).unwrap();
+        for (index, provider) in ["openai", "deepseek", "openai"].into_iter().enumerate() {
+            std::fs::write(
+                &config_path,
+                config.replace("provider='openai'", &format!("provider='{provider}'")),
+            )
+            .unwrap();
+            let (mut request, reply) = fixture.request(&format!("continued-{index}"));
+            request.messages = history.clone();
+            let observed = request.clone();
+            let response = fixture.run(request, reply).unwrap();
+            assert_eq!(response.content.as_deref(), Some("ok"));
+            fixture.idle();
+            let (path, headers, body) = server
+                .received
+                .recv_timeout(Duration::from_secs(3))
+                .unwrap();
+            assert_eq!(path, "/v1/responses");
+            assert!(
+                headers
+                    .to_lowercase()
+                    .contains("authorization: bearer private-test-key")
+            );
+            let expected = if provider == "openai" {
+                json!([
+                    {"role":"user","content":"start reasoning"},
+                    {"role":"assistant","content":""},
+                    {"role":"user","content":"continue after interruption"}
+                ])
+            } else {
+                json!([
+                    {"role":"user","content":"start reasoning"},
+                    {"role":"user","content":"continue after interruption"}
+                ])
+            };
+            assert_eq!(body["input"], expected, "{provider}");
+            assert_eq!(body["store"], false);
+            assert!(
+                !body
+                    .to_string()
+                    .contains("reasoning accepted before interruption")
+            );
+            assert_eq!(serde_json::to_value(&observed.messages).unwrap(), original);
+            assert_eq!(serde_json::to_value(&history).unwrap(), original);
+        }
+    }
+}

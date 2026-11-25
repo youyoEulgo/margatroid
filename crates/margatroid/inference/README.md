@@ -44,7 +44,6 @@ DomainRequest
 
 // 插件内可失败的具体格式转换。
 impl TryFrom<DomainRequest> for ChatCompletionsRequest
-impl TryFrom<EncodeInput> for ChatCompletionsRequest
 impl TryFrom<DomainRequest> for MessagesRequest
 impl TryFrom<DomainRequest> for ResponsesRequest
 
@@ -68,12 +67,14 @@ OpenRouter<ChatCompletionsRequest>
 上述片段是类型与impl签名索引，字段和方法以设计及Rust定义为准。调用链固定为：
 
 ```text
-厂商无关内部消息
-    → DomainRequest
+第一层：厂商无关领域消息
+    → DomainRequest / InferenceMessage
+第二层：通用API格式转换
     → ApiAdapter::encode / TryFrom / try_into()
-    → 具体ChatCompletionsRequest、MessagesRequest或ResponsesRequest
+    → ChatCompletionsRequest、MessagesRequest或ResponsesRequest
+第三层：厂商 × API格式特化
     → ApiAdapter::process_request
-    → Vendor<具体请求类型>::process
+    → OpenAi<T> / Anthropic<T> / DeepSeek<T> / OpenRouter<T>::process
     → ProviderHttpRequest / HTTP
 
 上游响应
@@ -84,21 +85,27 @@ OpenRouter<ChatCompletionsRequest>
     → MCL生成内部消息，由Driver显式记录
 ```
 
-DomainRequest只携带消息、纯工具定义及公共采样语义；不含provider/api_type、URL、密钥、HTTP、Agent/turn执行身份、取消令牌或通道。EncodeInput是插件局部的编码能力输入，不得反向成为第二套共享请求或持久消息。
+DomainRequest只携带消息、纯工具定义及公共采样语义；不含provider/api_type、URL、密钥、HTTP、Agent/turn执行身份、取消令牌或通道。第二层用具体格式的有类型消息保留assistant及reasoning-only身份；不再以EncodeInput把厂商能力传入通用转换，也不建立另一份持久消息。
 
 禁止绕过这些边界：不能把三种具体Request合成一个任意JSON壳，不能用通用VendorAdapter按厂商补字段，不能将ApiRequest::Responses等枚举变体当作Rust泛型类型，不能从URL/模型名称猜格式，也不能用兼容handler兜底未知组合。JSON序列化是具体格式编码的输出，不是内部通用消息的替代品。
 
 内部消息、共享响应、累积器、Block和历史不得加入replay、api_format、厂商thinking块、签名或encrypted_content。协议解码可以读取这些字段以识别上游事件，但不得将原生结构透传至领域消息，也不得为重放而再存一份reasoning。厂商选项与格式字段只在上述推理边界处理。
 
-切换模型或API格式时，重新从原有内部消息构造目标请求。不能要求历史消息预先带有目标格式元数据，不能为适配目标而改写、清空数据库或替换角色。目标支持独立reasoning输入时映射该字段；目标不支持无签名历史reasoning时不发送此独立字段，但不改正文和工具。仅有reasoning、无正文/工具且目标无法表达时明确失败。禁止伪造签名、制造thinking块、插入标签把reasoning伪装成正文，或丢弃正文、工具ID及媒体来强行通过转换。
+切换模型或API格式时，从同一份原始领域消息重新构造请求，不改写、清空数据库或替换角色。reasoning-only assistant是合法领域消息：允许没有正文和工具调用，原始reasoning保留在上下文及历史中。通用准入和第二层Responses转换不能统一拒绝或提前剔除它。禁止伪造签名、制造专有reasoning item或把reasoning包装成正文。
+
+第三层的`OpenAi<ResponsesRequest>`将这类消息输出为`{"role":"assistant","content":""}`；这是最终请求投影补空正文，不要求修改领域消息。对不接受这种空assistant的Responses厂商，由其各自handler剔除本次请求中的该项。剔除不作用于领域上下文或历史，也不推广为所有Responses供应商的统一规则。有正文或工具调用的assistant必须保留这些内容及关联，不能因携带reasoning而整条删除。
+
+源码已按此分层实现：ResponsesInput::ReasoningOnly在通用层保留，OpenAi与DeepSeek各自生成ResponsesHttpRequest最终投影。缺失及空字符串正文都覆盖；正文和工具调用非空的正常历史不被误删。运行中的daemon是否已使用此实现仍取决于部署版本。
 
 这些不变量由具体格式转换、跨格式真实HTTP和存储往返测试验证：同一份内部消息可重新选择已支持组合；切换后正文与工具关联不变；内部reasoning只出现一次；返回值和落库消息不包含厂商重放字段。新增组合必须补充显式handler及对应编解码验证，不能只增加配置枚举。
 
-DomainRequest先通过TryFrom转换为ChatCompletionsRequest、MessagesRequest或ResponsesRequest；需要厂商能力时使用插件内EncodeInput。ApiAdapter只分派明确支持的组合，调用OpenAi<T>、Anthropic<T>、DeepSeek<T>或OpenRouter<T>对应的具体process实现，T是具体格式请求类型。参数处理使用有类型字段，不能先编码成通用JSON再按厂商分支补救。响应解码器由同一组合选定，逆向输出统一分片。Messages要求max_output_tokens，Responses不接受stop序列；不通过静默丢弃参数完成兼容。
+第一层领域消息只表达业务内容；第二层TryFrom生成ChatCompletionsRequest、MessagesRequest或ResponsesRequest的通用格式材料；第三层OpenAi<T>、Anthropic<T>、DeepSeek<T>、OpenRouter<T>处理厂商差异后生成HTTP请求。ApiAdapter只分派明确支持的组合，T始终是具体格式请求类型。厂商选项、历史reasoning的映射、空assistant补齐或剔除均在第三层完成，不能把厂商限制混入领域准入或通用转换。参数处理使用有类型字段，不能先编码任意JSON再补丁修复。响应解码器由同一组合选定，逆向输出统一分片。Messages要求max_output_tokens，Responses不接受stop序列；无关的参数约束不因本次消息规则变化而放宽。
 
 Responses提交完整本地上下文，store=false，不依赖远端conversation或previous_response_id。内部消息只保存一份reasoning、正文和结构化工具关联，不包含api_format、签名块、加密reasoning或replay。响应解码器将可读思考统一为reasoning，厂商协议签名及加密内容不进入共享结果、累积器、Block或历史。
 
-历史正文、工具调用、工具结果及图片按目标API格式转换。Chat在对应厂商能力允许时映射独立reasoning_content；Messages/Responses无法直接表达无签名历史思考时不发送该独立字段，不改写正文、不伪造签名且不改变内部消息。只有思考而没有正文或工具的历史若目标无法表达，转换明确失败；有正文或工具的正常历史不因缺少专属协议数据而失败。切换模型和API格式始终重新从同一内部消息构造请求。
+历史正文、工具调用、工具结果及图片先映射通用API格式，再由具体厂商handler决定最终表达。支持独立reasoning输入的厂商映射该字段；不支持的厂商不发送该字段，但不能改写正文或伪造签名。纯reasoning消息按上文OpenAI补空正文、其他不支持的Responses厂商剔除请求项的规则处理，内部值始终保留。
+
+对应回归应分别验证：领域准入接受reasoning-only；第二层不提前拒绝或丢失其身份；OpenAI Responses最终HTTP包含空正文assistant；不支持的Responses组合最终HTTP不含该项；有正文或工具的混合消息不被误删；切换厂商后仍从原始消息重新转换，领域消息和存储往返不变。插件单元测试和本地真实HTTP捕获已覆盖这些边界；测试不连接外部模型服务，也不修改用户历史。
 
 内部用户和工具消息的图片集合JSON键统一为data；图片项保留media_type和base64 data。用户和工具结果图片均支持PNG/JPEG/GIF/WebP标准base64，校验数量、字节和magic。Messages与Responses使用原生工具图片；Chat保留tool结果，整批结果齐备后追加格式层user图片消息，不修改本地消息或历史。
 

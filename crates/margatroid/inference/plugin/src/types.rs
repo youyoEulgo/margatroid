@@ -223,7 +223,7 @@ impl ApiFormat {
 #[derive(Clone, Debug, Serialize)]
 pub(crate) struct ChatCompletionsRequest {
     pub(crate) model: String,
-    pub(crate) messages: Vec<Value>,
+    pub(crate) messages: Vec<ChatMessage>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub(crate) tools: Vec<Value>,
     pub(crate) stream: bool,
@@ -243,7 +243,7 @@ pub(crate) struct MessagesRequest {
     pub(crate) model: String,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub(crate) system: Vec<Value>,
-    pub(crate) messages: Vec<Value>,
+    pub(crate) messages: Vec<MessagesMessage>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub(crate) tools: Vec<Value>,
     pub(crate) stream: bool,
@@ -259,7 +259,8 @@ pub(crate) struct MessagesRequest {
 #[derive(Clone, Debug, Serialize)]
 pub(crate) struct ResponsesRequest {
     pub(crate) model: String,
-    pub(crate) input: Vec<Value>,
+    #[serde(skip)]
+    pub(crate) input: Vec<ResponsesInput>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub(crate) tools: Vec<Value>,
     pub(crate) stream: bool,
@@ -271,6 +272,49 @@ pub(crate) struct ResponsesRequest {
     pub(crate) max_output_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) top_p: Option<f32>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(untagged)]
+pub(crate) enum ChatMessage {
+    Assistant(ChatAssistant),
+    Other(Value),
+}
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct ChatAssistant {
+    role: &'static str,
+    content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_content: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    tool_calls: Vec<Value>,
+}
+#[derive(Clone, Debug, Serialize)]
+#[serde(untagged)]
+pub(crate) enum MessagesMessage {
+    Assistant(MessagesAssistant),
+    Other(Value),
+}
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct MessagesAssistant {
+    role: &'static str,
+    content: Vec<Value>,
+    #[serde(skip)]
+    reasoning: Option<String>,
+}
+#[derive(Clone, Debug)]
+pub(crate) enum ResponsesInput {
+    Item(Value),
+    ReasoningOnly {
+        reasoning: String,
+        content: Option<String>,
+    },
+}
+#[derive(Serialize)]
+struct ResponsesHttpRequest<'a> {
+    #[serde(flatten)]
+    request: &'a ResponsesRequest,
+    input: Vec<Value>,
 }
 
 pub(crate) fn validated_message_sizes(message: &InferenceMessage) -> Result<(usize, usize)> {
@@ -326,36 +370,9 @@ fn user_content(content: String, images: Vec<InferenceImage>, format: ApiFormat)
     json!(parts)
 }
 
-#[derive(Clone, Copy)]
-pub(crate) enum ChatReasoning {
-    Omit,
-    Preserve,
-    DeepSeek { disabled: bool },
-}
-
-pub(crate) struct EncodeInput {
-    pub request: DomainRequest,
-    pub chat_reasoning: ChatReasoning,
-}
-
 impl TryFrom<DomainRequest> for ChatCompletionsRequest {
     type Error = InferenceError;
-    fn try_from(request: DomainRequest) -> Result<Self> {
-        EncodeInput {
-            request,
-            chat_reasoning: ChatReasoning::Preserve,
-        }
-        .try_into()
-    }
-}
-
-impl TryFrom<EncodeInput> for ChatCompletionsRequest {
-    type Error = InferenceError;
-    fn try_from(input: EncodeInput) -> Result<Self> {
-        let EncodeInput {
-            mut request,
-            chat_reasoning,
-        } = input;
+    fn try_from(mut request: DomainRequest) -> Result<Self> {
         normalize(&mut request)?;
         let mut messages = Vec::new();
         let mut pending = HashSet::new();
@@ -372,34 +389,14 @@ impl TryFrom<EncodeInput> for ChatCompletionsRequest {
                     tool_calls,
                     ..
                 } => {
-                    if matches!(chat_reasoning, ChatReasoning::Omit)
-                        && content.as_ref().is_none_or(String::is_empty)
-                        && tool_calls.is_empty()
-                    {
-                        return Err(invalid(
-                            "Chat Completions cannot encode reasoning-only assistant history",
-                        ));
-                    }
                     pending.extend(tool_calls.iter().map(|call| call.id.clone()));
-                    let mut value = json!({"role":"assistant","content":content});
-                    match chat_reasoning {
-                        ChatReasoning::Omit => {}
-                        ChatReasoning::Preserve => {
-                            if let Some(reasoning) = reasoning {
-                                value["reasoning_content"] = json!(reasoning);
-                            }
-                        }
-                        ChatReasoning::DeepSeek { disabled } => {
-                            if !disabled || !tool_calls.is_empty() {
-                                value["reasoning_content"] = json!(reasoning.unwrap_or_default());
-                            }
-                        }
-                    }
-                    if !tool_calls.is_empty() {
-                        value["tool_calls"] = json!(tool_calls.into_iter().map(|call| json!({"id":call.id,"type":"function","function":{"name":call.name,"arguments":call.arguments.to_string()}})).collect::<Vec<_>>());
-                    }
-                    value
+                    messages.push(ChatMessage::Assistant(ChatAssistant {
+                        role: "assistant", content, reasoning_content: reasoning,
+                        tool_calls: tool_calls.into_iter().map(|call|json!({"id":call.id,"type":"function","function":{"name":call.name,"arguments":call.arguments.to_string()}})).collect(),
+                    }));
+                    continue;
                 }
+
                 InferenceMessage::Tool {
                     call_id,
                     content,
@@ -421,20 +418,27 @@ impl TryFrom<EncodeInput> for ChatCompletionsRequest {
                     json!({"role":"tool","tool_call_id":call_id,"content":content})
                 }
             };
-            messages.push(value);
+            messages.push(ChatMessage::Other(value));
             if pending.is_empty() && !image_blocks.is_empty() {
-                messages.push(json!({"role":"user","content":std::mem::take(&mut image_blocks)}));
+                messages.push(ChatMessage::Other(
+                    json!({"role":"user","content":std::mem::take(&mut image_blocks)}),
+                ));
             }
         }
         Ok(Self { model: request.config.model, messages, tools: request.tools.into_iter().map(|tool| json!({"type":"function","function":{"name":tool.name,"description":tool.description,"parameters":tool.input_schema}})).collect(), stream:true, stream_options:json!({"include_usage":true}), temperature:request.config.temperature, max_tokens:request.config.max_output_tokens, top_p:request.config.top_p, stop:request.config.stop })
     }
 }
 
-fn merge_message(messages: &mut Vec<Value>, role: &str, blocks: Vec<Value>) {
-    if let Some(last) = messages.last_mut().filter(|last| last["role"] == role) {
+fn merge_message(messages: &mut Vec<MessagesMessage>, role: &str, blocks: Vec<Value>) {
+    if let Some(MessagesMessage::Other(last)) = messages
+        .last_mut()
+        .filter(|last| matches!(last,MessagesMessage::Other(value) if value["role"]==role))
+    {
         last["content"].as_array_mut().unwrap().extend(blocks);
     } else {
-        messages.push(json!({"role":role,"content":blocks}));
+        messages.push(MessagesMessage::Other(
+            json!({"role":role,"content":blocks}),
+        ));
     }
 }
 
@@ -470,23 +474,23 @@ impl TryFrom<DomainRequest> for MessagesRequest {
                         .clone(),
                 ),
                 InferenceMessage::Assistant {
+                    reasoning,
                     content,
                     tool_calls,
                     ..
                 } => {
                     let mut blocks = Vec::new();
-                    if let Some(content) = content {
+                    if let Some(content) = content.filter(|text| !text.is_empty()) {
                         blocks.push(json!({"type":"text","text":content}));
                     }
                     for call in tool_calls {
                         blocks.push(json!({"type":"tool_use","id":call.id,"name":call.name,"input":call.arguments}));
                     }
-                    if blocks.is_empty() {
-                        return Err(invalid(
-                            "Messages cannot encode reasoning-only assistant history without fabricating signed thinking",
-                        ));
-                    }
-                    merge_message(&mut messages, "assistant", blocks);
+                    messages.push(MessagesMessage::Assistant(MessagesAssistant {
+                        role: "assistant",
+                        content: blocks,
+                        reasoning,
+                    }));
                 }
                 InferenceMessage::Tool {
                     call_id,
@@ -518,24 +522,26 @@ impl TryFrom<DomainRequest> for ResponsesRequest {
         for message in request.messages {
             match message {
                 InferenceMessage::System { content } => {
-                    input.push(json!({"role":"system","content":content}))
+                    input.push(ResponsesInput::Item(json!({"role":"system","content":content})))
                 }
                 InferenceMessage::User { content, images } => {
-                    input.push(json!({"role":"user","content":user_content(content, images, ApiFormat::Responses)}))
+                    input.push(ResponsesInput::Item(json!({"role":"user","content":user_content(content, images, ApiFormat::Responses)})))
                 }
                 InferenceMessage::Assistant {
+                    reasoning,
                     content,
                     tool_calls,
                     ..
                 } => {
                     if content.as_ref().is_none_or(String::is_empty) && tool_calls.is_empty() {
-                        return Err(invalid("Responses cannot encode reasoning-only assistant history without opaque reasoning items"));
+                        input.push(ResponsesInput::ReasoningOnly { reasoning: reasoning.unwrap_or_default(), content });
+                        continue;
                     }
-                    if let Some(content) = content {
-                        input.push(json!({"role":"assistant","content":[{"type":"output_text","text":content}]}));
+                    if let Some(content) = content.filter(|text|!text.is_empty()) {
+                        input.push(ResponsesInput::Item(json!({"role":"assistant","content":[{"type":"output_text","text":content}]})));
                     }
                     for call in tool_calls {
-                        input.push(json!({"type":"function_call","call_id":call.id,"name":call.name,"arguments":call.arguments.to_string()}));
+                        input.push(ResponsesInput::Item(json!({"type":"function_call","call_id":call.id,"name":call.name,"arguments":call.arguments.to_string()})));
                     }
                 }
                 InferenceMessage::Tool {
@@ -543,9 +549,9 @@ impl TryFrom<DomainRequest> for ResponsesRequest {
                     content,
                     images,
                     ..
-                } => input.push(
+                } => input.push(ResponsesInput::Item(
                     json!({"type":"function_call_output","call_id":call_id,"output":user_content(content, images, ApiFormat::Responses)}),
-                ),
+                )),
             }
         }
         Ok(Self { model:request.config.model,input,tools:request.tools.into_iter().map(|tool| json!({"type":"function","name":tool.name,"description":tool.description,"parameters":tool.input_schema,"strict":false})).collect(),stream:true,store:false,include:vec![],temperature:request.config.temperature,max_output_tokens:request.config.max_output_tokens,top_p:request.config.top_p })
@@ -779,33 +785,9 @@ pub(crate) fn build_adapter(
 impl ApiAdapter {
     pub(crate) fn encode(&self, request: DomainRequest) -> Result<ApiRequest> {
         match self {
-            Self::OpenAiChat(_) => Ok(ApiRequest::ChatCompletions(
-                EncodeInput {
-                    request,
-                    chat_reasoning: ChatReasoning::Omit,
-                }
-                .try_into()?,
-            )),
-            Self::DeepSeekChat(handler) => Ok(ApiRequest::ChatCompletions(
-                EncodeInput {
-                    request,
-                    chat_reasoning: ChatReasoning::DeepSeek {
-                        disabled: handler
-                            .options
-                            .thinking
-                            .as_ref()
-                            .is_some_and(|option| option.r#type == "disabled"),
-                    },
-                }
-                .try_into()?,
-            )),
-            Self::OpenRouterChat(_) => Ok(ApiRequest::ChatCompletions(
-                EncodeInput {
-                    request,
-                    chat_reasoning: ChatReasoning::Preserve,
-                }
-                .try_into()?,
-            )),
+            Self::OpenAiChat(_) | Self::DeepSeekChat(_) | Self::OpenRouterChat(_) => {
+                Ok(ApiRequest::ChatCompletions(request.try_into()?))
+            }
             Self::AnthropicMessages(_) | Self::DeepSeekMessages(_) => {
                 Ok(ApiRequest::Messages(request.try_into()?))
             }
@@ -846,7 +828,19 @@ impl ApiAdapter {
 }
 
 impl OpenAi<ChatCompletionsRequest> {
-    fn process(&self, request: ChatCompletionsRequest) -> Result<ProviderHttpRequest> {
+    fn process(&self, mut request: ChatCompletionsRequest) -> Result<ProviderHttpRequest> {
+        for message in &mut request.messages {
+            if let ChatMessage::Assistant(assistant) = message {
+                if assistant.content.as_ref().is_none_or(String::is_empty)
+                    && assistant.tool_calls.is_empty()
+                {
+                    return Err(invalid(
+                        "OpenAI Chat Completions cannot encode reasoning-only assistant history",
+                    ));
+                }
+                assistant.reasoning_content = None;
+            }
+        }
         self.transport.prepare(
             &request,
             "/chat/completions",
@@ -858,20 +852,86 @@ impl OpenAi<ChatCompletionsRequest> {
 
 impl OpenAi<ResponsesRequest> {
     fn process(&self, request: ResponsesRequest) -> Result<ProviderHttpRequest> {
-        self.transport
-            .prepare(&request, "/responses", false, ApiFormat::Responses)
+        let input = request
+            .input
+            .iter()
+            .map(|item| match item {
+                ResponsesInput::Item(value) => value.clone(),
+                ResponsesInput::ReasoningOnly { reasoning, content } => {
+                    debug_assert!(
+                        !reasoning.is_empty() && content.as_ref().is_none_or(String::is_empty)
+                    );
+                    json!({"role":"assistant","content":content.as_deref().unwrap_or("")})
+                }
+            })
+            .collect();
+        self.transport.prepare(
+            &ResponsesHttpRequest {
+                request: &request,
+                input,
+            },
+            "/responses",
+            false,
+            ApiFormat::Responses,
+        )
+    }
+}
+
+impl MessagesRequest {
+    fn merge_adjacent_assistants(&mut self) {
+        let mut messages = Vec::with_capacity(self.messages.len());
+        for message in std::mem::take(&mut self.messages) {
+            match message {
+                MessagesMessage::Assistant(assistant) => {
+                    if let Some(MessagesMessage::Assistant(previous)) = messages.last_mut() {
+                        previous.content.extend(assistant.content);
+                    } else {
+                        messages.push(MessagesMessage::Assistant(assistant));
+                    }
+                }
+                other => messages.push(other),
+            }
+        }
+        self.messages = messages;
     }
 }
 
 impl Anthropic<MessagesRequest> {
-    fn process(&self, request: MessagesRequest) -> Result<ProviderHttpRequest> {
+    fn process(&self, mut request: MessagesRequest) -> Result<ProviderHttpRequest> {
+        for message in &request.messages {
+            if let MessagesMessage::Assistant(assistant) = message {
+                if assistant.content.is_empty()
+                    && assistant
+                        .reasoning
+                        .as_ref()
+                        .is_some_and(|text| !text.is_empty())
+                {
+                    return Err(invalid("Messages provider cannot encode reasoning-only assistant history without fabricating signed thinking"));
+                }
+            }
+        }
+        request.merge_adjacent_assistants();
         self.transport
             .prepare(&request, "/messages", true, ApiFormat::Messages)
     }
 }
 
 impl DeepSeek<ChatCompletionsRequest> {
-    fn process(&self, request: ChatCompletionsRequest) -> Result<ProviderHttpRequest> {
+    fn process(&self, mut request: ChatCompletionsRequest) -> Result<ProviderHttpRequest> {
+        let disabled = self
+            .options
+            .thinking
+            .as_ref()
+            .is_some_and(|option| option.r#type == "disabled");
+        for message in &mut request.messages {
+            if let ChatMessage::Assistant(assistant) = message {
+                assistant.reasoning_content = if !disabled || !assistant.tool_calls.is_empty() {
+                    Some(assistant.reasoning_content.take().unwrap_or_default())
+                } else {
+                    None
+                };
+            }
+        }
         self.transport.prepare(
             &VendorRequest {
                 request: &request,
@@ -885,7 +945,20 @@ impl DeepSeek<ChatCompletionsRequest> {
 }
 
 impl DeepSeek<MessagesRequest> {
-    fn process(&self, request: MessagesRequest) -> Result<ProviderHttpRequest> {
+    fn process(&self, mut request: MessagesRequest) -> Result<ProviderHttpRequest> {
+        for message in &request.messages {
+            if let MessagesMessage::Assistant(assistant) = message {
+                if assistant.content.is_empty()
+                    && assistant
+                        .reasoning
+                        .as_ref()
+                        .is_some_and(|text| !text.is_empty())
+                {
+                    return Err(invalid("Messages provider cannot encode reasoning-only assistant history without fabricating signed thinking"));
+                }
+            }
+        }
+        request.merge_adjacent_assistants();
         self.transport
             .prepare(&request, "/messages", true, ApiFormat::Messages)
     }
@@ -893,8 +966,23 @@ impl DeepSeek<MessagesRequest> {
 
 impl DeepSeek<ResponsesRequest> {
     fn process(&self, request: ResponsesRequest) -> Result<ProviderHttpRequest> {
-        self.transport
-            .prepare(&request, "/responses", false, ApiFormat::Responses)
+        let input = request
+            .input
+            .iter()
+            .filter_map(|item| match item {
+                ResponsesInput::Item(value) => Some(value.clone()),
+                ResponsesInput::ReasoningOnly { .. } => None,
+            })
+            .collect();
+        self.transport.prepare(
+            &ResponsesHttpRequest {
+                request: &request,
+                input,
+            },
+            "/responses",
+            false,
+            ApiFormat::Responses,
+        )
     }
 }
 

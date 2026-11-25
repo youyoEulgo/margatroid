@@ -259,7 +259,8 @@ push_frame(delivery: &mut StreamDelivery, frame: serde_json::Value)
 build_request(input: DomainRequest, route: ModelRoute) -> Result<ProviderHttpRequest, InferenceError>
     行为：
         按route明确的Vendor及ApiFormat构造支持的ApiAdapter；
-        调用adapter.encode(input)经TryFrom得到具体ApiRequest，再调用adapter.process_request完成该组合HTTP编码；
+        调用adapter.encode(input)经TryFrom完成领域消息到三种通用API格式的转换，再调用adapter.process_request进入对应厂商handler特化并生成HTTP请求；
+        通用格式转换与厂商特化是两个独立职责，不能在通用层按某一家厂商的限制提前拒绝其他组合可处理的消息；
         不从URL或模型名猜测，不使用通用JSON请求壳修补或未知组合回退；
         输入DomainRequest保持厂商无关，不向消息、结果或历史添加格式状态。
 ```
@@ -317,22 +318,48 @@ ApiRequest：具体格式请求，私有枚举
     Responses(ResponsesRequest)
 ChatCompletionsRequest / MessagesRequest / ResponsesRequest：插件自有具体格式结构体，不是共享领域类型或通用JSON壳
     impl TryFrom<DomainRequest> for ChatCompletionsRequest
-    impl TryFrom<EncodeInput> for ChatCompletionsRequest
     impl TryFrom<DomainRequest> for MessagesRequest
     impl TryFrom<DomainRequest> for ResponsesRequest
         type Error = InferenceError
         行为：
-            转换消息、工具及参数；
-            在HTTP前校验目标格式与厂商能力，不经过通用JSON中间请求；
-            Chat按EncodeInput能力映射reasoning_content，Messages/Responses仅编码其支持的独立字段，不把历史思考混入正文或构造签名块；
-            只有reasoning且无正文/工具的历史若目标无法表达则明确失败，有正文或工具时保持它们原样转换。
-EncodeInput：插件内格式编码材料--DomainRequest及本次只读ChatReasoning能力，不进入领域core或存储。
-OpenAi<T> / Anthropic<T> / DeepSeek<T> / OpenRouter<T>：具体厂商handler
+            完成第二层公共结构映射：消息、工具及公共参数转换为对应的具体API格式结构；不在此层合并厂商特化规则；
+            reasoning-only assistant是合法领域输入：reasoning非空、content缺失或为空、tool_calls为空，不得仅据此在通用准入或通用Responses转换中报错；
+            通用格式结构保留该assistant项及其只有reasoning、无正文和工具的区别，供下一层有类型的厂商handler决定请求投影；不提前丢弃，也不把reasoning写进正文或伪造专有reasoning item；
+            第二层结构是插件内单次转换材料，既非HTTP最终JSON，也不回写领域消息、Block或历史。
+ChatMessage：第二层Chat消息，私有枚举
+    Assistant(ChatAssistant)
+    Other(serde_json::Value)--公共格式的system/user/tool项
+ChatAssistant：私有有类型值
+    role: &'static str--assistant
+    content: Option<String>
+    reasoning_content: Option<String>--公共映射保留；具体厂商在第三层决定发送或省略
+    tool_calls: Vec<serde_json::Value>
+MessagesMessage：第二层Messages消息，私有枚举
+    Assistant(MessagesAssistant)
+    Other(serde_json::Value)
+MessagesAssistant：私有有类型值
+    role: &'static str--assistant
+    content: Vec<serde_json::Value>--文本或tool_use块
+    reasoning: Option<String>--只供第三层能力判断，不序列化为签名thinking块
+ResponsesInput：第二层Responses输入，私有枚举
+    Item(serde_json::Value)--已完成公共映射的消息或函数调用项
+    ReasoningOnly { reasoning: String, content: Option<String> }--保留消息身份及缺失/空正文
+ResponsesHttpRequest<'a>：第三层Responses HTTP序列化值
+    request: &'a ResponsesRequest--flatten公共字段，公共input不直接序列化
+    input: Vec<serde_json::Value>--由明确的厂商handler生成最终输入项
+    行为：通用ResponsesRequest持有Vec<ResponsesInput>，最终HTTP输入只能由对应厂商process形成，不使用任意JSON对象补丁。
+OpenAi<T> / Anthropic<T> / DeepSeek<T> / OpenRouter<T>：第三层具体厂商handler
     T：具体ChatCompletionsRequest、MessagesRequest或ResponsesRequest，不是ApiRequest枚举变体。
     process(&self, request: T) -> Result<ProviderHttpRequest, InferenceError>
         行为：
             仅OpenAi<ChatCompletionsRequest>、OpenAi<ResponsesRequest>、Anthropic<MessagesRequest>、DeepSeek<ChatCompletionsRequest>、DeepSeek<MessagesRequest>、DeepSeek<ResponsesRequest>、OpenRouter<ChatCompletionsRequest>实现process；
-            以有类型字段处理厂商选项、鉴权和端点，附上同一组合选择的响应解码器。
+            以有类型字段处理厂商选项、鉴权和端点，附上同一组合选择的响应解码器；消息可表达性差异在此第三层处理。
+            OpenAi<ResponsesRequest>对reasoning-only assistant保留其消息位置，输出role=assistant、content=""；缺失与空正文在此明确补成空字符串，不需要工具调用或专有reasoning item才能准入。
+            不支持这种空assistant的Responses厂商在各自handler中从本次HTTP输入投影剔除该reasoning-only项，不统一影响OpenAi，也不删除原始领域消息。
+            不支持独立历史reasoning的组合不发送该字段；正文或工具调用非空时必须保留并正常转换，不能因有reasoning就剔除整个assistant。
+            Chat/Messages的能力映射同样属于各自组合：OpenAi<ChatCompletionsRequest>保留原来的reasoning-only拒绝，正常assistant省略reasoning_content；DeepSeek Chat按thinking选项决定独立reasoning_content，OpenRouter Chat保留该字段。
+            Anthropic及DeepSeek Messages在各自handler拒绝无法形成文本或工具块的纯思考项，通过后再合并相邻assistant块；这些原有厂商策略不提前放进通用层。
+            不依据URL或模型名猜测行为，不再以reasoning-only作为所有组合的统一失败条件。
 ApiAdapter：显式组合分派，私有枚举
     OpenAiChat(OpenAi<ChatCompletionsRequest>)
     OpenAiResponses(OpenAi<ResponsesRequest>)
@@ -342,7 +369,7 @@ ApiAdapter：显式组合分派，私有枚举
     DeepSeekResponses(DeepSeek<ResponsesRequest>)
     OpenRouterChat(OpenRouter<ChatCompletionsRequest>)
     encode(&self, request: DomainRequest) -> Result<ApiRequest, InferenceError>
-        行为：按已选具体组合调用.try_into()，必要时在插件内构造EncodeInput；不修改原始领域消息或持久历史。
+        行为：仅按ApiFormat调用对应TryFrom<DomainRequest>，同格式不同厂商得到相同的公共转换结果；不再构造携带厂商能力的EncodeInput，不修改原始领域消息或持久历史。
     process_request(&self, request: ApiRequest) -> Result<ProviderHttpRequest, InferenceError>
         行为：配对ApiAdapter与具体ApiRequest，调用对应泛型handler.process；格式不匹配明确失败。
     约束：不以通用VendorAdapter在JSON对象上修补差异，不用ApiRequest枚举变体充当泛型T。
@@ -416,10 +443,11 @@ DomainRequest：拥有所有权的纯领域输入，不承载厂商或API协议�
     config: InferenceParameters--编码前model替换为上游模型名
     约束：不含provider、api_type、URL、密钥、HTTP材料、Entity、turn、执行句柄或channel；不并建第二份共享请求。
 
-InferenceMessage：推理自身的厂商无关消息契约，公开枚举；不含replay、api_format、签名块或加密重放载荷
+InferenceMessage：第一层推理领域的厂商无关消息契约，公开枚举；由AgentMessage经MCL映射而来，不含replay、api_format、签名块或加密重放载荷
     System { content: String }
     User { content: String, images: Vec<InferenceImage> }--JSON字段名为data，无images别名
-    Assistant { reasoning: Option<String>, content: Option<String>, tool_calls: Vec<InferenceToolCall> }--反序列化接受compact别名，厂商转换统一assistant
+    Assistant { reasoning: Option<String>, content: Option<String>, tool_calls: Vec<InferenceToolCall> }--允许reasoning-only；反序列化接受compact别名，厂商转换统一assistant
+        行为：原始reasoning只保存一份；换厂商、换API格式时从同一原始消息重新转换，不以某个请求投影反向改写领域值或持久历史。
     Tool { call_id: String, content: String, images: Vec<InferenceImage>, failed: bool }--JSON字段名为data
 
 InferenceToolDefinition：本次工具定义--name、description、input_schema
