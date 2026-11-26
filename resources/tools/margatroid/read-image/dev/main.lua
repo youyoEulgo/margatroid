@@ -37,7 +37,7 @@ local function perform(arguments, context)
     if not media then return failure("Not a supported PNG, JPEG, GIF or WebP image: " .. arguments.path) end
     return {
         ok = true,
-        content = string.format("Image %s (%s, %d bytes)", arguments.path, media, #bytes),
+        content = string.format("Image loaded for your visual inspection: %s (%s, %d bytes). Inspect the attached image and answer the user's request; loading it does not deliver it to the user.", arguments.path, media, #bytes),
         images = {{media_type = media, data = margatroid.data:encode("base64", bytes)}}
     }
 end

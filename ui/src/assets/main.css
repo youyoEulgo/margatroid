@@ -630,6 +630,7 @@ textarea:focus-visible {
      above it while the scrollbar itself still reaches the viewport bottom. */
   padding: 16px 32px calc(var(--mg-composer-height, 220px) + 28px);
   scrollbar-gutter: stable;
+  overflow-anchor: none;
 }
 
 .empty-state {

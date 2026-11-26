@@ -390,14 +390,8 @@ const currentChannelLabel = computed(() => {
 });
 
 const NEAR_BOTTOM_PX = 80;
-
-function shouldFollowMessages() {
-  const list = messageList.value;
-  if (!list) return false;
-  return (
-    list.scrollHeight - list.scrollTop - list.clientHeight <= NEAR_BOTTOM_PX
-  );
-}
+const followMessages = ref(true);
+let lastMessageScrollTop = 0;
 
 watch(
   () =>
@@ -406,9 +400,9 @@ watch(
         `${message.key}:${message.thinking.length}:${message.content.length}`,
     ),
   () => {
-    const follow = shouldFollowMessages();
+    if (!followMessages.value) return;
     nextTick(() => {
-      if (follow) scrollMessages();
+      if (followMessages.value) scrollMessages();
     });
   },
 );
@@ -536,6 +530,7 @@ async function submitMessage() {
     if (generation !== draftGeneration) return;
     draft.value = "";
     draftImages.value = [];
+    followMessages.value = true;
     nextTick(scrollMessages);
   } catch (error) {
     if (generation === draftGeneration) composerError.value = "Send failed";
@@ -595,12 +590,14 @@ function selectSandbox(value: string) {
 function selectWorkspace(key: string) {
   store.selectWorkspace(key);
   sidebarOpen.value = false;
+  followMessages.value = true;
   nextTick(scrollMessages);
 }
 
 function selectMember(agent: string | null, key?: string) {
   store.selectAgent(agent, key);
   sidebarOpen.value = false;
+  followMessages.value = true;
   nextTick(scrollMessages);
 }
 
@@ -633,6 +630,19 @@ function scrollMessages() {
   });
 }
 
+function onMessageWheel(event: WheelEvent) {
+  if (event.deltaY < 0) {
+    followMessages.value = false;
+    return;
+  }
+  const list = messageList.value;
+  if (
+    list &&
+    list.scrollHeight - list.scrollTop - list.clientHeight <= NEAR_BOTTOM_PX
+  )
+    followMessages.value = true;
+}
+
 const olderPending = ref(false);
 let olderAnchor: { height: number; top: number } | null = null;
 let olderTimer: ReturnType<typeof setTimeout> | undefined;
@@ -652,8 +662,17 @@ function loadEarlierMessages() {
 
 function onMessageScroll() {
   const list = messageList.value;
-  if (!list || olderPending.value || list.scrollTop > 96) return;
-  loadEarlierMessages();
+  if (!list) return;
+  const top = list.scrollTop;
+  const movedUp = top < lastMessageScrollTop;
+  lastMessageScrollTop = top;
+  const distance = list.scrollHeight - top - list.clientHeight;
+  // A wheel-up must stay detached even while content growth keeps the
+  // remaining distance under the follow threshold. Only downward scrolling
+  // that actually reaches the bottom re-enables following.
+  if (movedUp) followMessages.value = false;
+  else if (distance <= NEAR_BOTTOM_PX) followMessages.value = true;
+  if (!olderPending.value && top <= 96) loadEarlierMessages();
 }
 
 /** Let the wheel roll through the composer into the message list. */
@@ -960,6 +979,7 @@ const conversationRows = computed<ConversationRow[]>(() => {
         class="message-list"
         aria-live="polite"
         @scroll="onMessageScroll"
+        @wheel="onMessageWheel"
       >
         <div v-if="!selectedWorkspace" class="empty-state">
           <div class="empty-icon">

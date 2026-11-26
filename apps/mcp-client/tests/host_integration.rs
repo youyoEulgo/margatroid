@@ -230,15 +230,19 @@ mod linux {
         let registered: Value = serde_json::from_str(&response.content).unwrap();
         assert_eq!(registered["task_id"], "catalog-owner");
         let aliases = registered["aliases"].as_array().unwrap();
-        assert_eq!(aliases.len(), 1024);
-        for (index, alias) in aliases.iter().enumerate() {
+        assert_eq!(aliases.len(), 1025);
+        assert_eq!(aliases.last().unwrap(), "large_update");
+        for (index, alias) in aliases.iter().take(1024).enumerate() {
             assert_eq!(alias, &json!(format!("large_catalog_{index:04}")));
         }
         let tools = f.app.world().get_component::<Tools>(f.agent).unwrap();
-        assert_eq!(tools.iter().count(), 1025);
+        assert_eq!(tools.iter().count(), 1026);
         let definitions: Vec<_> = tools
             .iter()
-            .filter(|(_, tool)| tool.owner_task_id.as_deref() == Some("catalog-owner"))
+            .filter(|(alias, tool)| {
+                alias.starts_with("large_catalog_")
+                    && tool.owner_task_id.as_deref() == Some("catalog-owner")
+            })
             .map(|(alias, tool)| {
                 json!({
                     "alias":alias, "description":tool.description,
@@ -256,7 +260,9 @@ mod linux {
             assert_eq!(tool.path, f.resource.join("tool.toml"));
             assert_eq!(
                 tool.binding,
-                Some(json!({"remote_tool":format!("catalog_{marker}")}))
+                Some(
+                    json!({"kind":"mcp_tool","agent":"/mcp/agent","task_id":"catalog-owner","remote_tool":format!("catalog_{marker}")})
+                )
             );
             assert_eq!(
                 tool.description,
@@ -364,7 +370,7 @@ mod linux {
             );
         }
         println!(
-            "host_integration large_catalog: tools=1024 host_records=1025 catalog_json_bytes={catalog_bytes} definition_json_bytes={definition_bytes}; full descriptions/schemas, reverse concurrent calls, all aliases/tasks/processes cleanup passed"
+            "host_integration large_catalog: tools=1024 host_records=1026 catalog_json_bytes={catalog_bytes} definition_json_bytes={definition_bytes}; full descriptions/schemas, reverse concurrent calls, all aliases/tasks/processes cleanup passed"
         );
     }
     pub fn result_formatting() {
@@ -483,12 +489,20 @@ mod linux {
         );
         let registered: Value = serde_json::from_str(&response.content).unwrap();
         assert_eq!(registered["task_id"], "owner");
-        assert_eq!(registered["aliases"], json!(["e2e_echo", "e2e_other"]));
+        assert_eq!(
+            registered["aliases"],
+            json!(["e2e_echo", "e2e_other", "e2e_update"])
+        );
         let tools = f.app.world().get_component::<Tools>(f.agent).unwrap();
         for (alias, remote) in [("e2e_echo", "echo"), ("e2e_other", "other")] {
             let tool = tools.get(alias).unwrap();
             assert_eq!(tool.owner_task_id.as_deref(), Some("owner"));
-            assert_eq!(tool.binding, Some(json!({"remote_tool":remote})));
+            assert_eq!(
+                tool.binding,
+                Some(
+                    json!({"kind":"mcp_tool","agent":"/mcp/agent","task_id":"owner","remote_tool":remote})
+                )
+            );
             assert_eq!(tool.path, f.resource.join("tool.toml"));
             assert!(
                 !tool.description.is_empty(),
@@ -599,7 +613,90 @@ mod linux {
             config,
             "startup replay must not append a duplicate command"
         );
-        f.finish("restarted-owner");
+        let mut updated_arguments: Value =
+            serde_json::from_str(replay["arguments"].as_str().unwrap()).unwrap();
+        updated_arguments["alias_prefix"] = json!("changed_");
+        let update = f.execute("replacement-owner", "e2e_update", updated_arguments.clone());
+        let updated = f.response(update).unwrap();
+        assert!(!updated.failed, "MCP update failed: {}", updated.content);
+        assert!(
+            f.tasks().get("restarted-owner").is_err(),
+            "old MCP task must be physically cleaned before update returns"
+        );
+        assert!(
+            f.tasks().get("replacement-owner").is_ok(),
+            "update invocation must become the new serving task"
+        );
+        let tools = f.app.world().get_component::<Tools>(f.agent).unwrap();
+        assert!(tools.get("e2e_echo").is_none() && tools.get("e2e_update").is_none());
+        for alias in ["changed_echo", "changed_other", "changed_update"] {
+            assert_eq!(
+                tools.get(alias).unwrap().owner_task_id.as_deref(),
+                Some("replacement-owner")
+            );
+        }
+        assert!(
+            f.tasks()
+                .get("replacement-owner")
+                .unwrap()
+                .snapshot("replacement-owner")
+                .unwrap()
+                .output
+                .is_empty(),
+            "discovery and update parameters must not be copied into the task output cache"
+        );
+        let ping = f.execute(
+            "updated-ping",
+            "changed_echo",
+            json!({"text":"updated-serving"}),
+        );
+        let ping = f.response(ping).unwrap();
+        assert!(!ping.failed);
+        assert_eq!(ping.content, "updated-serving");
+        let storage_core::StorageValue::Config(updated_config) =
+            storage_core::execute_storage(&storage, storage_core::StorageOperation::ReadConfig)
+                .unwrap()
+        else {
+            panic!()
+        };
+        let updated_config = serde_json::to_value(updated_config).unwrap();
+        let updated_startup = updated_config["initialization"]["custom"]
+            .as_array()
+            .unwrap();
+        assert_eq!(
+            updated_startup.len(),
+            1,
+            "update must replace rather than append startup instructions"
+        );
+        assert_eq!(
+            updated_startup[0]["arguments"][0][0]["tool_name"],
+            "mcp_register"
+        );
+        let persisted: Value = serde_json::from_str(
+            updated_startup[0]["arguments"][0][0]["arguments"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(persisted, updated_arguments);
+        updated_arguments["alias_prefix"] = json!("again_");
+        let again = f.execute(
+            "replacement-again",
+            "changed_update",
+            updated_arguments.clone(),
+        );
+        let again = f.response(again).unwrap();
+        assert!(!again.failed, "repeated update failed: {}", again.content);
+        assert!(f.tasks().get("replacement-owner").is_err());
+        assert!(
+            f.app
+                .world()
+                .get_component::<Tools>(f.agent)
+                .unwrap()
+                .get("again_update")
+                .is_some()
+        );
+        f.finish("replacement-again");
         let storage_core::StorageValue::Config(table) =
             storage_core::execute_storage(&storage, storage_core::StorageOperation::ReadConfig)
                 .unwrap()

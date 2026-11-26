@@ -818,7 +818,26 @@ export const useWorkbenchStore = defineStore('workbench', () => {
       fields: [{ name: 'stage', value: r.stage }],
     }));
   });
-  const contextTokens = computed(() => latestContextTokens(selectedHistory.value));
+  const contextTokens = computed(() => {
+    let latest: number | null = null;
+    for (const entry of visibleMessages.value) {
+      if (entry.role !== 'assistant' && entry.role !== 'compact') continue;
+      const value =
+        isRecord(entry.payload) && isRecord(entry.payload.message)
+          ? entry.payload.message
+          : entry.payload;
+      const usage = isRecord(value) && isRecord(value.usage) ? value.usage : null;
+      if (
+        usage &&
+        typeof usage.input_tokens === 'number' &&
+        usage.input_tokens >= 0 &&
+        typeof usage.output_tokens === 'number' &&
+        usage.output_tokens >= 0
+      )
+        latest = usage.input_tokens + usage.output_tokens;
+    }
+    return latest;
+  });
   const contextWindowTokens = computed(
     () => selectedAgentState.value?.context_window_tokens ?? null,
   );
@@ -826,9 +845,12 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     let input = 0,
       output = 0,
       cached = 0;
-    for (const row of selectedHistory.value?.messages ?? []) {
+    for (const entry of visibleMessages.value) {
+      if (entry.role !== 'assistant' && entry.role !== 'compact') continue;
       const value =
-        isRecord(row.payload) && isRecord(row.payload.message) ? row.payload.message : row.payload;
+        isRecord(entry.payload) && isRecord(entry.payload.message)
+          ? entry.payload.message
+          : entry.payload;
       const usage = isRecord(value) && isRecord(value.usage) ? value.usage : null;
       if (!usage) continue;
       input += typeof usage.input_tokens === 'number' ? usage.input_tokens : 0;

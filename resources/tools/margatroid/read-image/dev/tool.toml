@@ -1,3 +1,3 @@
 schema_version = 1
 name = "read-image"
-description = "Read a PNG, JPEG, GIF or WebP image (maximum 5 MiB) for visual inspection. Paths may be absolute or relative to the project root. Format is identified by file signature rather than extension. Unsupported, empty, unreadable, or oversized files fail explicitly."
+description = "Read an image into your visual context so you can inspect and analyze its contents. After reading, explain the relevant findings to the user. This tool does not present or send the image to the user. Supports PNG, JPEG, GIF and WebP up to 5 MiB. Paths may be absolute or relative to the project root. Format is identified by file signature rather than extension. Unsupported, empty, unreadable, or oversized files fail explicitly."

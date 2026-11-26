@@ -8,7 +8,7 @@
       "type": "string",
       "pattern": "^[A-Za-z_][A-Za-z0-9_-]*$",
       "maxLength": 64,
-      "description": "Prefix prepended to each remote tool name; defaults to mcp_. Non-identifier bytes in remote names become underscores. Collisions fail the whole registration."
+      "description": "Prefix prepended to remote tool names and the generated update tool; defaults to mcp_. Non-identifier bytes in remote names become underscores. The suffix update is reserved for replacing this MCP connection. Collisions fail the whole registration. Updating replaces the complete server configuration and uses the new prefix (mcp_ if omitted)."
     },
     "server": {
       "oneOf": [

@@ -6,8 +6,10 @@ local MAX_QUEUE = 4096
 local QUEUE_BYTES = 2 * FRAME_BYTES
 
 function configure(arguments, context)
-    if context.owner_task_id == nil then return { timeout_ms = 0 } end
-    return { timeout_ms = 30000 }
+    if type(context.binding) == "table" and context.binding.kind == "mcp_tool" then
+        return { timeout_ms = 30000 }
+    end
+    return { timeout_ms = 0 }
 end
 
 local function failure(message)
@@ -82,10 +84,12 @@ local function format_result(response)
 end
 
 local function call_remote(arguments, context)
-    if type(context.binding) ~= "table" or type(context.binding.remote_tool) ~= "string" then
+    if type(context.binding) ~= "table" or context.binding.kind ~= "mcp_tool"
+        or type(context.binding.remote_tool) ~= "string" or type(context.binding.agent) ~= "string"
+        or type(context.binding.task_id) ~= "string" then
         error("missing remote_tool binding")
     end
-    margatroid.task:send({agent=context.owner_agent,task_id=context.owner_task_id}, {
+    margatroid.task:send({agent=context.binding.agent,task_id=context.binding.task_id}, {
         operation = "call", id = context.task_id, reply_to = context.task_id,
         tool = context.binding.remote_tool, arguments = arguments,
     })
@@ -99,28 +103,94 @@ local function call_remote(arguments, context)
 end
 
 
--- Persist replay instructions through the existing CONFIG contract. GET/SET is
--- intentionally a whole-array replacement, not a multi-command transaction.
-local function persist_registration(context, replay_arguments)
-    local function command(text, arguments)
-        local response = margatroid.mcl:execute(context.agent_info.address, text, arguments)
-        if response.Error then error(response.Error.message, 0) end
-        return response
-    end
-    local config = command("CONFIG GET").Config
+local function command(context, text, arguments)
+    local response = margatroid.mcl:execute(context.agent_info.address, text, arguments)
+    if response.Error then error(response.Error.message, 0) end
+    return response
+end
+
+local function custom_initialization(context)
+    local config = command(context, "CONFIG GET").Config
     local initialization = config.initialization or {}
     local custom = initialization.custom or {}
     if type(custom) ~= "table" then error("initialization.custom must be an array", 0) end
-    local replay = {command = "EFFECT tool_call ?", arguments = {{
-        {id = "startup-" .. context.alias, tool_name = context.alias,
-         arguments = margatroid.data:encode("json", replay_arguments)}
+    return custom
+end
+
+local function make_replay(register_alias, arguments)
+    return {command = "EFFECT tool_call ?", arguments = {{
+        {id = "startup-" .. register_alias, tool_name = register_alias,
+         arguments = margatroid.data:encode("json", arguments)}
     }}}
-    local encoded = margatroid.data:encode("json", replay)
-    for _, item in ipairs(custom) do
-        if margatroid.data:encode("json", item) == encoded then return end
+end
+
+local function locate_replay(custom, binding)
+    local found
+    for index, item in ipairs(custom) do
+        if json_equal(item, binding.replay)
+            or (binding.previous_replay ~= nil and json_equal(item, binding.previous_replay)) then
+            if found then error("multiple matching MCP startup registrations", 0) end
+            found = index
+        end
     end
-    custom[#custom + 1] = replay
-    command("CONFIG SET ? ?", {"initialization.custom", custom})
+    if not found then error("MCP startup registration is missing", 0) end
+    return found
+end
+
+-- Only the saved registration entry is replaced; unrelated order and entries stay intact.
+local function persist_registration(context, replay, replacing)
+    local custom = custom_initialization(context)
+    if replacing then
+        local index = locate_replay(custom, replacing)
+        custom[index] = replay
+    else
+        for _, item in ipairs(custom) do
+            if json_equal(item, replay) then return end
+        end
+        custom[#custom + 1] = replay
+    end
+    command(context, "CONFIG SET ? ?", {"initialization.custom", custom})
+end
+
+local function prepare_registration(arguments, context, state)
+    if type(context.agent_info) ~= "table" or type(context.agent_info.address) ~= "string" then
+        error("MCP registration requires a calling Agent", 0)
+    end
+    if not object(arguments.server) then error("missing MCP server parameters", 0) end
+    local server = arguments.server
+    if server.transport == "stdio" then
+        if type(server.command) ~= "string" or server.command == "" then error("missing MCP server command", 0) end
+    elseif server.transport == "http" then
+        if type(server.url) ~= "string" or server.url == "" then error("missing MCP server URL", 0) end
+    else
+        error("unsupported MCP transport", 0)
+    end
+    state.prefix = arguments.alias_prefix or "mcp_"
+    if type(state.prefix) ~= "string" then error("invalid MCP alias prefix", 0) end
+    state.update_schema = margatroid.data:decode("json", margatroid.files:read(context.resource_dir .. "/input.schema.json"))
+    if not object(state.update_schema) then error("invalid MCP registration schema", 0) end
+    local binding = context.binding
+    if binding ~= nil then
+        if type(binding) ~= "table" or binding.kind ~= "mcp_update"
+            or binding.agent ~= context.agent_info.address
+            or type(binding.task_id) ~= "string" or binding.task_id == ""
+            or binding.task_id == context.task_id
+            or type(binding.register_alias) ~= "string" or binding.register_alias == ""
+            or not object(binding.replay) then
+            error("invalid MCP update binding", 0)
+        end
+        local custom = custom_initialization(context)
+        local index = locate_replay(custom, binding)
+        state.replacing = {replay = custom[index]}
+        state.register_alias = binding.register_alias
+    else
+        state.register_alias = context.alias
+        if type(state.register_alias) ~= "string" or state.register_alias == "" then error("missing MCP registration alias", 0) end
+    end
+    state.replay = make_replay(state.register_alias, {server = server, alias_prefix = state.prefix})
+    if binding ~= nil then
+        margatroid.task:finish({agent = binding.agent, task_id = binding.task_id})
+    end
 end
 
 local function register_server(arguments, context, state)
@@ -222,8 +292,9 @@ local function register_server(arguments, context, state)
             or margatroid.data:encode("json", result.tools):sub(1, 1) ~= "[" then
             error("invalid discovery result: expected tools array")
         end
-        local prefix = arguments.alias_prefix or "mcp_"
-        local definitions, aliases, seen = {}, {}, {}
+        local prefix = state.prefix
+        local update_alias = prefix .. "update"
+        local definitions, aliases, seen = {}, {}, {[update_alias] = true}
         for _, tool in ipairs(result.tools) do
             if not object(tool) or type(tool.name) ~= "string" or tool.name == ""
                 or not object(tool.inputSchema)
@@ -241,14 +312,24 @@ local function register_server(arguments, context, state)
             definitions[#definitions + 1] = {
                 alias = alias, description = description,
                 input_schema = tool.inputSchema, lifetime = {task_id=context.task_id},
-                binding = { remote_tool = tool.name },
+                binding = { kind = "mcp_tool", remote_tool = tool.name,
+                    agent = context.agent_info.address, task_id = context.task_id },
             }
         end
-        -- The host validates and commits the entire batch to its existing Tools.
+        aliases[#aliases + 1] = update_alias
+        definitions[#definitions + 1] = {
+            alias = update_alias,
+            description = "Replace this MCP server connection with complete new server and alias_prefix parameters, and replace its saved startup registration. Closes the old server task before connecting the new one.",
+            input_schema = state.update_schema, lifetime = {task_id = context.task_id},
+            binding = {kind = "mcp_update", agent = context.agent_info.address,
+                task_id = context.task_id, register_alias = state.register_alias,
+                replay = state.replay,
+                previous_replay = state.replacing and state.replacing.replay or nil},
+        }
+        -- The host validates and commits the entire batch, including the updater.
         margatroid.tools:register({tools=definitions})
         registered = true
-        local replay_arguments = {server = arguments.server, alias_prefix = prefix}
-        local saved, save_error = pcall(persist_registration, context, replay_arguments)
+        local saved, save_error = pcall(persist_registration, context, state.replay, state.replacing)
         if saved then
             -- Keep the serving task alive after returning; aliases depend on it.
             margatroid.task:return_result('{"task_id":' .. margatroid.data:encode("json", context.task_id) .. ',"aliases":'
@@ -303,11 +384,15 @@ function execute(arguments, context)
     arguments = context.arguments
     local state = { pending = {}, returned = false }
     local ok, err = pcall(function()
-        if context.owner_task_id == nil then
+        local kind = type(context.binding) == "table" and context.binding.kind or nil
+        if context.binding == nil or kind == "mcp_update" then
+            prepare_registration(arguments, context, state)
             register_server(arguments, context, state)
-        else
+        elseif kind == "mcp_tool" then
             call_remote(arguments, context)
             state.returned = true
+        else
+            error("unknown MCP binding kind", 0)
         end
     end)
     if not ok then
@@ -323,6 +408,7 @@ function execute(arguments, context)
         else margatroid.task:append_output({ error = "MCP session ended: " .. tostring(err) }) end
     end
     -- Self finish never returns. Keep it outside pcall; host worker cleanup owns
-    -- process termination and releases all dynamic aliases and dependent tasks.
+    -- process termination and releases this task's dynamic aliases; already accepted
+    -- calls are independent tasks and are not cancelled with those definitions.
     margatroid.task:finish(context.task_id)
 end

@@ -141,7 +141,9 @@ LLM可见的工具失败保留原调用ID、工具名、failed标记、错误类
 
 tools:register使用{agent?,tools}批次，宿主固定当前资源路径，每项lifetime={agent?,task_id}选择实际任务，省略为静态工具，整批登记，任一定义无效或alias冲突整批失败，不增加System或专用事件。调用入口的owner_task_id、binding通过context传给同一脚本，模型参数不能改写它们；不额外增加工具清单或可见性步骤。
 
-MCP注册任务A连接成功、注入入口后return但不finish；使用入口的任务B从私有context取得owner_task_id和binding，运行同一Lua脚本，把带request ID的调用发送给A，得到结果后return并finish。A连续转发带ID的请求并路由乱序响应。A关闭作用域时主动撤销它持有的精确注册，不等待或取消已受理的B；B按自身超时、取消与工具内部通信结果处理。B先结束时，A的迟到回复遇TaskMissing仅清除该请求关联。
+MCP注册任务A连接成功、注入业务入口与prefix+update入口后return但不finish。脚本根据可信binding.kind三路分流：无binding为首次注册，mcp_tool携带服务任务及remote_tool转发业务调用，mcp_update携带旧任务与精确初始化条目接替服务。A关闭作用域时撤销工具定义，不等待或取消已受理的调用任务B；B继续按自身生命周期运行。
+
+更新工具沿用注册Schema，接收完整server和可选alias_prefix，不需要模型提供任务id或旧配置。它先校验初始化目标唯一，再finish旧任务等待真实清理，当前调用直接连接新server、批次注册业务工具和新update工具，并替换原初始化项；不通过EFFECT tool_call嵌套注册、不把发现结果或协议流写入任务缓存。初始化保存失败仍保留已运行的新服务并清晰报告，关闭后连接失败则保留原持久配置，不自动重试。
 
 process_open使用原始stdin/stdout/stderr管道，不经过PTY；write/read保持字节，工具自己处理消息边界、UTF-8分片和多条消息。输入写入、stdout与stderr读取需并行推进，避免双向背压互相阻塞。子进程和后代受ToolTask唯一存活预算、取消及finish清理约束。
 
@@ -203,7 +205,7 @@ Agent创建注入接口为name/config_path/ui_path，拒绝旧resource_dir创建
 任务绑定Agent生命周期已实现。自动Driver和工具创建的Agent都绑定创建者同一TaskScope，不再有AgentOwner，创建来源保存在同一AgentTaskBinding.creator中。任务正常execute结束、异常、超时或外部finish/cancel均停止所有绑定Agent，等待其推理、任务、子Agent、Block临时状态及监控真实收口并移除Entity后才能确认任务结束；return_result仅交付结果，不会停止Agent。Agent提前主动停止解除绑定，之后任务结束不重复关闭；Agent关闭其任务，任务scope停止自己创建的Agent；Workspace统一关闭所有Agent并等待实际移除，避免循环等待。
 Agent创建已提交后，Lua取消不能丢弃启动oneshot：宿主持有创建交接监督，创建完成后仍绑定并按已关闭scope清理，finish也先等待所有在途创建。停止无法确认时不宣称任务finish成功，不删除用户持久库，不增加专用子代理接口。该能力不实现子代理Driver分流、继承或输出策略。
 
-Bundled skill/MCP registrars now save successful registration commands to the target Agent initialization.custom using CONFIG GET then whole-key SET. Identical commands are not written again, including on startup replay; differing commands append, with no upsert or multi-command isolation. Skill saves canonical SKILL.md, MCP saves server/prefix, neither saves task handles. Failed persistence clearly reports current registration versus missing startup persistence; MCP keeps the existing serving task alive. The Tool host supplies no registration-specific persistence API.
+Bundled skill/MCP registrars save successful startup registration commands through Agent CONFIG GET and whole-key SET. Initial registrations deduplicate exact commands, otherwise append. MCP update instead replaces its exact original item without changing other entries or their order, keeping the original registration tool alias and complete new server/prefix. No persisted task handles, no nested registration invocation and no host-specific persistence API. A failed save reports that the new serving task is live but the startup configuration remains unchanged; GET/SET retains existing whole-array concurrency semantics.
 
 
 ## 通用 Lua HTTP

@@ -118,6 +118,8 @@ DOMPurify.addHook('afterSanitizeAttributes', (node) => {
       const rewritten = activeRewriter(href);
       if (rewritten) element.setAttribute('href', rewritten);
     }
+    element.setAttribute('target', '_blank');
+    element.setAttribute('rel', 'noopener noreferrer');
   }
 });
 

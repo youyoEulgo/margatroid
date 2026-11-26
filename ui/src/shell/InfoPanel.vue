@@ -3,7 +3,7 @@ import { computed, nextTick, onMounted, ref, watch } from 'vue';
 import { storeToRefs } from 'pinia';
 import { Boxes, ChevronRight, Cpu, History, ShieldCheck, Wrench } from 'lucide-vue-next';
 import { useWorkbenchStore } from '@/stores/workbench';
-import { isRecord, type HistoryMessage } from '@/types/protocol';
+import { isRecord } from '@/types/protocol';
 import { formatRecordTime } from '@/lib/time';
 
 const store = useWorkbenchStore();
@@ -12,7 +12,7 @@ const {
   selectedAgentState,
   selectedAgentName,
   selectedWorkspace,
-  selectedHistory,
+  visibleMessages,
   historyCursors,
   toolDefinitions,
   taskStates,
@@ -29,23 +29,45 @@ const agent = computed(() => selectedAgentState.value);
 const model = computed(() => agent.value?.model ?? null);
 const tools = computed(() => toolDefinitions.value.get(address.value) ?? []);
 const tasks = computed(() => taskStates.value.get(address.value) ?? []);
-const history = computed<HistoryMessage[]>(() => selectedHistory.value?.messages ?? []);
+interface InfoHistoryRow {
+  key: string;
+  sequence: number | null;
+  turn: string | null;
+  kind: string;
+  content: string;
+  payload: unknown;
+  created_at_ms: number;
+}
+
+const history = computed<InfoHistoryRow[]>(() =>
+  visibleMessages.value.map((entry) => ({
+    key: entry.key,
+    sequence: entry.sequence,
+    turn: null,
+    kind: entry.kind,
+    content: entry.content,
+    payload:
+      entry.payload ??
+      { type: entry.messageType ?? entry.role, content: entry.content },
+    created_at_ms: entry.timestamp,
+  })),
+);
 const hasOlder = computed(() => {
   const cursor = historyCursors.value.get(address.value);
   return cursor === undefined || cursor.before !== null;
 });
 const sandboxActive = computed(() => agent.value?.sandbox ?? null);
 
-function payloadOf(message: HistoryMessage): Record<string, unknown> {
+function payloadOf(message: InfoHistoryRow): Record<string, unknown> {
   return isRecord(message.payload) ? message.payload : {};
 }
 
-function messageType(message: HistoryMessage): string {
+function messageType(message: InfoHistoryRow): string {
   const type = payloadOf(message).type;
   return typeof type === 'string' ? type : 'message';
 }
 
-function historyPreview(message: HistoryMessage): string {
+function historyPreview(message: InfoHistoryRow): string {
   const payload = payloadOf(message);
   if (Array.isArray(payload.tool_calls) && payload.tool_calls.length) {
     const names = payload.tool_calls
@@ -66,7 +88,7 @@ function historyPreview(message: HistoryMessage): string {
   return message.content || '(empty)';
 }
 
-function historyDetail(message: HistoryMessage): string {
+function historyDetail(message: InfoHistoryRow): string {
   return JSON.stringify(message.payload, null, 2) ?? String(message.content);
 }
 
@@ -252,13 +274,13 @@ onMounted(async () => {
           aria-label="Agent history"
           @scroll="onHistoryScroll"
         >
-          <details v-for="message in history" :key="message.sequence" class="info-history-entry">
+          <details v-for="message in history" :key="message.key" class="info-history-entry">
             <summary class="info-history-row">
               <span class="info-history-time">{{
                 formatRecordTime(message.created_at_ms, true)
               }}</span>
               <span class="info-badge">{{ messageType(message) }}</span>
-              <span class="info-history-seq">#{{ message.sequence }}</span>
+              <span class="info-history-seq">{{ message.sequence === null ? 'live' : `#${message.sequence}` }}</span>
               <span class="info-history-text">{{ historyPreview(message) }}</span>
               <ChevronRight class="info-history-caret" :size="12" />
             </summary>

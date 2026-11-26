@@ -71,7 +71,9 @@ subagent采用全新对话：config_path固定资源目录setting.toml，不读�
 
 主Agent创建时ui_path使用资源目录/ui，子模式使用/subagent-ui。两种UI来源均由原目录监控和agent.ui接口交付，不复制、不回退主UI。创建来源creator由真实任务绑定产生，不由脚本传owner。
 
-skill_register与mcp_register在实际注册成功后，使用目标Agent CONFIG GET/SET向initialization.custom追加{command="EFFECT tool_call ?",arguments=[[{id="startup-<alias>",tool_name=<实际注册工具alias>,arguments=<注册参数JSON>}]]}。skill保存规范SKILL.md路径，MCP保存server及alias_prefix，不保存当次task_id、发现结果或进程句柄。启动重放如已存在完全相同命令参数则不追加、不SET，现有活跃alias冲突仍报错；参数不同的命令按追加处理，不提供身份upsert。
+skill_register与mcp_register在实际注册成功后，使用目标Agent CONFIG GET/SET向initialization.custom追加{command="EFFECT tool_call ?",arguments=[[{id="startup-<alias>",tool_name=<实际注册工具alias>,arguments=<注册参数JSON>}]]}。skill保存规范SKILL.md路径，MCP保存server及alias_prefix，不保存当次task_id、发现结果或进程句柄。首次注册及启动重放如已存在完全相同命令参数则不追加、不SET，现有活跃alias冲突仍报错；不同的首次注册仍按追加处理。
+
+MCP注册批次同时加入prefix+update工具。无binding、mcp_tool、mcp_update分别进入首次注册、远端调用和更新分支；标记与任务关联来自宿主注入binding，不进入模型Schema。更新调用任务独立于旧服务，先校验新参数和唯一初始化目标，再finish旧任务并等待实际清理，当前任务直接接替建立新连接和注入工具，不嵌套执行注册工具。成功后只替换原初始化条目，保留其他条目及顺序；保存的入口仍为原普通注册工具及新参数，不保存更新工具别名或任务id。
 
 CONFIG写入失败返回“本次已注册但启动命令未保存”的失败说明。skill静态工具保留；MCP返回失败说明及当前serving task_id，任务仍存活、维持已注册工具转发。后续启动重新执行已保存命令，建立新MCP连接/任务，不使用旧task_id。GET编辑SET之间不做隔离，整数组覆盖语义由调用方接受。
 

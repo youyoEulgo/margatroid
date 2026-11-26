@@ -424,6 +424,8 @@ margatroid.tools:register(registration: RegisterToolsRequest) -> Future<Output =
     行为：仅工具execute可用。注册批次指定目标Agent，每项lifetime独立指定任务；缺省Agent为当前Agent，缺省lifetime不绑定发起任务。
         inject_tools在World闭包校验实际发起任务身份和同Workspace当前目标，原子登记完整批次；程序路径固定为当前工具资源，不接受参数指定任意程序。
         绑定任务关闭时只撤销该批次对应注册，不取消已受理调用，不增加同步事件或监听任务。
+        MCP资源用同一脚本的binding.kind区分mcp_tool和mcp_update，无binding执行首次注册；任务id和远端入口由可信context提供，不进入模型参数。
+        业务与更新定义均可绑定同一服务任务；已受理的更新执行独立于该归属，关闭旧服务后仍能继续注册新定义并使自身成为服务任务，宿主不增加MCP专用分流或持久化接口。
 margatroid.workspace:agents() -> Future<Output = Vec<Value>>
     行为：工具execute异步请求WorkspaceAgents，宿主核对实际调用任务后实时查询同Workspace成员address/name/state，不缓存启动时成员列表。
 inject_tools(context: &ToolExecutionContext, registration: RegisterToolsRequest) -> Future<Output = Result<(), ToolError>>
