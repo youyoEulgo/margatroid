@@ -31,6 +31,7 @@ function execute(arguments, context)
     local turn
     local pending_tool_results = 0
     local subdriver_finished = false
+    local request_body_recoveries = 0
 
     local function command(text, arguments)
         return execute_command(agent.address, text, arguments)
@@ -41,6 +42,12 @@ function execute(arguments, context)
     end
 
     local function append_history(message)
+        if message.type == "error" and message.code == "RequestBodyTooLarge" then
+            margatroid:log("warn", message.message, {
+                code = message.code, request_id = message.request_id, details = message.details,
+            })
+            return message
+        end
         message = command("EFFECT history_append ?", {{message}}).Array.Message[1]
         if subdriver then
             if message.type == "assistant" and type(message.content) == "string" and message.content ~= "" then
@@ -121,6 +128,83 @@ function execute(arguments, context)
         command("INJECT soul TO msg.instructions")
     end
 
+    -- Request-size recovery is Driver policy; original history is never rewritten.
+    local function recover_request_body()
+        local function unable(reason)
+            append_history({type = "error", code = "RequestBodyTooLarge",
+                message = "Cannot recover oversized request: " .. reason})
+            return false
+        end
+        if request_body_recoveries >= 8 then return unable("recovery limit reached") end
+        local config = settings()
+        local conversation = command("GET session.conversation").Array.Message
+        local original = margatroid.data:encode("json", conversation)
+        local preferred = compaction_split(conversation, config.compaction.keep_messages) - 1
+        local boundaries, pending = {}, {}
+        for index, item in ipairs(conversation) do
+            if item.type == "assistant" then
+                for _, call in ipairs(item.tool_calls or {}) do pending[call.id] = true end
+            elseif item.type == "tool_call" then
+                pending[item.tool_call_id] = nil
+            end
+            if next(pending) == nil and index < #conversation then boundaries[#boundaries + 1] = index end
+        end
+        if #boundaries == 0 then return unable("no complete earlier message batch fits a summary") end
+        local candidate = #boundaries
+        if preferred > 0 then
+            while candidate > 1 and boundaries[candidate] > preferred do candidate = candidate - 1 end
+        end
+        local attempts, tried = 0, {}
+        while candidate >= 1 and attempts < 16 do
+            attempts = attempts + 1
+            tried[candidate] = true
+            local ending = boundaries[candidate]
+            local earlier = {}
+            for index = 1, ending do earlier[#earlier + 1] = conversation[index] end
+            command("INJECT ? TO msg.compact_context", {earlier})
+            command("INJECT compact TO msg.compact_prompt")
+            local summary = command("EFFECT inference (msg.instructions, msg.compact_context, msg.compact_prompt)").Inference.message
+            if summary.type == "error" then
+                append_history(summary)
+                if summary.code ~= "RequestBodyTooLarge" then
+                    return false
+                end
+            elseif summary.type == "assistant" and summary.stop_reason == "completed"
+                and type(summary.content) == "string" and summary.content ~= "" then
+                local replacement = {{type = "user", content = "Conversation checkpoint:\n" .. summary.content}}
+                for index = ending + 1, #conversation do replacement[#replacement + 1] = conversation[index] end
+                if #margatroid.data:encode("json", replacement) < #original then
+                    local current = command("GET session.conversation").Array.Message
+                    if margatroid.data:encode("json", current) ~= original then
+                        return unable("conversation changed while preparing summary")
+                    end
+                    summary.type = "compact"
+                    append_history(summary)
+                    command("EFFECT block_snapshot ?", {"session"})
+                    command("INJECT ? TO session.conversation", {replacement})
+                    command("INJECT soul TO msg.instructions")
+                    request_body_recoveries = request_body_recoveries + 1
+                    return true
+                end
+                -- Once the old prefix is already compact, include an earlier part
+                -- of the normally retained tail rather than resummarizing it forever.
+                local larger = #boundaries
+                while larger > candidate and tried[larger] do larger = larger - 1 end
+                if larger <= candidate then return unable("summary did not reduce the conversation size") end
+                candidate = larger
+                goto next_candidate
+            else
+                return unable("summary did not complete with usable content")
+            end
+            -- A failed summary cannot be repaired by retrying the same prefix.
+            if candidate == 1 then break end
+            candidate = math.max(1, math.floor(candidate / 2))
+            while candidate >= 1 and tried[candidate] do candidate = candidate - 1 end
+            ::next_candidate::
+        end
+        return unable("even the smallest complete prefix exceeds the request budget")
+    end
+
     local function initialize()
         local config = settings()
         active_model = command("EFFECT model_set ?", {config.inference}).Config
@@ -184,6 +268,7 @@ function execute(arguments, context)
         elseif message.type == "user" then
             command("INJECT ? TO session.conversation[-1]", {{message}})
             turn = command("EFFECT start_turn").Turn
+            request_body_recoveries = 0
             enqueue_inference()
         elseif message.type == "assistant" then
             if (message.content and message.content ~= "")
@@ -202,7 +287,11 @@ function execute(arguments, context)
             end
         elseif message.type == "error" then
             pending_tool_results = 0
-            finish_turn()
+            if message.code == "RequestBodyTooLarge" and recover_request_body() then
+                enqueue_inference()
+            else
+                finish_turn()
+            end
         elseif message.type == "tool_call" then
             command("INJECT ? TO session.conversation[-1]", {{message}})
             pending_tool_results = pending_tool_results - 1

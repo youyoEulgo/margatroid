@@ -1179,10 +1179,16 @@ async fn execute_inference(
         .map_err(|_| error(MclErrorKind::CleanupFailed, "inference reply was lost"))?
     {
         Ok(response) => inference_result(response, &context.request.id),
-        Err(failed) => Ok(MclValue::Inference {
-            message: json!({"type":"error","message":failed.to_string(),"request_id":context.request.id}),
-            stop_reason: "error".into(),
-        }),
+        Err(failed) => {
+            let mut message = json!({"type":"error","code":format!("{:?}",failed.kind),"message":failed.to_string(),"request_id":context.request.id});
+            if let Some(details) = failed.details {
+                message["details"] = details;
+            }
+            Ok(MclValue::Inference {
+                message,
+                stop_reason: "error".into(),
+            })
+        }
     }
 }
 

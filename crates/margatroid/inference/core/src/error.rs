@@ -4,6 +4,8 @@ use std::fmt;
 pub struct InferenceError {
     pub kind: InferenceErrorKind,
     pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub details: Option<serde_json::Value>,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum InferenceErrorKind {
@@ -18,6 +20,7 @@ pub enum InferenceErrorKind {
     InvalidModelRoute,
     UnsupportedFormat,
     RequestFailed,
+    RequestBodyTooLarge,
     ResponseStatus,
     ResponseInvalid,
     ResponseIncomplete,
@@ -33,6 +36,7 @@ impl InferenceError {
         Self {
             kind,
             message: message.into(),
+            details: None,
         }
     }
 }

@@ -363,6 +363,11 @@ margatroid.files:matches(path: LuaString, pattern: String) -> bool
         无斜杠模式的文件名匹配与含斜杠的相对路径匹配遵循现有ripgrep glob契约
         非法模式返回明确错误，不使用Lua pattern近似替代
 
+margatroid.data:image_prepare(bytes: LuaString, options?: ImagePrepareOptions) -> ImagePreview
+    行为：复用lua_runtime_core的data::install纯Rust图片预览转换，完整类型与算法见Lua Runtime设计；不增加工具专用helper或图片进程。
+        read-image资源不再按原文件5MiB拒绝输入，先解码并压缩，再交付预览；默认max_dimension=1280、target_bytes=307200、quality=80，可由本次工具入参显式调整。
+        返回的图片结果使用预览字节而非原始字节，正文记录原尺寸与预览尺寸、编码和大小；原文件与已有消息历史不改。
+
 margatroid.data:decode(format: String, content: LuaString) -> LuaValue
     行为：
         format仅接受json、yaml、toml、base64，不猜测格式，不保留旧方法别名

@@ -285,14 +285,7 @@ fn message_sync_uses_one_reasoning_field_and_real_history_identity() {
 }
 
 #[test]
-fn budgets_and_media_validation_do_not_echo_payloads() {
-    assert_eq!(
-        parse_client_message(&" ".repeat(MAX_MESSAGE_BYTES + 1))
-            .unwrap_err()
-            .0
-            .code,
-        "MessageTooLarge"
-    );
+fn media_validation_does_not_echo_payloads() {
     let message = |image| json!({"address":"/demo/coder","command":"INJECT ? TO entry.pending[-1]","arguments":[[{"type":"user","content":"image","data":[image]}]]});
     assert!(
         parse(

@@ -767,6 +767,21 @@ fn format_provider_status_error(
                     .map(str::to_owned)
             })
         });
+    let provider_type = field("type");
+    let provider_code = field("code");
+    let is_body_too_large = status == reqwest::StatusCode::PAYLOAD_TOO_LARGE
+        || [&provider_type, &provider_code]
+            .into_iter()
+            .flatten()
+            .any(|value| {
+                matches!(
+                    value.as_str(),
+                    "payload_too_large_error"
+                        | "payload_too_large"
+                        | "request_too_large"
+                        | "request_body_too_large"
+                )
+            });
     let message = field("message").or_else(|| upstream?.as_str().map(str::to_owned));
     let request_id = request_id.or_else(|| {
         let message = message.as_deref()?;
@@ -791,7 +806,7 @@ fn format_provider_status_error(
     for (name, value, limit) in [
         ("type", field("type"), 48),
         ("code", field("code"), 48),
-        ("request_id", request_id, 96),
+        ("request_id", request_id.clone(), 96),
     ] {
         if let Some(value) = value {
             let value = safe_error_field(&value, secrets, limit);
@@ -833,7 +848,31 @@ fn format_provider_status_error(
     output.push_str("; message=");
     output.push_str(&detail);
     output.push_str(&suffix);
-    error(Kind::ResponseStatus, output)
+    let mut failure = error(
+        if is_body_too_large {
+            Kind::RequestBodyTooLarge
+        } else {
+            Kind::ResponseStatus
+        },
+        output,
+    );
+    if is_body_too_large {
+        let mut details = json!({"http_status": status.as_u16()});
+        for (name, value, limit) in [
+            ("request_id", request_id, 96),
+            ("provider_type", provider_type, 48),
+            ("provider_code", provider_code, 48),
+        ] {
+            if let Some(value) = value {
+                let value = safe_error_field(&value, secrets, limit);
+                if !value.is_empty() {
+                    details[name] = json!(value);
+                }
+            }
+        }
+        failure.details = Some(details);
+    }
+    failure
 }
 
 struct StreamTextSnapshot {
@@ -859,32 +898,23 @@ fn push_full(delivery: &mut StreamDelivery, result: Result<&InferenceResponse, &
                 .retain(|_, value| !value.is_null());
             (message, None)
         }
-        Err(failure) => (
-            json!({"type":"error","message":failure.to_string(),"request_id":delivery.id}),
-            Some(json!({"code":format!("{:?}",failure.kind),"message":failure.message})),
-        ),
+        Err(failure) => {
+            let mut message = json!({"type":"error","message":failure.to_string(),"request_id":delivery.id,"code":format!("{:?}",failure.kind)});
+            if let Some(details) = &failure.details {
+                message["details"] = details.clone();
+            }
+            (
+                message,
+                Some(json!({"code":format!("{:?}",failure.kind),"message":failure.message})),
+            )
+        }
     };
     let frame = json!({"type":"agent.message.full.sync","address":delivery.agent,"turn":delivery.turn,"generation":delivery.id,"history_sequence":null,"message":message,"error":failure});
     push_frame(delivery, frame);
 }
 
-const MAX_STREAM_FRAME_BYTES: usize = 32 * 1024 * 1024;
 fn push_frame(delivery: &mut StreamDelivery, frame: serde_json::Value) {
     if let Ok(encoded) = serde_json::to_string(&frame) {
-        if encoded.len() > MAX_STREAM_FRAME_BYTES {
-            if delivery
-                .source_alive
-                .load(std::sync::atomic::Ordering::Acquire)
-            {
-                for (_, sender) in delivery
-                    .clients
-                    .select(&[client_core::ClientSelector::Type("webui".into())])
-                {
-                    sender.cancel();
-                }
-            }
-            return;
-        }
         delivery.clients.send_scoped(
             &[client_core::ClientSelector::Type("webui".into())],
             Arc::new(ClientFrame::Text(encoded)),

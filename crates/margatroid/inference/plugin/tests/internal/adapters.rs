@@ -345,3 +345,23 @@ fn domain_media_serializes_once_under_data_without_provider_fields() {
         );
     }
 }
+
+#[test]
+fn request_body_has_no_hidden_local_text_limit() {
+    let route = ModelRoute {
+        model: "model".into(),
+        provider: "openai".into(),
+        api_type: "responses".into(),
+        base_url: "http://127.0.0.1:1/v1".into(),
+        api_key: "key".into(),
+        context_window_tokens: 1000,
+        thinking: None,
+        reasoning_effort: None,
+    };
+    let mut input = domain();
+    input.messages[0] = InferenceMessage::User {
+        content: "x".repeat(17 * 1024 * 1024),
+        images: vec![],
+    };
+    assert!(build_request(input.clone(), &route).unwrap().body.len() > 17 * 1024 * 1024);
+}

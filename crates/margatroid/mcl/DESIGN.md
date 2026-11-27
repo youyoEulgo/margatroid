@@ -199,7 +199,8 @@ explicit_turn(context: &CommandContext, parameter: Option<EffectParameter>) -> R
 execute_inference(context: &CommandContext, messages: Vec<Value>, turn: Option<String>) -> Future<Output = Result<MclValue, MclError>>
     行为：compact输入在inference_message中按assistant别名规范化，保留相同reasoning/content/tool_calls并映射为InferenceMessage::Assistant；不把compact角色发往厂商。转换消息与读取实际推理配置，经通用check_action后提交InferenceRequest；turn只来自本次effect明确提供的可选参数，不来自Agent当前状态快照；省略为None，空字符串或非字符串明确报参数错误。
         无turn也正常提交，不在MCL构造empty_completed或短路返回；Inference plugin决定生命周期、会话、权限及并发受理，Some(turn)额外要求当前有效且匹配，None为自由调用，并以原oneshot返回结果。
-        InferenceRequest的领域Err转换为MclValue::Inference { message: {type:"error",message:原领域Display文本,request_id:原MCL id}, stop_reason:"error" }，属于成功交付的推理错误消息，不转换顶层MclValue::Error或抛Lua异常。
+        InferenceRequest的领域Err转换为MclValue::Inference { message: {type:"error",code:领域错误种类名称,message:原领域Display文本,request_id:原MCL id,details?:原领域结构化诊断}, stop_reason:"error" }，属于成功交付的推理错误消息，不转换顶层MclValue::Error或抛Lua异常。
+        上游明确请求体超限归一为RequestBodyTooLarge，details保留http_status及可选request_id，由Driver按code决定压缩恢复；MCL仅透传，不解析文案、不自行修改上下文或重试，不伪造本地字节上限。
         正常响应仍由inference_result转换assistant；真实MCL参数/身份/权限/取消、配置缺失及oneshot丢失等执行通道错误保留原MclError，不伪造正常返回或自动重试。
 
 execute_tools(context: &CommandContext, messages: Vec<Value>, turn: Option<String>) -> Future<Output = Result<MclValue, MclError>>

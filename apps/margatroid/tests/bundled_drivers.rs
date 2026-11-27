@@ -2,7 +2,8 @@ use std::path::Path;
 #[test]
 fn all_bundled_drivers_and_declared_resource_files_are_readable_with_the_new_contracts() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../resources");
-    for name in ["coder", "reviewer"] {
+    {
+        let name = "assistant";
         let manifest = root
             .join("agent-drivers/margatroid")
             .join(name)
@@ -126,7 +127,8 @@ mod mailbox_compaction {
             .join("../../resources")
             .canonicalize()
             .unwrap();
-        for name in ["coder", "reviewer"] {
+        {
+            let name = "assistant";
             let home = tempfile::tempdir().unwrap();
             let project = home.path().join("project");
             std::fs::create_dir(&project).unwrap();
@@ -1131,17 +1133,16 @@ mod mailbox_compaction {
 
 #[test]
 fn subdriver_creates_fresh_agent_from_default_config_before_returning_task_id() {
-    for source in [
-        include_str!("../../../resources/agent-drivers/margatroid/coder/dev/main.lua"),
-        include_str!("../../../resources/agent-drivers/margatroid/reviewer/dev/main.lua"),
-    ] {
+    {
+        let source =
+            include_str!("../../../resources/agent-drivers/margatroid/assistant/dev/main.lua");
         let lua = mlua::Lua::new();
         lua.load(r#"
 ctx={kind="tool",resource_dir="/driver",project_root="/project",task_id="task",arguments={instructions="delegated objective",path="src",alias="Child"}}
 margatroid={agent={}}
 function margatroid.agent:create(options)
  assert(options.node_name==nil and options.alias=="Child" and options.project_root=="/project/src" and options.config_path=="/driver/setting.toml" and options.ui_path=="/driver/subagent-ui")
- return {address="/probe/coder/~temporary-task"}
+ return {address="/probe/assistant/~temporary-task"}
 end
 "#).exec().unwrap();
         let prefix = source.split("    local active_model").next().unwrap();
@@ -1161,19 +1162,18 @@ end
 
 #[test]
 fn top_level_driver_uses_explicit_node_alias_and_relative_work_directory() {
-    for source in [
-        include_str!("../../../resources/agent-drivers/margatroid/coder/dev/main.lua"),
-        include_str!("../../../resources/agent-drivers/margatroid/reviewer/dev/main.lua"),
-    ] {
+    {
+        let source =
+            include_str!("../../../resources/agent-drivers/margatroid/assistant/dev/main.lua");
         let lua = mlua::Lua::new();
         lua.load(r#"
-ctx={kind="tool",resource_dir="/driver",project_root="/project",task_id="task",arguments={node_name="coder",alias="Developer",path="src"}}
+ctx={kind="tool",resource_dir="/driver",project_root="/project",task_id="task",arguments={node_name="assistant",alias="Assistant",path="src"}}
 margatroid={agent={}}
 function margatroid.agent:create(options)
- assert(options.node_name=="coder" and options.alias=="Developer" and options.project_root=="/project/src")
+ assert(options.node_name=="assistant" and options.alias=="Assistant" and options.project_root=="/project/src")
  assert(options.ui_path=="/driver/ui" and options.config_path=="/driver/setting.toml")
  assert(options.owner==nil and options.creator==nil)
- return {address="/probe/coder"}
+ return {address="/probe/assistant"}
 end
 "#).exec().unwrap();
         let prefix = source.split("    local active_model").next().unwrap();
@@ -1192,7 +1192,8 @@ end
 
 #[test]
 fn driver_and_subagent_schemas_expose_separate_arguments() {
-    for name in ["coder", "reviewer"] {
+    {
+        let name = "assistant";
         let root = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../resources/agent-drivers/margatroid")
             .join(name)
@@ -1222,7 +1223,8 @@ fn driver_and_subagent_schemas_expose_separate_arguments() {
 
 #[test]
 fn absent_and_empty_initialization_never_read_resource_defaults() {
-    for name in ["coder", "reviewer"] {
+    {
+        let name = "assistant";
         let path = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../resources/agent-drivers/margatroid")
             .join(name)

@@ -1260,8 +1260,8 @@ pub(crate) async fn ws_handler(
         connection,
     };
     upgrade
-        .max_message_size(MAX_MESSAGE_BYTES)
-        .max_frame_size(MAX_MESSAGE_BYTES)
+        .max_message_size(usize::MAX)
+        .max_frame_size(usize::MAX)
         .on_upgrade(move |socket| async move {
             let _guard = guard;
             let _reservation = reservation;
@@ -1284,27 +1284,9 @@ impl Drop for ConnectionReservation {
 }
 
 fn encode_response(value: Value) -> Option<String> {
-    if let Ok(message) = serde_json::from_value::<ServerMessage>(value.clone())
-        && let Ok(text) = encode_server_message(&message)
-    {
-        return Some(text);
-    }
-    let kind = value.get("type")?.as_str()?;
-    let id = value.get("id")?.as_str()?;
-    let mut failure = frame(
-        kind,
-        id,
-        Err(error(
-            "ResponseTooLarge",
-            "response cannot fit the protocol budget",
-        )),
-    );
-    if let Some(address) = value.get("address") {
-        failure["address"] = address.clone();
-    }
-    serde_json::from_value::<ServerMessage>(failure)
+    serde_json::from_value::<ServerMessage>(value)
         .ok()
-        .and_then(|v| encode_server_message(&v).ok())
+        .and_then(|message| encode_server_message(&message).ok())
 }
 fn invalid_reply(text: &str) -> Option<Value> {
     let raw: Value = serde_json::from_str(text).ok()?;
@@ -1413,7 +1395,7 @@ async fn serve_connection(
                         Err(error)=>{
                             let request=serde_json::from_str(&text).unwrap_or_else(|_|json!({"raw_frame":text.to_string()}));
                             if let Some(value)=invalid_reply(&text){pending.push(async move{ReplyOutput{value,request}}.boxed());None}
-                            else{let failure=json!({"success":false,"error":{"code":error.0.code,"message":error.0.message}});trace_response(connection,&request,&failure);Some(Message::Close(Some(CloseFrame{code:if text.len()>MAX_MESSAGE_BYTES{1009}else{1007},reason:"invalid protocol request".into()})))}
+                            else{let failure=json!({"success":false,"error":{"code":error.0.code,"message":error.0.message}});trace_response(connection,&request,&failure);Some(Message::Close(Some(CloseFrame{code:1007,reason:"invalid protocol request".into()})))}
                         },
                     }},
                     Some(Ok(Message::Ping(v)))=>Some(Message::Pong(v)),

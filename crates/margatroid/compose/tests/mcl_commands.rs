@@ -1701,7 +1701,7 @@ async fn inference_error_is_a_value_and_finish_turn_waits_for_cleanup() {
         assert_eq!(stop_reason, "error");
         assert_eq!(
             message,
-            json!({"type": "error", "message": format!("{kind:?}: safe failure"), "request_id": request.id})
+            json!({"type": "error", "code":format!("{kind:?}"), "message": format!("{kind:?}: safe failure"), "request_id": request.id})
         );
         assert_eq!(
             fixture
@@ -1811,7 +1811,7 @@ async fn inference_error_does_not_finish_a_replacement_turn() {
     };
     assert_eq!(
         message,
-        json!({"type":"error", "message":"Timeout: safe failure", "request_id":request.id})
+        json!({"type":"error", "code":"Timeout", "message":"Timeout: safe failure", "request_id":request.id})
     );
     let agent = fixture
         .app
@@ -1824,16 +1824,10 @@ async fn inference_error_does_not_finish_a_replacement_turn() {
 
 #[tokio::test]
 async fn bundled_drivers_record_inference_error_messages_and_keep_running_while_cleanup_finishes() {
-    for (role, source) in [
-        (
-            "coder",
-            include_str!("../../../../resources/agent-drivers/margatroid/coder/dev/base.lua"),
-        ),
-        (
-            "reviewer",
-            include_str!("../../../../resources/agent-drivers/margatroid/reviewer/dev/base.lua"),
-        ),
-    ] {
+    for (role, source) in [(
+        "assistant",
+        include_str!("../../../../resources/agent-drivers/margatroid/assistant/dev/base.lua"),
+    )] {
         for kind in [
             InferenceErrorKind::RequestFailed,
             InferenceErrorKind::ResponseStatus,
@@ -1921,7 +1915,7 @@ async fn bundled_drivers_record_inference_error_messages_and_keep_running_while_
             );
             // Run the bundled initialization list; fake only resource imports and inference.
             let initial: Value = toml::from_str(include_str!(
-                "../../../../resources/agent-drivers/margatroid/coder/dev/setting.toml"
+                "../../../../resources/agent-drivers/margatroid/assistant/dev/setting.toml"
             ))
             .unwrap();
             fixture

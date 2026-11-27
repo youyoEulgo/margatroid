@@ -6,7 +6,6 @@ pub use types::*;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde_json::Value;
 
-pub const MAX_MESSAGE_BYTES: usize = 32 * 1024 * 1024;
 pub const MAX_ID_BYTES: usize = 512;
 pub const MAX_COMMAND_BYTES: usize = 64 * 1024;
 
@@ -19,12 +18,6 @@ pub fn valid_request_id(id: &str) -> bool {
 }
 
 pub fn parse_client_message(text: &str) -> Result<ClientMessage, ProtocolError> {
-    if text.len() > MAX_MESSAGE_BYTES {
-        return Err(ProtocolError::new(
-            "MessageTooLarge",
-            "message exceeds 32 MiB",
-        ));
-    }
     let raw: Value = serde_json::from_str(text).map_err(|_| invalid("invalid protocol message"))?;
     if !raw.get("message").is_some_and(Value::is_object) {
         return Err(invalid("message must be an explicit object"));
@@ -190,12 +183,6 @@ pub fn parse_client_message(text: &str) -> Result<ClientMessage, ProtocolError> 
 pub fn encode_server_message(message: &ServerMessage) -> Result<String, ProtocolError> {
     let text = serde_json::to_string(message)
         .map_err(|_| ProtocolError::new("EncodeFailed", "response cannot be serialized"))?;
-    if text.len() > MAX_MESSAGE_BYTES {
-        return Err(ProtocolError::new(
-            "ResponseTooLarge",
-            "response exceeds 32 MiB",
-        ));
-    }
     Ok(text)
 }
 

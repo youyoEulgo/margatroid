@@ -7,6 +7,8 @@ use std::{collections::HashSet, path::PathBuf};
 
 #[path = "files.rs"]
 mod files;
+#[path = "image.rs"]
+mod image;
 #[path = "text.rs"]
 mod text;
 
@@ -289,6 +291,7 @@ pub fn install(lua: &Lua, callbacks: &mlua::Table, root: PathBuf) -> mlua::Resul
             to_lua(lua, value)
         })?,
     )?;
+    image::install(lua, callbacks)?;
     files::install(lua, callbacks, root)?;
     text::install(lua, callbacks)
 }

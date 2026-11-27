@@ -5,6 +5,25 @@
       "type": "string",
       "description": "Image file path, absolute or relative to the current project root.",
       "minLength": 1
+    },
+    "max_dimension": {
+      "type": "integer",
+      "minimum": 1,
+      "default": 1280,
+      "description": "Maximum preview side in pixels, preserving aspect ratio; small images are never enlarged. Raise this for fine details."
+    },
+    "quality": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 100,
+      "default": 80,
+      "description": "Initial JPEG quality for opaque images; lowered to at most 70 then 60 before reducing dimensions. Transparent images preserve alpha as lossless WebP."
+    },
+    "target_bytes": {
+      "type": "integer",
+      "minimum": 1,
+      "default": 307200,
+      "description": "Desired maximum encoded preview bytes. Increase to preserve more detail; dimensions shrink further if encoding alone cannot fit. An impossible target fails explicitly."
     }
   },
   "required": [

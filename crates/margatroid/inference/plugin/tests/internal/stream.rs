@@ -1768,9 +1768,9 @@ async fn cumulative_chunks_preserve_both_texts_across_interleaved_and_empty_frag
 }
 
 #[test]
-fn cumulative_wire_budget_cancels_delivery_without_changing_accumulated_result() {
+fn cumulative_frames_larger_than_32_mib_preserve_connection_and_terminal_delivery() {
     let (mut delivery, mut frames) = captured_delivery();
-    let content = "\n".repeat(MAX_STREAM_FRAME_BYTES / 2 + 1);
+    let content = "\n".repeat(16 * 1024 * 1024 + 1);
     let mut gate = StreamGate::default();
     gate.accumulator
         .accept(ProviderFragment::Content(content.clone()))
@@ -1783,12 +1783,44 @@ fn cumulative_wire_budget_cancels_delivery_without_changing_accumulated_result()
             reasoning: String::new(),
         },
     );
-    assert!(frames.try_recv().is_err());
-    assert!(delivery
-        .clients
-        .select(&[client_core::ClientSelector::Type("webui".into())])
-        .is_empty());
+    let ClientFrame::Text(encoded) = frames.try_recv().unwrap() else {
+        panic!("expected a text chunk");
+    };
+    assert!(encoded.len() > 32 * 1024 * 1024);
+    let chunk: Value = serde_json::from_str(&encoded).unwrap();
+    assert_eq!(chunk["type"], "agent.message.chunk.sync");
+    assert_eq!(chunk["generation"], delivery.id);
+    assert_eq!(chunk["sequence"], 1);
+    assert_eq!(chunk["content"], content);
+    assert_eq!(chunk["reasoning"], "");
+    drop(chunk);
+    drop(encoded);
+    assert_eq!(
+        delivery
+            .clients
+            .select(&[client_core::ClientSelector::Type("webui".into())])
+            .len(),
+        1,
+        "a large cumulative chunk must not cancel the connection"
+    );
+    gate.accumulator
+        .accept(ProviderFragment::Finished(InferenceStopReason::Completed))
+        .unwrap();
+    let response = gate.accumulator.response().unwrap();
+    push_full(&mut delivery, Ok(&response));
+    let full = frame_json(frames.try_recv().unwrap());
+    assert_eq!(full["type"], "agent.message.full.sync");
+    assert_eq!(full["generation"], delivery.id);
+    assert_eq!(full["message"]["content"], content);
     assert_eq!(gate.accumulator.content, content);
+    assert_eq!(
+        delivery
+            .clients
+            .select(&[client_core::ClientSelector::Type("webui".into())])
+            .len(),
+        1,
+        "the terminal frame must preserve the same live connection"
+    );
 }
 
 #[test]
@@ -1806,4 +1838,71 @@ fn retiring_a_source_discards_queued_terminal_frames_without_cancelling_other_ex
         frames.try_recv().is_err(),
         "retired instance cannot deliver a queued full"
     );
+}
+
+#[test]
+fn upstream_request_body_limit_has_machine_readable_details_in_full() {
+    let base = "[[models]]\nid='route'\nmodel='model'\nprovider='openai'\napi_type='responses'\nbase_url='https://example.com/v1'\napi_key='key'\n";
+    assert!(parse_model_routes(base).is_ok());
+    assert!(parse_model_routes(&format!("{base}max_request_bytes=50331648\n")).is_err());
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert("x-request-id", "header-id".parse().unwrap());
+    let failure = format_provider_status_error(reqwest::StatusCode::PAYLOAD_TOO_LARGE, &headers,
+        br#"{"error":{"message":"Failed to buffer the request body: length limit exceeded","type":"payload_too_large_error","code":"invalid_request_error","request_id":"upstream-id"}}"#,
+        None, &[]);
+    assert_eq!(failure.kind, Kind::RequestBodyTooLarge);
+    assert_eq!(
+        failure.details,
+        Some(
+            json!({"http_status":413,"request_id":"upstream-id","provider_type":"payload_too_large_error","provider_code":"invalid_request_error"})
+        )
+    );
+    assert!(failure.message.contains("length limit exceeded"));
+    let (mut delivery, mut frames) = captured_delivery();
+    push_full(&mut delivery, Err(&failure));
+    let frame = frame_json(frames.try_recv().unwrap());
+    assert_eq!(frame["message"]["code"], "RequestBodyTooLarge");
+    assert_eq!(frame["message"]["details"], failure.details.unwrap());
+}
+
+#[test]
+fn upstream_body_limit_classification_never_guesses_from_generic_failure() {
+    for (status, body, expected) in [
+        (413, "", Kind::RequestBodyTooLarge),
+        (
+            400,
+            r#"{"error":{"code":"request_body_too_large","message":"too large"}}"#,
+            Kind::RequestBodyTooLarge,
+        ),
+        (
+            400,
+            r#"{"error":{"type":"payload_too_large_error","message":"too large"}}"#,
+            Kind::RequestBodyTooLarge,
+        ),
+        (
+            400,
+            r#"{"error":{"code":"invalid_request_error","message":"length limit exceeded"}}"#,
+            Kind::ResponseStatus,
+        ),
+        (
+            400,
+            r#"{"error":{"code":"context_length_exceeded","message":"maximum context length"}}"#,
+            Kind::ResponseStatus,
+        ),
+        (550, "", Kind::ResponseStatus),
+        (502, "", Kind::ResponseStatus),
+    ] {
+        let failure = format_provider_status_error(
+            reqwest::StatusCode::from_u16(status).unwrap(),
+            &Default::default(),
+            body.as_bytes(),
+            None,
+            &[],
+        );
+        assert_eq!(failure.kind, expected, "status={status}");
+        assert_eq!(
+            failure.details.is_some(),
+            expected == Kind::RequestBodyTooLarge
+        );
+    }
 }

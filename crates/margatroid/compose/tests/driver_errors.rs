@@ -14,10 +14,8 @@ use std::{
 };
 use tokio::sync::oneshot;
 
-const CODER: &str =
-    include_str!("../../../../resources/agent-drivers/margatroid/coder/dev/base.lua");
-const REVIEWER: &str =
-    include_str!("../../../../resources/agent-drivers/margatroid/reviewer/dev/base.lua");
+const ASSISTANT: &str =
+    include_str!("../../../../resources/agent-drivers/margatroid/assistant/dev/base.lua");
 
 #[derive(Default)]
 struct Commands {
@@ -34,6 +32,8 @@ struct Commands {
     inference_error: bool,
     conversation: Vec<Value>,
     snapshots: Vec<Vec<Value>>,
+    inference_responses: VecDeque<Value>,
+    compact_prefixes: Vec<Vec<Value>>,
 }
 
 // Run the shipped drivers in a real Workspace Lua VM. The command responder is
@@ -119,7 +119,7 @@ impl Fixture {
                         MclValue::Unit
                     } else {
                         let mut config:toml::Table=toml::from_str("sandbox='read_only'\n[compaction]\nthreshold=0.8\nkeep_messages=2\n").unwrap();
-                        let initialization=state.initialization.clone().unwrap_or_else(||toml::from_str::<Value>(include_str!("../../../../resources/agent-drivers/margatroid/coder/dev/setting.toml")).unwrap()["initialization"].clone());
+                        let initialization=state.initialization.clone().unwrap_or_else(||toml::from_str::<Value>(include_str!("../../../../resources/agent-drivers/margatroid/assistant/dev/setting.toml")).unwrap()["initialization"].clone());
                         config.insert("initialization".into(),toml::Value::try_from(initialization).unwrap());
                         MclValue::Config(config)
                     }
@@ -130,6 +130,9 @@ impl Fixture {
                     assert_eq!(request.instruction.arguments, vec![json!("session")]);
                     let saved = state.conversation.clone();
                     state.snapshots.push(saved);
+                    MclValue::Unit
+                } else if text == "INJECT ? TO msg.compact_context" {
+                    state.compact_prefixes.push(request.instruction.arguments[0].as_array().unwrap().clone());
                     MclValue::Unit
                 } else if text == "INJECT ? TO session.conversation" {
                     state.conversation = request.instruction.arguments[0].as_array().unwrap().clone();
@@ -155,7 +158,9 @@ impl Fixture {
                 } else if text.starts_with("EFFECT inference ") && std::mem::take(&mut state.inference_error) {
                     MclValue::Inference{message:json!({"type":"error","message":"provider connection refused","request_id":request.id}),stop_reason:"error".into()}
                 } else if text.starts_with("EFFECT inference ") {
-                    MclValue::Inference {message:json!({"type":"assistant", "content":"done", "stop_reason":"completed"}), stop_reason:"completed".into()}
+                    let message=state.inference_responses.pop_front().unwrap_or_else(||json!({"type":"assistant", "content":"done", "stop_reason":"completed"}));
+                    let stop_reason=if message["type"]=="error"{"error"}else{"completed"}.into();
+                    MclValue::Inference {message,stop_reason}
                 } else if text == "EFFECT start_turn" {
                     state.working = true;
                     MclValue::Turn("driver-error-turn".into())
@@ -205,7 +210,7 @@ impl Fixture {
         };
         self.app.world().send_event(StartDriverLuaVm {
             owner:self.owner, workspace:self.workspace,
-            program:LuaProgram {source, origin:PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../resources/agent-drivers/margatroid/coder/dev/shipped-driver.lua"), },
+            program:LuaProgram {source, origin:PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../resources/agent-drivers/margatroid/assistant/dev/shipped-driver.lua"), },
             environment:LuaEnvironment {globals:BTreeMap::from([("execution_context".into(), LuaBinding::Value(LuaValue::from_json(json!({"workspace":{"address":"/unit"},"arguments":{"node_name":"driver-errors","alias":"Driver fixture","path":"."},"resource_dir":"/tmp"})).unwrap()))]), modules:BTreeMap::new()},
             reply:Arc::new(Mutex::new(Some(sender))),
         });
@@ -271,7 +276,7 @@ impl Fixture {
 
 #[tokio::test]
 async fn shipped_drivers_stop_at_each_mcl_failure_and_host_logs_once() {
-    for source in [CODER, REVIEWER] {
+    for source in [ASSISTANT] {
         for stage in [
             "GET entry.pending[0]",
             "INJECT [] TO entry.pending[0,1]",
@@ -336,7 +341,7 @@ async fn shipped_drivers_stop_at_each_mcl_failure_and_host_logs_once() {
 
 #[tokio::test]
 async fn lua_programming_errors_are_logged_by_host_and_exit_without_script_recovery() {
-    for source in [CODER, REVIEWER] {
+    for source in [ASSISTANT] {
         let mut fixture = Fixture::new();
         let instance = fixture.start(source).await.unwrap();
         fixture.settle().await;
@@ -393,7 +398,7 @@ async fn lua_programming_errors_are_logged_by_host_and_exit_without_script_recov
 
 #[tokio::test]
 async fn initialization_mcl_error_exits_through_host_without_ready() {
-    for source in [CODER, REVIEWER] {
+    for source in [ASSISTANT] {
         let mut fixture = Fixture::new();
         fixture.commands.lock().unwrap().fail = Some("CONFIG GET".into());
         let failure = fixture.start(source).await.unwrap_err();
@@ -432,7 +437,7 @@ async fn initialization_mcl_error_exits_through_host_without_ready() {
 
 #[tokio::test]
 async fn compaction_snapshots_before_replacement_and_preserves_context_on_snapshot_failure() {
-    for source in [CODER, REVIEWER] {
+    for source in [ASSISTANT] {
         for (tokens, fail_snapshot) in [(4000, false), (4000, true), (0, false)] {
             let mut fixture = Fixture::new();
             let original = vec![
@@ -565,7 +570,7 @@ end
 #[tokio::test]
 async fn compact_returns_error_or_compact_without_history_or_context_updates_until_caller_records_it()
  {
-    for source in [CODER, REVIEWER] {
+    for source in [ASSISTANT] {
         let mut fixture = Fixture::new();
         let original = vec![
             json!({"type":"user","content":"old"}),
@@ -630,7 +635,7 @@ end
 
 #[tokio::test]
 async fn manual_compaction_without_earlier_context_returns_and_records_error_without_inference() {
-    for source in [CODER, REVIEWER] {
+    for source in [ASSISTANT] {
         let mut fixture = Fixture::new();
         let prefix = source.split("\n    initialize()\n").next().unwrap();
         let program = format!(
@@ -664,7 +669,7 @@ end
 
 #[tokio::test]
 async fn configured_initialization_runs_defaults_before_custom_and_stops_on_custom_error() {
-    for source in [CODER, REVIEWER] {
+    for source in [ASSISTANT] {
         for fail_custom in [false, true] {
             let mut fixture = Fixture::new();
             {
@@ -715,5 +720,224 @@ async fn configured_initialization_runs_defaults_before_custom_and_stops_on_cust
             }
             fixture.close(started.ok()).await;
         }
+    }
+}
+
+fn oversized_error() -> Value {
+    json!({"type":"error","code":"RequestBodyTooLarge","message":"HTTP 413 Payload Too Large; message=Failed to buffer the request body: length limit exceeded","details":{"http_status":413,"request_id":"upstream-size-error"}})
+}
+fn completed_summary(content: &str) -> Value {
+    json!({"type":"assistant","content":content,"stop_reason":"completed"})
+}
+
+#[tokio::test]
+async fn oversized_body_summarizes_smaller_balanced_prefix_then_retries_same_turn() {
+    for source in [ASSISTANT] {
+        let mut f = Fixture::new();
+        let instance = f.start(source).await.unwrap();
+        f.settle().await;
+        let original = vec![
+            json!({"type":"user","content":"earlier ".repeat(200)}),
+            json!({"type":"assistant","tool_calls":[{"id":"c","tool_name":"read_image","arguments":"{}"}]}),
+            json!({"type":"tool_call","tool_call_id":"c","tool_name":"read_image","content":"image information","failed":false}),
+            json!({"type":"user","content":"second question"}),
+            json!({"type":"assistant","content":"second answer"}),
+            json!({"type":"user","content":"latest request"}),
+        ];
+        {
+            let mut state = f.commands.lock().unwrap();
+            state.conversation = original.clone();
+            state.pending.push_back(oversized_error());
+            state.inference_responses = VecDeque::from([
+                oversized_error(),
+                completed_summary("checkpoint"),
+                completed_summary("resumed"),
+            ]);
+            state.working = true;
+        }
+        f.app.world().driver_wake(&instance).unwrap();
+        let commands = f.commands.clone();
+        f.drive(|| (commands.lock().unwrap().finished == 1).then_some(()))
+            .await;
+        {
+            let state = f.commands.lock().unwrap();
+            assert_eq!(
+                state
+                    .compact_prefixes
+                    .iter()
+                    .map(Vec::len)
+                    .collect::<Vec<_>>(),
+                vec![4, 1]
+            );
+            assert_eq!(state.snapshots, vec![original.clone()]);
+            assert_eq!(
+                state.conversation[0]["content"],
+                "Conversation checkpoint:\ncheckpoint"
+            );
+            assert_eq!(&state.conversation[1..], &original[1..]);
+            assert!(
+                state
+                    .calls
+                    .iter()
+                    .any(|call| call
+                        == "EFFECT inference (msg.instructions, session.conversation) ?")
+            );
+            assert_eq!(
+                state
+                    .history
+                    .iter()
+                    .filter(|m| m["type"] == "compact")
+                    .count(),
+                1
+            );
+            assert!(state.history.iter().any(|m| m["content"] == "resumed"));
+            assert!(
+                state
+                    .history
+                    .iter()
+                    .all(|message| message["code"] != "RequestBodyTooLarge")
+            );
+        }
+        let storage = f
+            .app
+            .world()
+            .get_component::<storage_core::AgentStorage>(f.owner)
+            .unwrap();
+        let logs = storage_core::read_agent_logs(storage, None, 100).unwrap();
+        assert_eq!(
+            logs.iter()
+                .filter(|log| log
+                    .record
+                    .details_json
+                    .as_ref()
+                    .is_some_and(|details| details["code"] == "RequestBodyTooLarge"))
+                .count(),
+            2,
+            "initial and summary oversize errors must be logged"
+        );
+        f.close(Some(instance)).await;
+    }
+}
+
+#[tokio::test]
+async fn oversized_body_recovery_stops_without_modifying_context_when_summary_cannot_fit_or_shrink()
+{
+    for summary in [oversized_error(), completed_summary(&"larger ".repeat(300))] {
+        for source in [ASSISTANT] {
+            let mut f = Fixture::new();
+            let instance = f.start(source).await.unwrap();
+            f.settle().await;
+            let original = vec![
+                json!({"type":"user","content":"earlier"}),
+                json!({"type":"user","content":"latest"}),
+            ];
+            {
+                let mut state = f.commands.lock().unwrap();
+                state.conversation = original.clone();
+                state.pending.push_back(oversized_error());
+                state.inference_responses.push_back(summary.clone());
+                state.working = true;
+            }
+            f.app.world().driver_wake(&instance).unwrap();
+            let commands = f.commands.clone();
+            f.drive(|| (commands.lock().unwrap().finished == 1).then_some(()))
+                .await;
+            {
+                let state = f.commands.lock().unwrap();
+                assert_eq!(state.conversation, original);
+                assert!(state.snapshots.is_empty());
+                assert_eq!(state.compact_prefixes.len(), 1);
+                assert!(
+                    !state.calls.iter().any(|call| call
+                        == "EFFECT inference (msg.instructions, session.conversation) ?")
+                );
+                assert!(
+                    state
+                        .history
+                        .iter()
+                        .all(|message| message["code"] != "RequestBodyTooLarge")
+                );
+            }
+            let storage = f
+                .app
+                .world()
+                .get_component::<storage_core::AgentStorage>(f.owner)
+                .unwrap();
+            let logs = storage_core::read_agent_logs(storage, None, 100).unwrap();
+            assert!(
+                logs.iter().any(|log| log
+                    .record
+                    .message
+                    .starts_with("Cannot recover oversized request:")),
+                "no-progress diagnostic must be in logs"
+            );
+            f.close(Some(instance)).await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn non_size_errors_do_not_invoke_request_body_recovery() {
+    for source in [ASSISTANT] {
+        let mut f = Fixture::new();
+        let instance = f.start(source).await.unwrap();
+        f.settle().await;
+        {
+            let mut s = f.commands.lock().unwrap();
+            s.pending.push_back(
+                json!({"type":"error","code":"ResponseStatus","message":"upstream error"}),
+            );
+            s.working = true;
+        }
+        f.app.world().driver_wake(&instance).unwrap();
+        let commands = f.commands.clone();
+        f.drive(|| (commands.lock().unwrap().finished == 1).then_some(()))
+            .await;
+        assert!(f.commands.lock().unwrap().compact_prefixes.is_empty());
+        f.close(Some(instance)).await;
+    }
+}
+
+#[tokio::test]
+async fn oversized_body_can_compact_into_retained_tail_when_old_checkpoint_cannot_shrink() {
+    for source in [ASSISTANT] {
+        let mut f = Fixture::new();
+        let instance = f.start(source).await.unwrap();
+        f.settle().await;
+        let original = vec![
+            json!({"type":"user","content":"tiny"}),
+            json!({"type":"assistant","content":"large earlier answer ".repeat(100)}),
+            json!({"type":"user","content":"latest request"}),
+        ];
+        {
+            let mut state = f.commands.lock().unwrap();
+            state.conversation = original.clone();
+            state.pending.push_back(oversized_error());
+            state.inference_responses = VecDeque::from([
+                completed_summary("this is larger than tiny"),
+                completed_summary("small"),
+                completed_summary("resumed"),
+            ]);
+            state.working = true;
+        }
+        f.app.world().driver_wake(&instance).unwrap();
+        let commands = f.commands.clone();
+        f.drive(|| (commands.lock().unwrap().finished == 1).then_some(()))
+            .await;
+        {
+            let state = f.commands.lock().unwrap();
+            assert_eq!(
+                state
+                    .compact_prefixes
+                    .iter()
+                    .map(Vec::len)
+                    .collect::<Vec<_>>(),
+                vec![1, 2]
+            );
+            assert_eq!(state.snapshots, vec![original.clone()]);
+            assert_eq!(state.conversation.len(), 2);
+            assert_eq!(state.conversation[1], original[2]);
+        }
+        f.close(Some(instance)).await;
     }
 }

@@ -102,6 +102,7 @@ workspace_file_status(error: io::Error) -> StatusCode
 
 ws_handler(State(state): State<DtoState>, ConnectInfo(peer): ConnectInfo<SocketAddr>, headers: HeaderMap, upgrade: WebSocketUpgrade) -> Future<Output = Response>
     行为：评估入口策略和退出状态，通过state.clients.allocate取得真实连接、唯一ClientReceiver及取消能力；升级任务持有AxumWorkGuard。
+        WebSocket消息与帧大小均设置usize::MAX，不叠加Axum/Tungstenite默认字节上限；JSON字段语义仍由protocol校验。
 
 handle_dto_request(world: &mut World, request: DtoRequest)
     行为：取出具体owned对象，resource.req交给resources进行异步只读查询，workspace.rename/agent.rename交给rename_alias进行数据库别名事务，其余按route转换领域请求或只读查询；原reply继续沿领域执行链回复；agent.start/stop/archive按新事件分派，不接受restart旧接口。
@@ -197,7 +198,7 @@ serve_connection(state: DtoState, connection: ConnectionId, socket: WebSocket, p
         Ordered帧先检查可选来源active，再保持入队顺序发送；正常生成结束的accepting=false不抹除已入队full；StateKey从同一ClientReceiver取最新pending来源，失效来源直接跳过。
         来源prepare持有可独立读取的Arc状态，必要IO/编码在受监督blocking worker完成，不访问World。
         每连接至多准备一个状态快照，准备期间继续接收请求、控制帧及取消；不每次更新创建无界worker。
-        完成快照后核验source epoch、revision及协议预算；旧来源或已发送版本跳过，实际发送由唯一writer串行进行。
+        完成快照后核验source epoch、revision及协议字段合法性，不限制整体编码字节数；旧来源或已发送版本跳过，实际发送由唯一writer串行进行。
         状态更新在准备期间可合并为一个新的StateKey；有序chunk及记录不作此合并。
         入队Full/Closed按ClientSender规则取消慢连接；编码/预算错误明确诊断并关闭受影响连接，不静默重试。
         退出先clients.remove，关闭队列、清空pending和请求等待，等待本连接真实准备worker结束，再发送一次ClientDisconnected并释放guard。

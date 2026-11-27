@@ -434,36 +434,92 @@ fn search_and_directory_tools_handle_spaces_hidden_files_and_brace_globs() {
     );
 }
 
+fn real_image_bytes(format: image::ImageFormat) -> Vec<u8> {
+    let source = image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+        20,
+        10,
+        image::Rgb([30, 60, 90]),
+    ));
+    let mut bytes = std::io::Cursor::new(Vec::new());
+    source.write_to(&mut bytes, format).unwrap();
+    bytes.into_inner()
+}
+
 #[test]
-fn all_supported_image_formats_return_actual_binary_images_and_reject_bad_inputs() {
+fn all_supported_image_formats_return_previews_and_reject_bad_inputs() {
     let mut f = Fixture::new();
-    let samples: [(&str, &str, &[u8]); 4] = [
-        ("tiny.png", "image/png", b"\x89PNG\r\n\x1a\nfixture"),
-        ("tiny.jpg", "image/jpeg", b"\xff\xd8\xfffixture"),
-        ("tiny.gif", "image/gif", b"GIF89afixture"),
-        ("tiny.webp", "image/webp", b"RIFF\0\0\0\0WEBPfixture"),
-    ];
-    for (name, media, bytes) in samples {
-        std::fs::write(f.root.path().join(name), bytes).unwrap();
+    for (name, format) in [
+        ("tiny.png", image::ImageFormat::Png),
+        ("tiny.jpg", image::ImageFormat::Jpeg),
+        ("tiny.gif", image::ImageFormat::Gif),
+        ("tiny.webp", image::ImageFormat::WebP),
+    ] {
+        let bytes = real_image_bytes(format);
+        let path = f.root.path().join(name);
+        std::fs::write(&path, &bytes).unwrap();
         let result = f.call("read-image", json!({"path":name}));
         assert!(!result.failed, "{}", result.content);
         assert_eq!(result.images.len(), 1);
-        assert_eq!(result.images[0].media_type, media);
+        assert_eq!(result.images[0].media_type, "image/jpeg");
         use base64::Engine;
+        let preview = base64::engine::general_purpose::STANDARD
+            .decode(&result.images[0].data)
+            .unwrap();
+        assert_eq!(image::load_from_memory(&preview).unwrap().width(), 20);
+        assert_eq!(image::load_from_memory(&preview).unwrap().height(), 10);
         assert_eq!(
-            base64::engine::general_purpose::STANDARD
-                .decode(&result.images[0].data)
-                .unwrap(),
-            bytes
+            std::fs::read(path).unwrap(),
+            bytes,
+            "original file must remain unchanged"
         );
     }
-    std::fs::write(f.root.path().join("text.png"), "not an image").unwrap();
-    assert!(f.fails("read-image", json!({"path":"text.png"})));
-    std::fs::write(f.root.path().join("empty.png"), []).unwrap();
-    assert!(f.fails("read-image", json!({"path":"empty.png"})));
+    for (name, bytes) in [
+        ("text.png", b"not an image".as_slice()),
+        ("empty.png", b"".as_slice()),
+        ("corrupt.png", b"\x89PNG\r\n\x1a\nfixture".as_slice()),
+    ] {
+        std::fs::write(f.root.path().join(name), bytes).unwrap();
+        assert!(f.fails("read-image", json!({"path":name})));
+    }
     let file = std::fs::File::create(f.root.path().join("huge.png")).unwrap();
     file.set_len(5 * 1024 * 1024 + 1).unwrap();
     assert!(f.fails("read-image", json!({"path":"huge.png"})));
+}
+
+#[test]
+fn image_source_larger_than_five_mib_is_compressed_before_delivery() {
+    use base64::Engine;
+    let mut f = Fixture::new();
+    let mut state = 0x12345678u32;
+    let image = image::RgbImage::from_fn(1800, 1200, |_, _| {
+        let mut values = [0; 3];
+        for value in &mut values {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            *value = state as u8;
+        }
+        image::Rgb(values)
+    });
+    let mut cursor = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::ImageRgb8(image)
+        .write_to(&mut cursor, image::ImageFormat::Png)
+        .unwrap();
+    let original = cursor.into_inner();
+    assert!(original.len() > 5 * 1024 * 1024);
+    let path = f.root.path().join("large-source.png");
+    std::fs::write(&path, &original).unwrap();
+    let result = f.call("read-image", json!({"path":"large-source.png"}));
+    assert!(!result.failed, "{}", result.content);
+    assert_eq!(result.images.len(), 1);
+    let preview = base64::engine::general_purpose::STANDARD
+        .decode(&result.images[0].data)
+        .unwrap();
+    assert!(preview.len() <= 300 * 1024);
+    let decoded = image::load_from_memory(&preview).unwrap();
+    assert!(decoded.width() <= 1280 && decoded.height() <= 1280);
+    assert!((decoded.width() as f64 / decoded.height() as f64 - 1.5).abs() < 0.01);
+    assert_eq!(std::fs::read(path).unwrap(), original);
 }
 
 #[test]
@@ -749,18 +805,22 @@ fn directory_and_search_boundaries_handle_unusual_names_and_limit_results() {
 }
 
 #[test]
-fn a_real_png_is_returned_unchanged_and_does_not_depend_on_extension() {
+fn a_real_png_is_prepared_without_depending_on_extension() {
     use base64::Engine;
     let mut f = Fixture::new();
-    let encoded = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a6l8AAAAASUVORK5CYII=";
-    let bytes = base64::engine::general_purpose::STANDARD
-        .decode(encoded)
-        .unwrap();
+    let bytes = real_image_bytes(image::ImageFormat::Png);
     std::fs::write(f.root.path().join("image.data"), &bytes).unwrap();
     let result = f.call("read-image", json!({"path":"image.data"}));
     assert!(!result.failed, "{}", result.content);
-    assert_eq!(result.images[0].media_type, "image/png");
-    assert_eq!(result.images[0].data, encoded);
+    assert_eq!(result.images[0].media_type, "image/jpeg");
+    let preview = base64::engine::general_purpose::STANDARD
+        .decode(&result.images[0].data)
+        .unwrap();
+    assert_eq!(image::load_from_memory(&preview).unwrap().width(), 20);
+    assert_eq!(
+        std::fs::read(f.root.path().join("image.data")).unwrap(),
+        bytes
+    );
 }
 
 #[test]
@@ -946,7 +1006,11 @@ fn bundled_file_tools_execute_without_shell_helpers_or_packaged_binaries() {
         .call("grep", json!({"pattern":"needle β","path":"plain.txt"}))
         .content
         .contains("plain.txt:1:needle β"));
-    std::fs::write(f.root.path().join("tiny.png"), b"\x89PNG\r\n\x1a\nfixture").unwrap();
+    std::fs::write(
+        f.root.path().join("tiny.png"),
+        real_image_bytes(image::ImageFormat::Png),
+    )
+    .unwrap();
     assert_eq!(
         f.call("read-image", json!({"path":"tiny.png"}))
             .images

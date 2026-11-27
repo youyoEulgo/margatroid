@@ -268,7 +268,7 @@ LuaHostFunction：异步宿主接口，公开trait
 Margatroid：共享Lua userdata
     context: serde_json::Value--只读执行身份、调用关联及arguments
     files: 文件操作子对象--read、write、list、info、create_directory、matches
-    data: 数据转换子对象--encode、decode及null标记
+    data: 数据转换子对象--encode、decode、image_prepare及null标记
     text: 文本搜索子对象--search
     process: 子进程子对象--start
     http: HTTP子对象--request，只有execute阶段可调用
@@ -350,6 +350,27 @@ margatroid:log(level: String, message: String, details: Option<LuaValue>) -> Fut
         共享绑定只调用传入回调，不引用storage_core或私有工具协议类型
         脚本不能指定或覆盖可信关联；不追加历史、不触发推理、不结束回合
         失败返回写入错误，不递归log；工具configure阶段不开放该IO方法
+
+margatroid.data:image_prepare(bytes: LuaString, options?: ImagePrepareOptions) -> ImagePreview
+    行为：execute阶段开放的纯数据同步转换，共享data::install自动向嵌入VM与工具worker提供data_image_prepare回调，不调用外部进程、不写临时文件。
+        Rust image库按实际内容识别PNG/JPEG/GIF/WebP，完整解码首帧；腐坏或不支持格式明确失败，不只检查magic伪装成功。
+        以max_dimension限制最长边、维持长宽比至像素取整，小图不放大；存在非不透明像素时用lossless WebP保留alpha，其余转JPEG。
+        JPEG先用quality，再依次min(quality,70)、min(quality,60)，当前尺寸首个符合target_bytes的输出成功；WebP不应用JPEG质量。
+        仍超目标时根据目标与实际编码体积比例缩小最长边，再从原图等比重采样，重复编码；最小1x1仍无法达到目标则明确失败。
+        原始字节不变，错误不返回损坏或超目标预览；选项只有显式格式/整数范围，不额外添加预览尺寸或体积硬quota。解码器本身的可分配内存及格式有效性检查照常。
+ImagePrepareOptions：host/image.rs私有
+    max_dimension: u32--默认1280，正整数
+    target_bytes: usize--默认307200，正整数
+    quality: u8--默认80，1..=100
+ImagePreview：Lua返回对象
+    data: LuaString--实际预览字节
+    media_type: String--image/jpeg或image/webp
+    width: u32
+    height: u32
+    original_width: u32
+    original_height: u32
+    original_bytes: usize
+    行为：实际编码字节数由#data取得；不带供应商、file_id或持久化身份。
 
 margatroid.http:request(options: HttpRequestOptions) -> Future<HttpResponse>
     行为：绑定core/src/host/http.rs的共享安装器，回调名http_request；先取得执行能力并释放userdata借用，再校验请求、认领在途槽位并异步执行。

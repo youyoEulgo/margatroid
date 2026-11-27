@@ -222,6 +222,12 @@ read_provider(client:reqwest::Client,request:ProviderHttpRequest,cancel:Cancella
         不向前端发送，不维护另一份最终正文；
         发送失败或取消后退出并释放连接。
 
+read_provider_status_error(response: reqwest::Response, cancel: &CancellationToken, read_deadline: Duration, secrets: &[String]) -> Future<Output = InferenceError>
+    行为：在既有期限和64KiB诊断读取预算内读取非成功响应，取消保留Cancelled；将实际状态、响应头、读取到的正文及截断/断流事实交给format_provider_status_error。
+format_provider_status_error(status: StatusCode, headers: &HeaderMap, body: &[u8], diagnostic: Option<&str>, secrets: &[String]) -> InferenceError
+    行为：保留有界脱敏HTTP状态、上游message/type/code/request_id；HTTP413或精确payload_too_large_error、payload_too_large、request_too_large、request_body_too_large机器code/type归一RequestBodyTooLarge。
+        该类details含http_status以及可取得的request_id/provider_type/provider_code，不保存正文或认证值，不编造实际请求大小与供应商上限。泛化400、context_length_exceeded、空550、502继续ResponseStatus，不按任意文案猜测。
+
 receive_stream(gate:Arc<Mutex<StreamGate>>,cancel:CancellationToken,delivery:&mut StreamDelivery,receiver:mpsc::Receiver<ProviderFragment>) -> Future<Output=Result<(),InferenceError>>
     行为：
         每轮使用biased select!优先检查取消，再等待一个分片，不批量排空。
@@ -240,7 +246,7 @@ push_stream(delivery: &mut StreamDelivery, snapshot: StreamTextSnapshot)
         按当前Clients槽位有界发送agent.message.chunk.sync，顶层content与reasoning均为必填字符串，表示同次接受门裁决之后的累计完整文本。
         不发送delta，不按reasoning布尔值选择某一侧单独追加；任一侧变化时两侧都随快照交付。
         address/turn/generation保持原身份，sequence为同一生成的文本快照序号，不是历史序号，也不是上游SSE数量。
-        发送发生在累积器提交之后且接受门锁外，慢连接不阻塞累积器；超预算/Full/Closed按既有规则关闭受影响连接，不截断累计文本或回退为增量。
+        发送发生在累积器提交之后且接受门锁外，慢连接不阻塞累积器；队列Full/Closed按既有规则关闭受影响连接，不因单帧字节数关闭连接，不截断累计文本或回退为增量。
         生成结束仍经push_full发送原完整消息及终态，chunk不携带半成品tool_calls、usage、stop_reason或持久序号。
 
 finish_inference(context: &mut InferenceContext, result: Result<InferenceResponse, InferenceError>)
@@ -250,7 +256,7 @@ push_full(delivery: &mut StreamDelivery, result: Result<&InferenceResponse, &Inf
     行为：
         生成agent.message.full.sync，携带address、turn、generation及history_sequence=null，不输出消息sequence。
         成功转换为完整内部assistant：reasoning/content、tool_calls、usage、stop_reason及request_id；工具name映射tool_name、arguments JSON值编码成字符串，空可选字段省略。
-        失败转换内部error消息并保留request_id，full.error含code/message；不制造assistant正文或持久序号，不带replay/data。
+        失败转换内部error消息并保留request_id、稳定code及可选details，full.error含code/message；不制造assistant正文或持久序号，不带replay/data。
         只投影通用响应，不另建厂商内部消息或调用协议crate。
 
 push_frame(delivery: &mut StreamDelivery, frame: serde_json::Value)
@@ -263,6 +269,8 @@ build_request(input: DomainRequest, route: ModelRoute) -> Result<ProviderHttpReq
         通用格式转换与厂商特化是两个独立职责，不能在通用层按某一家厂商的限制提前拒绝其他组合可处理的消息；
         不从URL或模型名猜测，不使用通用JSON请求壳修补或未知组合回退；
         输入DomainRequest保持厂商无关，不向消息、结果或历史添加格式状态。
+        具体厂商process完成最终HTTP body序列化后直接进入HTTP发送，不设置本地请求体大小检查或max_request_bytes配置。上游明确拒绝请求体超限时，由状态错误归一化返回RequestBodyTooLarge，Driver按code恢复。
+        不在转换层改写上下文或压缩，Driver根据错误code决定恢复。原隐藏请求128MiB、单条文本4MiB、全文本16MiB大小拦截删除，语义及图片合法性校验保留。
 ```
 
 # types
@@ -475,12 +483,14 @@ InferenceStopReason：停止原因，公开枚举
 InferenceError：执行错误
     kind: InferenceErrorKind
     message: String
+    details: Option<serde_json::Value>--可选机器可读安全详情；RequestBodyTooLarge包含http_status和可取得的request_id/provider_type/provider_code，不推测上游字节上限
+    new(kind, message) -> Self--details初始化None
     impl Display + std::error::Error
 
 InferenceErrorKind：错误类别，公开枚举
     InvalidRequest | AgentMissing | InferenceBusy | InvalidParameters | InvalidMessages | ToolMissing
     InvalidToolDefinition | ModelRouteMissing | InvalidModelRoute | UnsupportedFormat
-    RequestFailed | ResponseStatus | ResponseInvalid | ResponseIncomplete | ResponseTooLarge
+    RequestFailed | RequestBodyTooLarge | ResponseStatus | ResponseInvalid | ResponseIncomplete | ResponseTooLarge
     Timeout | Cancelled | ReplyClosed | TaskPanicked | CleanupFailed
 ```
 

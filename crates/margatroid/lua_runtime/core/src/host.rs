@@ -154,6 +154,12 @@ const NAMESPACE_METHODS: &[(NamespaceKind, &str, &str, bool)] = &[
     (NamespaceKind::Files, "matches", "files_matches", false),
     (NamespaceKind::Data, "encode", "data_encode", false),
     (NamespaceKind::Data, "decode", "data_decode", false),
+    (
+        NamespaceKind::Data,
+        "image_prepare",
+        "data_image_prepare",
+        true,
+    ),
     (NamespaceKind::Text, "search", "text_search", false),
     (NamespaceKind::Process, "start", "process_start", true),
     (NamespaceKind::Http, "request", "http_request", true),

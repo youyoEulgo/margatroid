@@ -21,16 +21,16 @@
 公开：
 ```text
 parse_client_message(text: &str) -> Result<ClientMessage, ProtocolError>
-    行为：反序列化JSON，校验type、请求id、message对象、字段形状和字节预算；拒绝未知type及已删除旧字段，不负责领域受理。
+    行为：反序列化JSON，校验type、请求id、message对象、字段形状；不设置网络信封字节上限；拒绝未知type及已删除旧字段，不负责领域受理。
 
 encode_server_message(message: &ServerMessage) -> Result<String, ProtocolError>
-    行为：按具体variant序列化顶层字段；校验成功/失败互斥、必需结果及消息预算；sync不生成请求id。MCL返回Turn时data.kind=turn且value为非空字符串；不新增消息type。推理chunk的turn必有且可空，None自由调用为null，full保留同一可选关联。
+    行为：按具体variant序列化顶层字段；校验成功/失败互斥、必需结果；不限制序列化后信封字节数；sync不生成请求id。MCL返回Turn时data.kind=turn且value为非空字符串；不新增消息type。推理chunk的turn必有且可空，None自由调用为null，full保留同一可选关联。
 
 valid_request_id(id: &str) -> bool
     行为：检查非空白、无控制字符及512字节上限。
 
 validate_server_value(value: &serde_json::Value) -> Result<(), ProtocolError>
-    行为：检查当前目录48种严格wire type、回执成功/失败互斥、查询载荷、分页游标presence、nullable字段、记录顺序及完整消息序号关联。
+    行为：检查当前目录52种严格wire type、回执成功/失败互斥、查询载荷、分页游标presence、nullable字段、记录顺序及完整消息序号关联。
         诊断details/context按日志报告处理，不按内部AgentMessage递归解释原错误快照。
         agent.ui.res成功必须出现可空ui，失败省略ui并提供error；agent.ui.sync始终出现ui及error，error非空时ui为null。
 
@@ -38,7 +38,7 @@ validate_value / validate_internal_message_fields / require_fields
     行为：检查递归预算、媒体、已删除旧消息字段、真实正sequence及必有字段；不推断领域权限或实例受理。
 
 validate_ui_bundle(value: &AgentUiBundleDto) -> Result<(), ProtocolError>
-    行为：校验sha256内容摘要格式、entry=index.html、files路径唯一且升序、相对路径段、媒体类型及标准base64；预算按实际网络信封UTF-8计算。
+    行为：校验sha256内容摘要格式、entry=index.html、files路径唯一且升序、相对路径段、媒体类型及标准base64；不设置完整网络信封字节上限。
 
 logical_name / validate_path / validate_target / validate_address / validate_image
     行为：检查纯网络值形状、绝对节点路径及文件资源路径和标准媒体编码；Workspace/Agent类型由DTO在World验证，不从地址kind猜测，不依赖领域core。
@@ -274,7 +274,8 @@ AgentMessageDto：厂商无关消息枚举，各variant均有sequence:Option<u64
     Compact { sequence: Option<u64>, request_id: Option<String>, reasoning: Option<String>, content: Option<String>, tool_calls: Vec<ToolCallDto>, usage: Option<TokenUsageDto>, stop_reason: Option<String> }--assistant同结构别名，wire保留compact
     ToolCall { sequence: Option<u64>, tool_call_id: String, tool_name: String, content: String, data: Vec<UserImageDto>, failed: bool }
     Inject { sequence: Option<u64>, messages: Vec<AgentMessageDto> }
-    Error { sequence: Option<u64>, message: String, request_id: Option<String> }
+    Error { sequence: Option<u64>, message: String, request_id: Option<String>, code: Option<String>, details: Option<serde_json::Value> }
+        行为：code为稳定领域错误种类，details保留可选机器诊断；RequestBodyTooLarge携带上游http_status及可选request_id，不伪造实际字节或厂商上限，不把厂商原生请求材料写入消息。旧错误缺省这两字段仍合法。
     行为：
         JSON type分别为system/user/assistant/compact/tool_call/inject/error；缺省sequence不输出，存在时校验正整数形状；Block不据此校验历史存在性/内容，历史接口输出本次真实记录序号
         data数组可省略为空；reasoning和content各保存一份，禁止replay、api_format和images兼容字段

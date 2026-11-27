@@ -1474,3 +1474,51 @@ fn responses_continuation_projects_reasoning_only_per_vendor_over_real_http() {
         }
     }
 }
+
+#[test]
+fn upstream_413_is_a_recoverable_request_body_error() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}/v1", listener.local_addr().unwrap());
+    let server = std::thread::spawn(move || {
+        let (mut socket, _) = listener.accept().unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut headers = Vec::new();
+        let mut byte = [0];
+        while !headers.ends_with(b"\r\n\r\n") {
+            socket.read_exact(&mut byte).unwrap();
+            headers.push(byte[0]);
+        }
+        let headers = String::from_utf8(headers).unwrap();
+        let length = headers
+            .lines()
+            .find_map(|line| {
+                line.to_ascii_lowercase()
+                    .strip_prefix("content-length:")
+                    .map(|value| value.trim().parse::<usize>().unwrap())
+            })
+            .unwrap();
+        let mut body = vec![0; length];
+        socket.read_exact(&mut body).unwrap();
+        let value: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["model"], "upstream-model");
+        let error=json!({"error":{"type":"payload_too_large_error","code":"invalid_request_error","message":"Failed to buffer the request body: length limit exceeded (request_id: example-upstream-id)"}}).to_string();
+        write!(socket,"HTTP/1.1 413 Payload Too Large\r\nContent-Type: application/json\r\nX-Request-Id: example-upstream-id\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",error.len(),error).unwrap();
+    });
+    let mut fixture = Fixture::new(&url, "deepseek", "responses");
+    let (request, reply) = fixture.request("oversized-upstream");
+    let failed = fixture.run(request, reply).unwrap_err();
+    assert_eq!(failed.kind, Kind::RequestBodyTooLarge);
+    assert!(failed.message.contains("413") && failed.message.contains("length limit exceeded"));
+    assert_eq!(failed.details.as_ref().unwrap()["http_status"], 413);
+    assert!(
+        failed
+            .details
+            .as_ref()
+            .unwrap()
+            .get("max_request_bytes")
+            .is_none()
+    );
+    server.join().unwrap();
+}

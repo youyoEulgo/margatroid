@@ -76,6 +76,6 @@ model.config 读取或同步原始 models.toml，更新完整校验后原子替�
 
 agent.ui 返回创建方法指定目录的完整资源集合，包含 SHA-256 revision、index.html 入口和排序唯一的 files；文件内容统一 base64。目录缺失可为 null；读取失败按对应 error 分支表示。nullable ui/error 必须按各消息规则出现。
 
-网络信封最多32MiB UTF-8，错误 message 最多512字节。媒体保留 PNG/JPEG/GIF/WebP、每消息最多8张、每张解码5MiB、合计20MiB的现有校验。ServerMessage 的编码与解码共同核对成功/失败互斥、必需载荷、nullable 字段、记录顺序及序号关联；不根据无效目标修改领域状态。
+网络请求、响应和同步信封不设置整体字节上限；WebSocket帧和消息入口也不叠加框架默认大小上限。错误 message 最多512字节。媒体保留 PNG/JPEG/GIF/WebP、每消息最多8张、每张解码5MiB、合计20MiB的现有校验。ServerMessage 的编码与解码共同核对成功/失败互斥、必需载荷、nullable 字段、记录顺序及序号关联；不根据无效目标修改领域状态。
 
 域内测试覆盖18种请求、28种出站、旧接口拒绝、互斥启动变体、登记类别、节点路径、必需 nullable 字段、累计文本、分页及显式回合关联。

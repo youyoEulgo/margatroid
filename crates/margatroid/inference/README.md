@@ -139,7 +139,7 @@ full不替代oneshot或真实退出证明。流/协议错误及时交付后仍�
 
 ## 预算
 
-配置、请求体、SSE缓冲、响应、工具参数和发送队列均有上限。单消息图片最多8张、每张解码5MiB、合计20MiB；请求和响应总量各不超过128MiB，单SSE事件不超过4MiB。整体推理默认180秒，单连接发送等待最多100ms。预算错误不自动重试、续写或压缩。
+推理不做本地请求体字节检查，也不接受max_request_bytes路由配置。HTTP413以及明确的payload_too_large_error、payload_too_large、request_too_large、request_body_too_large机器code/type归一为RequestBodyTooLarge，保留原HTTP诊断文本及可取得的关联。details包含http_status、可选request_id/provider_type/provider_code，不编造实际大小或供应商上限；Driver根据稳定code执行恢复。普通invalid_request_error、token上下文超限、550空正文、502和连接重置保留其原分类，不能猜作请求体超限。隐藏的128MiB请求、4MiB单条文本和16MiB全文本拦截已删除。配置、SSE缓冲、响应及输出工具参数的独立预算保留：单消息图片最多8张、每张解码5MiB、合计20MiB，响应总量128MiB，单SSE事件4MiB。整体推理默认180秒。
 
 推理通过普通异步闭包进行短启动交接，监督任务由共享InferenceHandle持有；未交接的Pending句柄仍算活动，wait_finished等待真实join，支持多个等待者和等待者取消。HTTP客户端不缓存Tokio执行器Handle、不使用临时服务握手；前端出口使用client_core::ClientSender和ClientFrame，不依赖mecs服务器类型。
 
@@ -155,7 +155,7 @@ full不替代oneshot或真实退出证明。流/协议错误及时交付后仍�
 
 新wire删除delta，使用顶层必填content和reasoning字符串，空值为""。这是不兼容改版，不接受旧增量字段作为别名。sequence只在正文或思考实际变化时递增，中途加入可从第一条收到的累计快照直接显示当前文本，不承诺无后续变化时自动补发旧快照或断线重放。
 
-累计快照包含全部已接受文本，只改变前端出口，不改变厂商解码、消息存储和后端唯一累积器。每次克隆/编码的成本随累计文本增长，原有32MiB信封预算和慢连接规则保持，超出时不静默截断或改回增量。取消门关闭后不再接受新片段，full仍从同一冻结累积器生成。
+累计快照包含全部已接受文本，只改变前端出口，不改变厂商解码、消息存储和后端唯一累积器。每次克隆/编码的成本随累计文本增长，不再设置32MiB网络帧上限，慢连接的有界队列及背压规则保持；不因单帧字节数取消客户端，也不静默截断或改回增量。取消门关闭后不再接受新片段，full仍从同一冻结累积器生成。
 
 验证要求：思考与正文交错时每次含两侧累计值；拆分UTF-8不产生损坏字符；工具参数/usage不误发文本快照；丢失某个chunk后的更高sequence可直接恢复文本；重复/迟到chunk不回滚，full后chunk不能重开生成；正常、取消、错误及零文本结束沿原full；预算失败不影响后端最终结果。
 
@@ -171,3 +171,6 @@ model.config.req/res/sync及model.config.update/update.result已实现，读取/
 InferenceHandle持有本次生成的source_alive租约，来源有效性不再从Agent.source_lease取得。Agent实例只有Starting/Running/Closing；内部来源实例不作为网络目标字段。实体地址为绝对节点路径，文件资源type:scope/name:tag定位规则不变。
 
 普通InferenceHandle.cancel只冻结接受门并请求取消，保留共享来源租约，使同generation的终态full能够交付。retire_source单独用于Agent真正关闭或来源替换，淘汰旧实例的已入队帧；调用方随后仍需cancel并等待真实清理。两者不可混同，回合中止不能提前退休终态来源。共享lease取消回归验证冻结文本、一次full、真实join及迟到文本拒绝。
+
+
+上游明确请求体超限时，error full与MCL推理结果都携带code=RequestBodyTooLarge及安全details；无响应体的413仍能归类。HTTP非成功错误仍只读取有界诊断体并剔除当前认证内容，不把原始请求或凭据加入详情。

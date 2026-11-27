@@ -217,6 +217,11 @@ Bundled skill/MCP registrars save successful startup registration commands throu
 
 `tool:margatroid/web-search:dev` 的模型参数为 `queries` 数组（1–10条，每条1–128个Unicode字符），`tool:margatroid/web-fetch:dev` 只接受 `url`。使用共享Lua HTTP能力访问固定DeepSeek Search/Fetch端点，逐次从可信调用Agent的CONFIG读取 `web.deepseek.api_key`，不使用父Agent、环境变量或模型路由密钥。
 
-内置coder/reviewer配置模板加入空的 `[web.deepseek] api_key = ""` 及 `web_search`、`web_fetch` 导入。已有Agent持久配置不会被资源模板覆盖，须由用户在该Agent配置中填写和导入；不自动向子代理复制父配置。API Key不进入工具Schema、输出、持久任务缓存或失败诊断。
+内置assistant配置模板加入空的 `[web.deepseek] api_key = ""` 及 `web_search`、`web_fetch` 导入。已有Agent持久配置不会被资源模板覆盖，须由用户在该Agent配置中填写和导入；不自动向子代理复制父配置。API Key不进入工具Schema、输出、持久任务缓存或失败诊断。
 
 脚本不重试付费请求、不自动跳转，也不更改当前沙箱。默认禁止联网的workspace-write/read-only策略仍然禁止这些请求。此次只进行离线模拟验证，真实API测试等用户配置凭据及允许联网后再进行。使用细节见资源各自README。
+
+
+## 读图预览
+
+read-image在返回模型图片前调用共享`data:image_prepare`，保留最长边1280默认比例及300KiB目标，可通过max_dimension、quality、target_bytes增加细节。opaque输出JPEG，透明输出lossless WebP，动画取首帧，原文件不写。工具结果注明实际预览元数据并提醒模型分析图片；此读取不是向用户展示或交付图片。原文件不再受旧5MiB输入截断规则限制，先进入压缩流程再返回预览，已有历史原图不自动重写。

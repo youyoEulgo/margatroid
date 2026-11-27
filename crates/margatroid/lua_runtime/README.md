@@ -101,3 +101,8 @@ URL 仅接受明确 http/https，拒绝URL内嵌账号密码和fragment。TLS必
 通用HTTP层不自动读取任何Agent配置或API Key，不把凭据放进进程参数、默认日志、历史或诊断。上层search/fetch工具负责从真实调用Agent配置读取凭据、构造Authorization，并筛选可返回的业务内容。不能将原始错误响应、认证头或配置直接拼入工具错误；脚本显式输出敏感值仍是工具层责任。通用能力不包含DeepSeek分支；专用search/fetch资源和web.deepseek.api_key配置见Tool说明，不修改前端或模型推理适配器。
 
 回归测试覆盖：两种执行环境同一请求行为；configure拒绝及只读命名空间；JSON与二进制往返；重复头；非2xx/3xx正常返回；非法URL拒绝；压缩保持原字节；重定向不跟随、凭据不跨地址发送；连接及读体超时；未知长度和谎报长度响应限流；并发Busy；取消、wait_any淘汰及退出无在途请求；工具worker内直接HTTP而非daemon转发。测试使用本地隔离HTTP，不访问用户真实服务或修改用户配置。TLS使用rustls默认验证与系统根证书，未添加关闭验证选项；未进行外部TLS服务或自签名证书握手测试。
+
+
+## 图片预览转换
+
+`margatroid.data:image_prepare(bytes, {max_dimension?, target_bytes?, quality?})`已提供共享纯Rust图片处理，默认等比最长边1280、不放大小图，目标300KiB，opaque JPEG质量80/70/60阶梯、透明图片lossless WebP。仍超目标就进一步缩小，最小尺寸仍无法满足则明确报错。参数可显式调高，不新增隐藏预览quota。返回原始/实际尺寸、源字节数、实际预览data和media_type；不写源文件或临时文件，不依赖外部程序。此能力通过data::install同时服务Driver和工具，configure阶段不开放。read-image只把新生成预览加入工具结果，不改写已有历史图片。测试覆盖真实四格式、损坏图片、保持比例/alpha、字节目标、选项校验、只读及阶段约束。

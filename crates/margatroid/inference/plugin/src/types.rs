@@ -19,10 +19,9 @@ use tokio::sync::oneshot;
 
 type Result<T> = std::result::Result<T, InferenceError>;
 
-pub(crate) const MAX_REQUEST_BYTES: usize = 128 * 1024 * 1024;
+pub(crate) const MAX_RESPONSE_BYTES: usize = 128 * 1024 * 1024;
 pub(crate) const MAX_CONFIG_BYTES: usize = 1024 * 1024;
 pub(crate) const MAX_MESSAGE_BYTES: usize = 4 * 1024 * 1024;
-pub(crate) const MAX_MESSAGES_BYTES: usize = 16 * 1024 * 1024;
 pub(crate) const FRAGMENT_CAPACITY: usize = 32;
 
 pub(crate) struct HttpRuntime {
@@ -906,7 +905,9 @@ impl Anthropic<MessagesRequest> {
                         .as_ref()
                         .is_some_and(|text| !text.is_empty())
                 {
-                    return Err(invalid("Messages provider cannot encode reasoning-only assistant history without fabricating signed thinking"));
+                    return Err(invalid(
+                        "Messages provider cannot encode reasoning-only assistant history without fabricating signed thinking",
+                    ));
                 }
             }
         }
@@ -954,7 +955,9 @@ impl DeepSeek<MessagesRequest> {
                         .as_ref()
                         .is_some_and(|text| !text.is_empty())
                 {
-                    return Err(invalid("Messages provider cannot encode reasoning-only assistant history without fabricating signed thinking"));
+                    return Err(invalid(
+                        "Messages provider cannot encode reasoning-only assistant history without fabricating signed thinking",
+                    ));
                 }
             }
         }
@@ -1046,12 +1049,7 @@ impl Transport {
                 "provider request could not be encoded",
             )
         })?;
-        if body.len() > MAX_REQUEST_BYTES {
-            return Err(InferenceError::new(
-                InferenceErrorKind::InvalidMessages,
-                "encoded provider request exceeds 32 MiB",
-            ));
-        }
+
         Ok(ProviderHttpRequest::new(
             Method::POST,
             url,
@@ -1105,21 +1103,8 @@ pub(crate) fn normalize(request: &mut DomainRequest) -> Result<()> {
     }
     let mut pending = HashSet::new();
     let mut seen = HashSet::new();
-    let mut text_bytes = 0usize;
-    let mut encoded_bytes = 0usize;
     for message in &request.messages {
-        let (text, encoded) = validated_message_sizes(message)?;
-        text_bytes = text_bytes.saturating_add(text);
-        encoded_bytes = encoded_bytes.saturating_add(encoded);
-        if text > MAX_MESSAGE_BYTES
-            || text_bytes > MAX_MESSAGES_BYTES
-            || encoded_bytes > MAX_REQUEST_BYTES
-        {
-            return Err(InferenceError::new(
-                InferenceErrorKind::InvalidMessages,
-                "message bytes exceed budget",
-            ));
-        }
+        validated_message_sizes(message)?;
         match message {
             InferenceMessage::Assistant {
                 content,
@@ -1258,7 +1243,8 @@ pub(crate) fn build_request(
             reasoning_effort: route.reasoning_effort.as_deref(),
         },
     )?;
-    adapter.process_request(adapter.encode(input)?)
+    let request = adapter.process_request(adapter.encode(input)?)?;
+    Ok(request)
 }
 
 impl ResponseAccumulator {
@@ -1280,7 +1266,7 @@ impl ResponseAccumulator {
         self.bytes = self
             .bytes
             .checked_add(size)
-            .filter(|&bytes| bytes <= MAX_REQUEST_BYTES)
+            .filter(|&bytes| bytes <= MAX_RESPONSE_BYTES)
             .ok_or_else(|| {
                 InferenceError::new(
                     InferenceErrorKind::ResponseTooLarge,
@@ -1465,7 +1451,7 @@ impl FormatDecoder {
 
     pub fn push(&mut self, chunk: &[u8]) -> Result<Vec<ProviderFragment>> {
         self.bytes = self.bytes.saturating_add(chunk.len());
-        if self.bytes > MAX_REQUEST_BYTES {
+        if self.bytes > MAX_RESPONSE_BYTES {
             return Err(InferenceError::new(
                 InferenceErrorKind::ResponseTooLarge,
                 "provider response exceeds budget",

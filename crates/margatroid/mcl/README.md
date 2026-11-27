@@ -22,7 +22,7 @@ block_snapshot和block_restore成功返回Unit；block_snapshots返回BlockSnaps
 ## 指令
 
 ```text
-IMPORT MESSAGE prompt:margatroid/coder-soul:dev AS soul
+IMPORT MESSAGE prompt:margatroid/assistant-soul:dev AS soul
 IMPORT TOOL tool:margatroid/bash:dev AS bash
 IMPORT SANDBOX sandbox:margatroid/workspace-write:dev AS workspace_write
 CREATE TEMP BLOCK msg (instructions, compact_prompt, compact_context)

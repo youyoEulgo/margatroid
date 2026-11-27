@@ -31,7 +31,7 @@ HTTP/SSE worker 只输出到容量 32 的 ProviderFragment 通道，不向前端
 
 内容结果与清理完成分别处理：已确认的provider或流错误可先回复，但监督始终等待HTTP worker真实join，不以冻结代替清理。清理超过预算仍等待真实结束并报告 CleanupFailed；Timeout、ReplyClosed、协议错误等保留各自分类。HTTP worker 退出后不能用独立正文补写结果。不改网络中止事件路径，不写历史，不执行工具或自动重试。
 
-预算包括配置 1MiB、请求/响应各 128MiB、SSE 单事件 4MiB、正文与工具参数及图片上限。单消息图片最多 8 张，每张解码 5MiB，合计 20MiB。整体执行默认 180 秒，工具定义准备计入期限。连接超时为 30 秒；等待响应头受整体剩余期限约束，流开始后每次读取的空闲上限为 60 秒，不把该空闲上限用于首响应等待。
+不做本地请求body大小检查，不接受max_request_bytes配置。HTTP413或精确的请求体超限code/type由适配边界归一为RequestBodyTooLarge，详情保留http_status、可选request_id/provider_type/provider_code，不伪造actual_bytes或max_request_bytes；原诊断继续保留并脱敏。550空正文、泛化400、token窗口超限不归入该类。通用层不再设置4MiB单文本、16MiB全文本或128MiB请求硬限制。其他预算包括配置1MiB、响应128MiB、SSE单事件4MiB、输出工具参数及图片上限。单消息图片最多 8 张，每张解码 5MiB，合计 20MiB。整体执行默认 180 秒，工具定义准备计入期限。连接超时为 30 秒；等待响应头受整体剩余期限约束，流开始后每次读取的空闲上限为 60 秒，不把该空闲上限用于首响应等待。
 
 装配层集成验证通过本地 HTTP 检查七种组合、鉴权、端点、图片、已登记工具定义及 Entity generation，并通过真实DTO/WebSocket注册、Agent地址投影及推理流核对目标关联。内部并发测试物理上位于 tests/internal：使用真实 HTTP 填满有界通道，验证未接受 backlog 不进入冻结累积器，并通过测试专用清理门验证同步冻结先于 worker join、oneshot 等待真实 join。另覆盖严格终态、UTF-8 跨字节、签名及加密材料不进入内部消息、跨API保留正文与工具、完整工具调用及 SSE 预算。
 

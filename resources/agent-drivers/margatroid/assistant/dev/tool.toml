@@ -1,0 +1,2 @@
+schema_version = 1
+description = "General-purpose Assistant Driver with persistent ordinary and temporary child Agents."

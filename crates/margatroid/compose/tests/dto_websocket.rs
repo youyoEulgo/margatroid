@@ -254,10 +254,15 @@ impl Harness {
 
     fn connect(&mut self) -> Socket {
         self.runtime
-            .block_on(tokio_tungstenite::connect_async(format!(
-                "ws://{}/ws",
-                self.server
-            )))
+            .block_on(tokio_tungstenite::connect_async_with_config(
+                format!("ws://{}/ws", self.server),
+                Some(
+                    tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default()
+                        .max_message_size(None)
+                        .max_frame_size(None),
+                ),
+                false,
+            ))
             .unwrap()
             .0
     }
@@ -318,7 +323,15 @@ impl Harness {
             .unwrap();
     }
     fn next(&mut self, socket: &mut Socket, matches: impl Fn(&Value) -> bool) -> Value {
-        let deadline = Instant::now() + Duration::from_secs(5);
+        self.next_with_timeout(socket, Duration::from_secs(5), matches)
+    }
+    fn next_with_timeout(
+        &mut self,
+        socket: &mut Socket,
+        timeout: Duration,
+        matches: impl Fn(&Value) -> bool,
+    ) -> Value {
+        let deadline = Instant::now() + timeout;
         loop {
             self.app.tick();
             if let Ok(Some(Ok(Message::Text(text)))) = self.runtime.block_on(async {
@@ -723,7 +736,7 @@ fn abort_control_runs_next_frame_freezes_inference_and_only_cancels_unreturned_t
 }
 
 #[test]
-fn oversized_history_query_fails_but_unrelated_state_queries_stay_small() {
+fn history_larger_than_the_former_wire_limit_returns_complete_records() {
     let mut harness = Harness::new();
     let storage = harness
         .app
@@ -737,8 +750,8 @@ fn oversized_history_query_fails_but_unrelated_state_queries_stay_small() {
                 source: None,
                 turn: None,
                 kind: "message".into(),
-                content: "x".repeat(margatroid_protocol::MAX_MESSAGE_BYTES),
-                payload: json!({"type": "user", "content": "x".repeat(margatroid_protocol::MAX_MESSAGE_BYTES)}),
+                content: "x".repeat(33 * 1024 * 1024),
+                payload: json!({"type": "user", "content": "x".repeat(33 * 1024 * 1024)}),
                 created_at_ms: Some(123),
             }],
         },
@@ -752,11 +765,18 @@ fn oversized_history_query_fails_but_unrelated_state_queries_stay_small() {
         "large-history",
         harness.target(),
     );
-    let reply = harness.next(&mut socket, |value| value["id"] == "large-history");
+    let reply = harness.next_with_timeout(&mut socket, Duration::from_secs(30), |value| {
+        value["id"] == "large-history"
+    });
     assert_eq!(reply["type"], "agent.history.res");
-    assert_eq!(reply["success"], false);
-    assert_eq!(reply["error"]["code"], "ResponseTooLarge");
-    assert!(reply.get("records").is_none());
+    assert_eq!(reply["success"], true);
+    assert!(reply.get("error").is_none());
+    let records = reply["records"].as_array().unwrap();
+    assert_eq!(records.len(), 1);
+    assert_eq!(
+        records[0]["payload"]["content"].as_str().unwrap().len(),
+        33 * 1024 * 1024
+    );
     harness.request(&mut socket, "agent.req", "small-agents", json!({}));
     let reply = harness.next(&mut socket, |value| value["id"] == "small-agents");
     assert_eq!(reply["type"], "agent.res");
@@ -766,6 +786,75 @@ fn oversized_history_query_fails_but_unrelated_state_queries_stay_small() {
     let reply = harness.next(&mut socket, |value| value["id"] == "small-workspaces");
     assert_eq!(reply["success"], true);
     assert!(reply.to_string().len() < 16384);
+}
+
+#[test]
+fn full_session_block_larger_than_32_mib_can_be_injected_and_queried_over_mcl() {
+    let mut harness = Harness::new();
+    let mut socket = harness.connect();
+    harness.register(&mut socket, "webui", "large-session-editor");
+    harness.command(
+        &mut socket,
+        "create-large-session",
+        "CREATE BLOCK session (conversation)",
+        json!([]),
+    );
+    let created = harness.next(&mut socket, |value| value["id"] == "create-large-session");
+    assert_eq!(created["success"], true);
+
+    let content = "session contents ".repeat((33usize * 1024 * 1024).div_ceil(17));
+    assert!(content.len() > 32 * 1024 * 1024);
+    harness.command(
+        &mut socket,
+        "inject-large-session",
+        "INJECT ? TO session.conversation",
+        json!([[{"type":"user","content":content}]]),
+    );
+    let injected = harness.next_with_timeout(&mut socket, Duration::from_secs(30), |value| {
+        value["id"] == "inject-large-session"
+    });
+    assert_eq!(injected["success"], true);
+
+    harness.command(
+        &mut socket,
+        "get-large-session",
+        "GET session.conversation",
+        json!([]),
+    );
+    let result = harness.next_with_timeout(&mut socket, Duration::from_secs(30), |value| {
+        value["id"] == "get-large-session"
+    });
+    assert_eq!(result["success"], true);
+    assert_eq!(result["data"]["kind"], "messages");
+    let messages = result["data"]["value"].as_array().unwrap();
+    assert_eq!(messages.len(), 1);
+    let restored = messages[0]["content"].as_str().unwrap();
+    assert_eq!(restored.len(), content.len());
+    assert!(restored == content);
+
+    // Verify persistence independently of the network result, using the actual
+    // AgentStorage-backed Block rather than a mocked projection.
+    let storage = harness
+        .app
+        .world()
+        .get_component::<AgentStorage>(harness.agent)
+        .unwrap();
+    let storage_core::StorageValue::Messages(stored) = execute_storage(
+        storage,
+        StorageOperation::ReadMessages {
+            selectors: vec![storage_core::MessageSelector {
+                block: "session".into(),
+                field: "conversation".into(),
+                instance: None,
+                selection: storage_core::MessageSelection::All,
+            }],
+        },
+    )
+    .unwrap() else {
+        panic!("expected stored session messages");
+    };
+    assert_eq!(stored.len(), 1);
+    assert!(stored[0]["content"].as_str().unwrap() == content);
 }
 
 #[test]

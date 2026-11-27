@@ -9,7 +9,7 @@
 api_key = ""
 ```
 
-coder/reviewer资源配置模板已包含空字段及web_search/web_fetch导入。已有Agent持久配置不会被模板覆盖：在该Agent的配置中填写同名字段，并在其初始化指令中导入 `tool:margatroid/web-search:dev AS web_search`。子代理有自己的配置，不能自动继承父Agent密钥。
+assistant资源配置模板已包含空字段及web_search/web_fetch导入。已有Agent持久配置不会被模板覆盖：在该Agent的配置中填写同名字段，并在其初始化指令中导入 `tool:margatroid/web-search:dev AS web_search`。子代理有自己的配置，不能自动继承父Agent密钥。
 
 固定调用 `POST https://api.deepseek.com/v1/tools/search`，Bearer鉴权，每个唯一query对应一次HTTP请求，固定 `count=10`、`need_content=false`。API Key和供应商参数不进入模型Schema；不额外读取用户对话推导ori_question，不自动设置localization。与DSH参考的模型Schema及轮转合并一致，当前Lua按顺序发送，避免超出共享HTTP的8并发预算；整个工具120秒，每次请求最多30秒。某条失败则整次调用失败，已完成请求可能已计费，不自动重试。
 

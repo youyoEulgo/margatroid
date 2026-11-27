@@ -146,7 +146,7 @@ async fn every_group_dispatches_plain_callbacks_and_rejects_wrong_capabilities()
                 "matches",
             ],
         ),
-        ("data", &["encode", "decode"]),
+        ("data", &["encode", "decode", "image_prepare"]),
         ("text", &["search"]),
         ("process", &["start"]),
         ("http", &["request"]),
@@ -173,7 +173,7 @@ async fn every_group_dispatches_plain_callbacks_and_rejects_wrong_capabilities()
             .iter()
             .map(|(_, methods)| methods.len())
             .sum::<usize>(),
-        22
+        23
     );
     for kind in [HostKind::Driver, HostKind::Tool] {
         let (lua, object) = host(kind);

@@ -1395,6 +1395,10 @@ pub enum AgentMessageDto {
         sequence: Option<u64>,
         message: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        code: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        details: Option<Value>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         request_id: Option<String>,
     },
 }
