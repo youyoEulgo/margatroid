@@ -8,7 +8,7 @@ const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const output = join(root, "dist");
 const target = resolve(
   root,
-  "../resources/agent-drivers/margatroid/coder/dev/ui/index.html",
+  "../resources/agent-drivers/margatroid/assistant/dev/ui/index.html",
 );
 const dependencies = join(root, "node_modules");
 

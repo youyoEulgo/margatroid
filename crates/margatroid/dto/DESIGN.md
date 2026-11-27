@@ -150,7 +150,7 @@ run_record_watch(context: RecordMonitorContext) -> Future<Output = Result<(), Dt
         取消时停止新读取，等待在途blocking读取结束后完成monitor；来源替换使用独立active标记，旧批次不能投递到新实例。
 read_batch(storage: &AgentStorage, position: RecordWatermarks, high: RecordWatermarks) -> Result<RecordBatch, StorageError>
 encode_batch(address: &str, batch: &RecordBatch) -> Result<Vec<Arc<ClientFrame>>, DtoAsyncError>
-    行为：每类最多50条，当前高水位限定排他范围；有request_id的assistant/error由推理通道完成，记录监控跳过其网络投影但照常推进游标；compact历史虽保留request_id但不属于assistant生成去重分支，仍交付generation=null的持久记录；非生成消息full保留真实持久序号、generation=null，MCL和日志过滤内部VM信息，完整编码/预算失败明确重试诊断而不重复旧记录。
+    行为：每类最多50条，当前高水位限定排他范围；有request_id的assistant/error由推理通道完成，记录监控跳过其网络投影但照常推进游标；compact历史虽保留request_id但不属于assistant生成去重分支，仍交付generation=null、tag=null的持久记录；非生成消息full保留真实持久序号、generation=null、tag=null，执行tag仅来自Inference本次请求，不从历史消息推导，MCL和日志过滤内部VM信息，完整编码/预算失败明确重试诊断而不重复旧记录。
 install_model_config_monitor(world: &mut World)
     行为：取得实际ModelConfigFile；无来源时不创建伪监控。使用同一Clients及固定webui目标建立model.config.sync的state_source，来源view与SyncContext同归ModelConfigSource；创建持AxumWorkGuard的watch_model_config。
 watch_model_config(source: ModelConfigView) -> Future<Output=Result<(),String>>

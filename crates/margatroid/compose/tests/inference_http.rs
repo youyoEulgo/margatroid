@@ -262,6 +262,7 @@ impl Fixture {
                 id: id.into(),
                 agent: self.agent,
                 turn: Some("turn".into()),
+                tag: None,
                 messages: vec![InferenceMessage::User {
                     content: "hello".into(),
                     images: vec![],
@@ -1521,4 +1522,47 @@ fn upstream_413_is_a_recoverable_request_body_error() {
             .is_none()
     );
     server.join().unwrap();
+}
+
+#[test]
+fn inference_tag_reaches_chunk_and_full_but_never_the_provider_body() {
+    for tag in [None, Some("compact".to_owned())] {
+        let server = HttpServer::new(trace("responses"));
+        let mut fixture = Fixture::new(&server.url, "deepseek", "responses");
+        let (mut request, reply) = fixture.request("tagged-generation");
+        request.tag = tag.clone();
+        fixture.run(request, reply).unwrap();
+        fixture.idle();
+        let (_, _, body) = server
+            .received
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap();
+        assert!(body.get("tag").is_none());
+        let mut saw_chunk = false;
+        let mut saw_full = false;
+        while let Ok(frame) = fixture.frames.try_recv() {
+            let client_core::ClientFrame::Text(text) = frame else {
+                continue;
+            };
+            let frame: Value = serde_json::from_str(&text).unwrap();
+            if !matches!(
+                frame["type"].as_str(),
+                Some("agent.message.chunk.sync" | "agent.message.full.sync")
+            ) {
+                continue;
+            }
+            assert_eq!(frame["generation"], "tagged-generation");
+            assert!(frame.get("tag").is_some());
+            assert_eq!(frame["tag"], json!(tag));
+            saw_chunk |= frame["type"] == "agent.message.chunk.sync";
+            saw_full |= frame["type"] == "agent.message.full.sync";
+            if let Some(message) = frame.get("message") {
+                assert!(
+                    message.get("tag").is_none(),
+                    "execution tag must not enter domain message"
+                );
+            }
+        }
+        assert!(saw_chunk && saw_full);
+    }
 }

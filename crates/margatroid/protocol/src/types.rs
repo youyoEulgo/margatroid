@@ -277,6 +277,7 @@ pub enum ServerMessage {
         address: AddressDto,
 
         turn: Option<String>,
+        tag: Option<String>,
         generation: String,
         sequence: u64,
         content: String,
@@ -286,6 +287,7 @@ pub enum ServerMessage {
         address: AddressDto,
 
         turn: Option<String>,
+        tag: Option<String>,
         generation: Option<String>,
         history_sequence: Option<u64>,
         message: AgentMessageDto,
@@ -528,6 +530,7 @@ pub(crate) enum ServerWire {
         address: AddressDto,
 
         turn: Option<String>,
+        tag: Option<String>,
         generation: String,
         sequence: u64,
         content: String,
@@ -538,6 +541,7 @@ pub(crate) enum ServerWire {
         address: AddressDto,
 
         turn: Option<String>,
+        tag: Option<String>,
         generation: Option<String>,
         history_sequence: Option<u64>,
         message: AgentMessageDto,
@@ -756,6 +760,7 @@ impl From<ServerMessage> for ServerWire {
                 address,
 
                 turn,
+                tag,
                 generation,
                 sequence,
                 content,
@@ -764,6 +769,7 @@ impl From<ServerMessage> for ServerWire {
                 address,
 
                 turn,
+                tag,
                 generation,
                 sequence,
                 content,
@@ -773,6 +779,7 @@ impl From<ServerMessage> for ServerWire {
                 address,
 
                 turn,
+                tag,
                 generation,
                 history_sequence,
                 message,
@@ -781,6 +788,7 @@ impl From<ServerMessage> for ServerWire {
                 address,
 
                 turn,
+                tag,
                 generation,
                 history_sequence,
                 message,
@@ -1001,6 +1009,7 @@ impl From<ServerWire> for ServerMessage {
                 address,
 
                 turn,
+                tag,
                 generation,
                 sequence,
                 content,
@@ -1009,6 +1018,7 @@ impl From<ServerWire> for ServerMessage {
                 address,
 
                 turn,
+                tag,
                 generation,
                 sequence,
                 content,
@@ -1018,6 +1028,7 @@ impl From<ServerWire> for ServerMessage {
                 address,
 
                 turn,
+                tag,
                 generation,
                 history_sequence,
                 message,
@@ -1026,6 +1037,7 @@ impl From<ServerWire> for ServerMessage {
                 address,
 
                 turn,
+                tag,
                 generation,
                 history_sequence,
                 message,

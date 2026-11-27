@@ -154,7 +154,7 @@ fn encode_batch(
         {
             continue;
         }
-        frames.push(json!({"type":"agent.message.full.sync","address":address,"turn":row.record.turn,"generation":null,"history_sequence":row.sequence,"message":row.record.payload,"error":null}));
+        frames.push(json!({"type":"agent.message.full.sync","address":address,"turn":row.record.turn,"generation":null,"tag":null,"history_sequence":row.sequence,"message":row.record.payload,"error":null}));
     }
     if !batch.mcl.is_empty() {
         frames.push(json!({"type":"agent.mcl.sync","address":address,"records":batch.mcl.iter().cloned().map(handler::mcl_record).collect::<Vec<_>>()}));

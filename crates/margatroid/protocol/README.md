@@ -66,7 +66,7 @@ Agent 运行状态为 starting/running/closing，与登记类别独立。Agent �
 
 Task 查询与同步提供完整活跃集合和各自保留输出窗口，包含已 return 尚未清理的后台任务。returned 不表示任务结束，真实清理后移除，不提供 completed 缓存，也不修改脚本读取游标。
 
-chunk 提供同一 generation 截至 sequence 的完整累计 content/reasoning，两者必有且为字符串、至少一侧非空。客户端替换文本，忽略同 generation 迟到或重复序号。turn 必有且可空，自由调用为 null。full 一次性交付生成终态，history_sequence=null，不证明落库；非生成持久消息的 full 使用真实 history_sequence 并与 message.sequence 一致。保存已生成 assistant/error 不产生第二条终态 full。
+chunk 提供同一 generation 截至 sequence 的完整累计 content/reasoning，两者必有且为字符串、至少一侧非空。客户端替换文本，忽略同 generation 迟到或重复序号。turn 必有且可空，自由调用为 null。chunk/full 顶层 `tag` 也必填可空，普通推理无标签时显式 null；标签如 `compact` 只表示执行用途，不进入 AgentMessage 或历史。非空标签最多512字节，不允许全空白或控制字符；同 generation 的 chunk、成功或失败 full 保持相同标签。full 的 generation 为 null 时，tag 必须为 null。full 一次性交付生成终态，history_sequence=null，不证明落库；非生成持久消息的 full 使用真实 history_sequence 并与 message.sequence 一致。保存已生成 assistant/error 不产生第二条终态 full。
 
 MCL 成功的非 Unit 返回 data.kind/value：turn、messages、config、import、inference、block_snapshots。Unit 省略 data；MCL Error 映射失败响应。推理领域错误可作为成功交付的 inference 值，其 message 为 error、stop_reason=error，不代表模型成功。显式 turn 必须匹配当前 running Agent，自由调用不继承当前回合；中止只影响明确关联的执行。
 

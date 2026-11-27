@@ -735,8 +735,19 @@ pub(crate) fn validate_server_value(value: &Value) -> Result<(), ProtocolError> 
             require_fields(task, &["error"])?;
         }
     }
+    if matches!(kind, "agent.message.chunk.sync" | "agent.message.full.sync") {
+        require_fields(value, &["tag"])?;
+        if !value["tag"].is_null() && !value["tag"].as_str().is_some_and(valid_request_id) {
+            return Err(invalid("invalid generation tag"));
+        }
+    }
     if kind == "agent.message.full.sync" {
         require_fields(value, &["turn", "generation", "history_sequence", "error"])?;
+        if value["generation"].is_null() && !value["tag"].is_null() {
+            return Err(invalid(
+                "nongenerated full message cannot carry a generation tag",
+            ));
+        }
     }
     if kind == "model.config.sync" {
         require_fields(value, &["content", "error"])?;

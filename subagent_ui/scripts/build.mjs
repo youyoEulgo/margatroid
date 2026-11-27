@@ -9,11 +9,11 @@ const output = join(root, "dist");
 const targets = [
   resolve(
     root,
-    "../resources/agent-drivers/margatroid/coder/dev/subagent-ui/index.html",
+    "../resources/agent-drivers/margatroid/assistant/dev/subagent-ui/index.html",
   ),
   resolve(
     root,
-    "../resources/agent-drivers/margatroid/reviewer/dev/subagent-ui/index.html",
+    "../resources/agent-drivers/margatroid/assistant/dev/subagent-ui/index.html",
   ),
 ];
 

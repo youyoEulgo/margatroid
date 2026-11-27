@@ -196,8 +196,13 @@ execute_block_effect(context: &CommandContext, name: &str, parameters: Vec<Effec
 explicit_turn(context: &CommandContext, parameter: Option<EffectParameter>) -> Result<Option<String>, MclError>
     行为：省略返回None；明确参数只接受Manual指定的非空字符串，读取对应原始JSON值，不从Agent状态或执行上下文补齐。parse_instruction先验证第二参数类型、长度与控制字符。
 
-execute_inference(context: &CommandContext, messages: Vec<Value>, turn: Option<String>) -> Future<Output = Result<MclValue, MclError>>
+explicit_inference_turn(context: &CommandContext, name: &str, arguments: &[EffectParameter]) -> Result<Option<String>, MclError>
+    行为：仅inference恰好三参数且第二Manual原值为null时返回None；其余调用explicit_turn，审计与实际执行共用相同显式关联规则。
+
+execute_inference(context: &CommandContext, messages: Vec<Value>, turn: Option<String>, tag: Option<String>) -> Future<Output = Result<MclValue, MclError>>
     行为：compact输入在inference_message中按assistant别名规范化，保留相同reasoning/content/tool_calls并映射为InferenceMessage::Assistant；不把compact角色发往厂商。转换消息与读取实际推理配置，经通用check_action后提交InferenceRequest；turn只来自本次effect明确提供的可选参数，不来自Agent当前状态快照；省略为None，空字符串或非字符串明确报参数错误。
+        inference可显式附加第三Manual参数tag；parse_instruction校验非空、非全白、无控制字符、最多512字节。带tag时第二Manual允许null表示无turn；旧两参数null仍拒绝，tool_call不支持第三参数。
+        tag原样放入InferenceRequest，不从turn或命令内容推断，不进入DomainRequest、MCL返回消息或历史；仅由推理网络出口投影到chunk/full顶层。
         无turn也正常提交，不在MCL构造empty_completed或短路返回；Inference plugin决定生命周期、会话、权限及并发受理，Some(turn)额外要求当前有效且匹配，None为自由调用，并以原oneshot返回结果。
         InferenceRequest的领域Err转换为MclValue::Inference { message: {type:"error",code:领域错误种类名称,message:原领域Display文本,request_id:原MCL id,details?:原领域结构化诊断}, stop_reason:"error" }，属于成功交付的推理错误消息，不转换顶层MclValue::Error或抛Lua异常。
         上游明确请求体超限归一为RequestBodyTooLarge，details保留http_status及可选request_id，由Driver按code决定压缩恢复；MCL仅透传，不解析文案、不自行修改上下文或重试，不伪造本地字节上限。

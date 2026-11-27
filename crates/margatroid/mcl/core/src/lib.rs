@@ -272,26 +272,55 @@ pub fn parse_instruction(input: &MclInstruction) -> Result<MclOperation, MclErro
                 }
             }
             let optional_turn = matches!(name, "inference" | "tool_call");
-            if arguments.len() != arity && !(optional_turn && arguments.len() == arity + 1) {
+            let tagged_inference = name == "inference" && arguments.len() == 3;
+            if arguments.len() != arity
+                && !(optional_turn && arguments.len() == arity + 1)
+                && !tagged_inference
+            {
                 return Err(invalid("effect parameter count mismatch"));
             }
-            if optional_turn && arguments.len() == 2 {
+            if optional_turn && arguments.len() >= 2 {
                 let EffectParameter::Manual(index) = arguments[1] else {
                     return Err(invalid("turn must be passed explicitly with ?"));
                 };
-                if input
-                    .arguments
-                    .get(index)
-                    .and_then(|value| value.as_str())
-                    .is_none_or(|turn| {
-                        turn.trim().is_empty()
-                            || turn.len() > 512
-                            || turn.chars().any(char::is_control)
-                    })
+                if !(tagged_inference
+                    && input
+                        .arguments
+                        .get(index)
+                        .is_some_and(serde_json::Value::is_null))
+                    && input
+                        .arguments
+                        .get(index)
+                        .and_then(|value| value.as_str())
+                        .is_none_or(|turn| {
+                            turn.trim().is_empty()
+                                || turn.len() > 512
+                                || turn.chars().any(char::is_control)
+                        })
                 {
                     return Err(MclError::new(
                         MclErrorKind::ArgumentMismatch,
                         "turn must be a nonempty string",
+                    ));
+                }
+            }
+            if tagged_inference {
+                let EffectParameter::Manual(index) = arguments[2] else {
+                    return Err(invalid("inference tag must be passed explicitly with ?"));
+                };
+                if input
+                    .arguments
+                    .get(index)
+                    .and_then(serde_json::Value::as_str)
+                    .is_none_or(|tag| {
+                        tag.trim().is_empty()
+                            || tag.len() > 512
+                            || tag.chars().any(char::is_control)
+                    })
+                {
+                    return Err(MclError::new(
+                        MclErrorKind::ArgumentMismatch,
+                        "inference tag must be a nonempty string",
                     ));
                 }
             }

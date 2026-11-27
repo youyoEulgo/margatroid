@@ -1,5 +1,7 @@
 # AgentDriver
 
+内置assistant的普通推理显式传递turn（缺失时为null）及执行tag=inference；所有压缩推理（手动、usage触发及请求体超限恢复摘要）显式调用 `EFFECT inference (msg.instructions, msg.compact_context, msg.compact_prompt) ? ?`，参数为 `{margatroid.data.null, "compact"}`，表示无turn的自由调用并带本次执行tag=compact。tag是推理执行关联，不写进AgentMessage或历史payload；成功摘要的type仍由Driver改为compact，snapshot及会话替换规则不变。
+
 内置assistant的压缩分为判断与执行：maybe_compact(message)只读配置和上下文并返回boolean。compact()准备TEMP压缩输入、执行自由推理并必然返回一条AgentMessage：成功保留assistant字段、type改为compact；推理失败保留error；无早期上下文返回error说明。compact内部不写历史、不快照、不替换session.conversation。调用方process_compaction(message)先沿原history_append记录返回消息，error立即结束；只有完整且有效的compact才按原流程先快照再替换会话上下文。每次压缩推理前重新INJECT compact刷新压缩提示词；成功完成上下文替换后重新INJECT soul刷新系统提示词，失败不刷新系统提示词。
 
 本轮共享Client槽位、统一写入口与异步监控已实现，尚未提交。具体函数和边界见本领域DESIGN及[DTO说明](../dto/README.md)；运行进程需使用新构建。

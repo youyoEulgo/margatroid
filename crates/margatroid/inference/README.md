@@ -174,3 +174,6 @@ InferenceHandle持有本次生成的source_alive租约，来源有效性不再�
 
 
 上游明确请求体超限时，error full与MCL推理结果都携带code=RequestBodyTooLarge及安全details；无响应体的413仍能归类。HTTP非成功错误仍只读取有界诊断体并剔除当前认证内容，不把原始请求或凭据加入详情。
+
+
+执行级tag由InferenceRequest.tag受理时固定到StreamDelivery；Assistant Driver普通推理显式Some("inference")，压缩推理Some("compact")，均在chunk/full顶层输出相同字符串；其他调用方省略tag时仍输出必填null。成功、错误和取消冻结后的终态沿同一generation及来源租约保留tag；退休来源的旧帧仍按原规则丢弃。tag不进入DomainRequest、厂商HTTP、InferenceMessage、assistant/error内容或历史，不改变turn和取消范围。非空标记须非全白、无控制字符且最多512字节，否则InvalidParameters。

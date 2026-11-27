@@ -83,6 +83,7 @@ fn request() -> InferenceRequest {
         id: "request".into(),
         agent: world.spawn(),
         turn: Some("turn".into()),
+        tag: None,
         messages: vec![inference_core::InferenceMessage::User {
             content: "hello".into(),
             images: vec![],
@@ -104,6 +105,7 @@ fn delivery() -> StreamDelivery {
         id: "request".into(),
         agent: "agent:test/agent:dev".into(),
         turn: Some("turn".into()),
+        tag: None,
         clients: client_core::Clients::default(),
         source_alive: Arc::new(std::sync::atomic::AtomicBool::new(true)),
     }
@@ -159,7 +161,8 @@ async fn real_http_backlog_is_discarded_without_entering_a_frozen_gate() {
 #[tokio::test]
 async fn handle_cancel_preserves_shared_source_terminal_full_and_waits_for_real_worker_join() {
     let (url, sender, server) = http_server().await;
-    let request = request();
+    let mut request = request();
+    request.tag = Some("compact".into());
     let cancel = request.cancel.clone();
     let gate = Arc::new(Mutex::new(StreamGate::default()));
     let (reply, mut received) = oneshot::channel();
@@ -167,6 +170,7 @@ async fn handle_cancel_preserves_shared_source_terminal_full_and_waits_for_real_
     let release = Arc::new(Notify::new());
     let (mut delivery, mut frames) = captured_delivery();
     delivery.turn = Some("turn".into());
+    delivery.tag = request.tag.clone();
     let source_alive = delivery.source_alive.clone();
     let context = InferenceContext {
         request,
@@ -231,6 +235,7 @@ async fn handle_cancel_preserves_shared_source_terminal_full_and_waits_for_real_
         sent.push(frame_json(frame));
     }
     assert_eq!(sent.len(), 2);
+    assert!(sent.iter().all(|frame| frame["tag"] == "compact"));
     assert_eq!(sent[0]["type"], "agent.message.chunk.sync");
     assert_eq!(sent[0]["content"], "accepted");
     assert_eq!(sent[0]["reasoning"], "");
@@ -1673,7 +1678,7 @@ async fn chunk_frames_share_one_generation_sequence_and_use_new_identity_fields(
         let frame = frame_json(frames.recv().await.unwrap());
         assert_eq!(
             frame,
-            json!({"type":"agent.message.chunk.sync","address":"agent:test/agent:dev","turn":"turn","generation":"request","sequence":sequence,"content":content,"reasoning":reasoning})
+            json!({"type":"agent.message.chunk.sync","address":"agent:test/agent:dev","turn":"turn","tag":null,"generation":"request","sequence":sequence,"content":content,"reasoning":reasoning})
         );
     }
     assert!(frames.try_recv().is_err());
@@ -1904,5 +1909,79 @@ fn upstream_body_limit_classification_never_guesses_from_generic_failure() {
             failure.details.is_some(),
             expected == Kind::RequestBodyTooLarge
         );
+    }
+}
+
+#[test]
+fn execution_tag_validation_preserves_valid_values() {
+    for tag in [None, Some("compact"), Some(" analysis ")] {
+        assert!(validate_execution_tag(tag).is_ok());
+    }
+    for tag in ["", "   ", "\tcompact", "bad\n"] {
+        assert_eq!(
+            validate_execution_tag(Some(tag)).unwrap_err().kind,
+            Kind::InvalidParameters
+        );
+    }
+    assert_eq!(
+        validate_execution_tag(Some(&"a".repeat(513)))
+            .unwrap_err()
+            .kind,
+        Kind::InvalidParameters
+    );
+    assert!(validate_execution_tag(Some(&"a".repeat(512))).is_ok());
+}
+
+#[tokio::test]
+async fn execution_tags_are_only_delivery_metadata_and_never_enter_provider_http() {
+    for tag in [None, Some("compact".to_owned())] {
+        let (url, sender, server, captured) = http_server_with_request().await;
+        let mut request = request();
+        request.tag = tag.clone();
+        let domain = prepare_domain(&request, &route(url.clone()), vec![]).unwrap();
+        let outbound = build_request(domain, &route(url)).unwrap();
+        let (fragments, receiver) = mpsc::channel(8);
+        let worker = tokio::spawn(read_provider(
+            reqwest::Client::new(),
+            outbound,
+            CancellationToken::new(),
+            fragments,
+        ));
+        sender.send(format!("{}data: {{\"choices\":[{{\"index\":0,\"delta\":{{}},\"finish_reason\":\"stop\"}}]}}\n\ndata: [DONE]\n\n",chat("answer"))).await.unwrap();
+        drop(sender);
+        let body = captured.await.unwrap();
+        assert!(body.get("tag").is_none());
+        assert!(!body.to_string().contains("compact"));
+        let (mut delivery, mut frames) = captured_delivery();
+        delivery.tag = tag.clone();
+        let gate = Arc::new(Mutex::new(StreamGate::default()));
+        receive_stream(
+            gate.clone(),
+            CancellationToken::new(),
+            &mut delivery,
+            receiver,
+        )
+        .await
+        .unwrap();
+        worker.await.unwrap().unwrap();
+        server.await.unwrap();
+        let result = gate.lock().unwrap().accumulator.response().unwrap();
+        push_full(&mut delivery, Ok(&result));
+        let chunk = frame_json(frames.recv().await.unwrap());
+        let full = frame_json(frames.recv().await.unwrap());
+        for frame in [&chunk, &full] {
+            assert!(frame.get("tag").is_some());
+            assert_eq!(frame["tag"], json!(tag));
+            assert_eq!(frame["generation"], delivery.id);
+        }
+        assert!(full["message"].get("tag").is_none());
+        push_full(
+            &mut delivery,
+            Err(&error(Kind::RequestFailed, "safe failure")),
+        );
+        let failed = frame_json(frames.recv().await.unwrap());
+        assert_eq!(failed["tag"], json!(tag));
+        assert_eq!(failed["message"]["type"], "error");
+        assert!(failed["message"].get("tag").is_none());
     }
 }

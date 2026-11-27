@@ -46,7 +46,7 @@ EFFECT ready
 EFFECT wake
 ```
 
-Lua调用为margatroid.mcl:execute(target_address, text, arguments)，arguments按顺序对应问号。目标使用完整节点地址，来源及实际执行instance由宿主绑定，不接受脚本伪造source。宿主只依赖mcl_core发送MclCommand并等待reply；唯一执行入口MclCommand要求调用方显式提供source_address，网络入口及Lua宿主传入自身真实地址，与source实体身份核对，MCL审计source保存该地址而非Entity编号；history_append按消息type映射role及规范内容列，不保存调用来源，返回带真实sequence的完整消息；mcl_plugin不定义Lua函数。inference使用消息数组；tool_call使用结构化调用数组或消息的tool_calls投影。marker形式为EFFECT inference ? [ ? ]和EFFECT tool_call ? [ ? ]，第二参数若存在只能是显式turn，不是工具alias列表。配置路径和值分别占一个参数。
+Lua调用为margatroid.mcl:execute(target_address, text, arguments)，arguments按顺序对应问号。目标使用完整节点地址，来源及实际执行instance由宿主绑定，不接受脚本伪造source。宿主只依赖mcl_core发送MclCommand并等待reply；唯一执行入口MclCommand要求调用方显式提供source_address，网络入口及Lua宿主传入自身真实地址，与source实体身份核对，MCL审计source保存该地址而非Entity编号；history_append按消息type映射role及规范内容列，不保存调用来源，返回带真实sequence的完整消息；mcl_plugin不定义Lua函数。inference使用消息数组；tool_call使用结构化调用数组或消息的tool_calls投影。marker形式为EFFECT inference ? [ ? [ ? ]]和EFFECT tool_call ? [ ? ]，第二参数为显式turn，不是工具alias列表。inference第三参数可显式提供tag，两个附加位置均须问号；仅这种三参数形式允许第二参数null表示无turn。tag必须非空、非全白、无控制字符且最多512字节，只用于本次chunk/full顶层，不进入厂商请求或持久消息。配置路径和值分别占一个参数。
 
 ## 消息Block
 
@@ -70,7 +70,7 @@ IMPORT校验种类、依赖和alias后，在对应资源领域登记；TOOL保�
 
 | EFFECT | 参数 | 返回值 |
 | --- | --- | --- |
-| inference | 消息数组、可选turn | .Inference.message、.Inference.stop_reason |
+| inference | 消息数组、可选显式turn、可选显式tag | .Inference.message、.Inference.stop_reason |
 | tool_call | 调用数组或消息tool_calls投影、可选turn | .Array.Message |
 | sandbox_use | 零或一个沙箱alias组成的数组 | Unit |
 | history_append | 消息数组 | .Array.Message（带真实sequence） |

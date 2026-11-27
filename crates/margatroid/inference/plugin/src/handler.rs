@@ -160,6 +160,18 @@ pub(crate) fn handle_init_inference(world: &mut World, request: InitInference) {
     let _ = reply.send(result);
 }
 
+fn validate_execution_tag(tag: Option<&str>) -> Result<(), InferenceError> {
+    if tag.is_some_and(|value| {
+        value.trim().is_empty() || value.len() > 512 || value.chars().any(char::is_control)
+    }) {
+        return Err(error(
+            Kind::InvalidParameters,
+            "tag must be nonblank, contain no control characters and fit 512 bytes",
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) fn handle_inference(world: &mut World, request: InferenceRequest) {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(180);
     let Some(reply) = request
@@ -170,6 +182,10 @@ pub(crate) fn handle_inference(world: &mut World, request: InferenceRequest) {
     else {
         return;
     };
+    if let Err(failure) = validate_execution_tag(request.tag.as_deref()) {
+        let _ = reply.send(Err(failure));
+        return;
+    }
     let Some(agent) = world.get_component::<Agent>(request.agent) else {
         let _ = reply.send(Err(error(Kind::AgentMissing, "Agent entity missing")));
         return;
@@ -294,6 +310,7 @@ pub(crate) fn handle_inference(world: &mut World, request: InferenceRequest) {
             id: request_id.clone(),
             agent: agent_address,
             turn: turn.clone(),
+            tag: request.tag.clone(),
             clients,
             source_alive: source_alive.clone(),
         },
@@ -881,7 +898,7 @@ struct StreamTextSnapshot {
     reasoning: String,
 }
 fn push_stream(delivery: &mut StreamDelivery, snapshot: StreamTextSnapshot) {
-    let frame = json!({"type":"agent.message.chunk.sync","address":delivery.agent,"turn":delivery.turn,"generation":delivery.id,"sequence":snapshot.sequence,"content":snapshot.content,"reasoning":snapshot.reasoning});
+    let frame = json!({"type":"agent.message.chunk.sync","address":delivery.agent,"turn":delivery.turn,"tag":delivery.tag,"generation":delivery.id,"sequence":snapshot.sequence,"content":snapshot.content,"reasoning":snapshot.reasoning});
     push_frame(delivery, frame);
 }
 
@@ -909,7 +926,7 @@ fn push_full(delivery: &mut StreamDelivery, result: Result<&InferenceResponse, &
             )
         }
     };
-    let frame = json!({"type":"agent.message.full.sync","address":delivery.agent,"turn":delivery.turn,"generation":delivery.id,"history_sequence":null,"message":message,"error":failure});
+    let frame = json!({"type":"agent.message.full.sync","address":delivery.agent,"turn":delivery.turn,"tag":delivery.tag,"generation":delivery.id,"history_sequence":null,"message":message,"error":failure});
     push_frame(delivery, frame);
 }
 

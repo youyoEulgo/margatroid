@@ -60,7 +60,7 @@ function execute(arguments, context)
     end
 
     local function enqueue_inference()
-        local message = command("EFFECT inference (msg.instructions, session.conversation) ?", {turn}).Inference.message
+        local message = command("EFFECT inference (msg.instructions, session.conversation) ? ?", {turn or margatroid.data.null, "inference"}).Inference.message
         command("INJECT ? TO entry.pending[-1]", {{message}})
     end
 
@@ -101,7 +101,7 @@ function execute(arguments, context)
         end
         command("INJECT ? TO msg.compact_context", {earlier})
         command("INJECT compact TO msg.compact_prompt")
-        local response = command("EFFECT inference (msg.instructions, msg.compact_context, msg.compact_prompt)").Inference
+        local response = command("EFFECT inference (msg.instructions, msg.compact_context, msg.compact_prompt) ? ?", {margatroid.data.null, "compact"}).Inference
         local message = response.message
         if message.type == "assistant" then message.type = "compact" end
         return message
@@ -163,7 +163,7 @@ function execute(arguments, context)
             for index = 1, ending do earlier[#earlier + 1] = conversation[index] end
             command("INJECT ? TO msg.compact_context", {earlier})
             command("INJECT compact TO msg.compact_prompt")
-            local summary = command("EFFECT inference (msg.instructions, msg.compact_context, msg.compact_prompt)").Inference.message
+            local summary = command("EFFECT inference (msg.instructions, msg.compact_context, msg.compact_prompt) ? ?", {margatroid.data.null, "compact"}).Inference.message
             if summary.type == "error" then
                 append_history(summary)
                 if summary.code ~= "RequestBodyTooLarge" then

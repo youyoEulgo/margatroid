@@ -34,6 +34,7 @@ struct Commands {
     snapshots: Vec<Vec<Value>>,
     inference_responses: VecDeque<Value>,
     compact_prefixes: Vec<Vec<Value>>,
+    inference_tags: Vec<Option<String>>,
 }
 
 // Run the shipped drivers in a real Workspace Lua VM. The command responder is
@@ -105,6 +106,18 @@ impl Fixture {
                 let text = request.instruction.text.as_str();
                 let mut state = state.lock().unwrap();
                 state.calls.push(text.to_owned());
+                if text.starts_with("EFFECT inference ") {
+                    if text.contains("msg.compact_context") {
+                        assert_eq!(text, "EFFECT inference (msg.instructions, msg.compact_context, msg.compact_prompt) ? ?");
+                        assert_eq!(request.instruction.arguments, vec![Value::Null, json!("compact")]);
+                        state.inference_tags.push(Some("compact".into()));
+                    } else {
+                        assert_eq!(text, "EFFECT inference (msg.instructions, session.conversation) ? ?");
+                        assert_eq!(request.instruction.arguments.len(), 2);
+                        assert_eq!(request.instruction.arguments[1], "inference");
+                        state.inference_tags.push(Some("inference".into()));
+                    }
+                }
                 let failed = state.fail.as_deref() == Some(text) || state.recovery_fail.as_deref() == Some(text);
                 let result = if failed {
                     if state.fail.as_deref() == Some(text) {
@@ -284,7 +297,7 @@ async fn shipped_drivers_stop_at_each_mcl_failure_and_host_logs_once() {
             "INJECT ? TO session.conversation[-1]",
             "EFFECT start_turn",
             "CONFIG GET",
-            "EFFECT inference (msg.instructions, session.conversation) ?",
+            "EFFECT inference (msg.instructions, session.conversation) ? ?",
             "INJECT ? TO entry.pending[-1]",
             "EFFECT finish_turn",
         ] {
@@ -527,6 +540,7 @@ end
                         |message| message["type"] == "compact" && message["content"] == "done"
                     ));
                     assert_eq!(state.snapshots, vec![original.clone()]);
+                    assert_eq!(state.inference_tags, vec![Some("compact".into())]);
                     assert_eq!(state.conversation.len(), 3);
                     assert_eq!(
                         state.conversation[0]["content"],
@@ -771,17 +785,21 @@ async fn oversized_body_summarizes_smaller_balanced_prefix_then_retries_same_tur
             );
             assert_eq!(state.snapshots, vec![original.clone()]);
             assert_eq!(
+                state.inference_tags,
+                vec![
+                    Some("compact".into()),
+                    Some("compact".into()),
+                    Some("inference".into())
+                ]
+            );
+            assert_eq!(
                 state.conversation[0]["content"],
                 "Conversation checkpoint:\ncheckpoint"
             );
             assert_eq!(&state.conversation[1..], &original[1..]);
-            assert!(
-                state
-                    .calls
-                    .iter()
-                    .any(|call| call
-                        == "EFFECT inference (msg.instructions, session.conversation) ?")
-            );
+            assert!(state.calls.iter().any(
+                |call| call == "EFFECT inference (msg.instructions, session.conversation) ? ?"
+            ));
             assert_eq!(
                 state
                     .history
@@ -849,7 +867,7 @@ async fn oversized_body_recovery_stops_without_modifying_context_when_summary_ca
                 assert_eq!(state.compact_prefixes.len(), 1);
                 assert!(
                     !state.calls.iter().any(|call| call
-                        == "EFFECT inference (msg.instructions, session.conversation) ?")
+                        == "EFFECT inference (msg.instructions, session.conversation) ? ?")
                 );
                 assert!(
                     state

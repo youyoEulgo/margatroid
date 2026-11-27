@@ -164,8 +164,8 @@ fn all_thirty_one_server_types_round_trip_and_distinguish_sync_ids() {
         json!({"type":"agent.turn.sync","address":"/demo/coder","turn":null}),
         json!({"type":"agent.task.res","id":"request-1","success":true,"address":"/demo/coder","tasks":[]}),
         json!({"type":"agent.task.sync","address":"/demo/coder","tasks":[]}),
-        json!({"type":"agent.message.chunk.sync","address":"/demo/coder","turn":"turn-1","generation":"gen-1","sequence":1,"content":"","reasoning":"think"}),
-        json!({"type":"agent.message.full.sync","address":"/demo/coder","turn":null,"generation":null,"history_sequence":null,"message":{"type":"user","content":"hello","data":[]},"error":null}),
+        json!({"type":"agent.message.chunk.sync","tag":null,"address":"/demo/coder","turn":"turn-1","generation":"gen-1","sequence":1,"content":"","reasoning":"think"}),
+        json!({"type":"agent.message.full.sync","tag":null,"address":"/demo/coder","turn":null,"generation":null,"history_sequence":null,"message":{"type":"user","content":"hello","data":[]},"error":null}),
     ]);
     for kind in ["agent.history.res", "agent.log.res", "agent.mcl.res"] {
         cases.push(json!({"type":kind,"id":"request-1","success":true,"address":"/demo/coder","records":[],"next_before_sequence":null,"next_after_sequence":null}));
@@ -258,7 +258,7 @@ fn complete_workspace_agent_tool_and_mcl_business_data_are_preserved() {
 
 #[test]
 fn message_sync_uses_one_reasoning_field_and_real_history_identity() {
-    let full = json!({"type":"agent.message.full.sync","address":"/demo/coder","turn":"t","generation":"g","history_sequence":42,"message":{"type":"assistant","sequence":42,"content":"answer","reasoning":"thought","tool_calls":[]},"error":null});
+    let full = json!({"type":"agent.message.full.sync","tag":null,"address":"/demo/coder","turn":"t","generation":"g","history_sequence":42,"message":{"type":"assistant","sequence":42,"content":"answer","reasoning":"thought","tool_calls":[]},"error":null});
     let parsed: ServerMessage = serde_json::from_value(full.clone()).unwrap();
     assert!(parsed.id().is_none());
     for (key, value) in [
@@ -324,7 +324,7 @@ fn media_validation_does_not_echo_payloads() {
 
 #[test]
 fn required_nullable_fields_and_type_constants_are_not_optional() {
-    let base = json!({"type":"agent.message.full.sync","address":"/demo/coder","turn":null,"generation":null,"history_sequence":null,"message":{"type":"error","message":"safe"},"error":null});
+    let base = json!({"type":"agent.message.full.sync","tag":null,"address":"/demo/coder","turn":null,"generation":null,"history_sequence":null,"message":{"type":"error","message":"safe"},"error":null});
     for key in ["turn", "generation", "history_sequence", "error"] {
         let mut bad = base.clone();
         bad.as_object_mut().unwrap().remove(key);
@@ -442,7 +442,7 @@ fn driver_ui_messages_enforce_complete_resource_and_nullable_contracts() {
 
 #[test]
 fn cumulative_chunk_requires_complete_text_pair_and_rejects_delta() {
-    let base = json!({"type":"agent.message.chunk.sync","address":"/demo/coder","turn":"turn-1","generation":"gen-1","sequence":1,"content":"你好","reasoning":"思考"});
+    let base = json!({"type":"agent.message.chunk.sync","tag":null,"address":"/demo/coder","turn":"turn-1","generation":"gen-1","sequence":1,"content":"你好","reasoning":"思考"});
     let message: ServerMessage = serde_json::from_value(base.clone()).unwrap();
     assert!(encode_server_message(&message).is_ok());
     for field in ["content", "reasoning"] {
@@ -471,7 +471,7 @@ fn returned_turn_and_free_generation_chunk_preserve_explicit_optional_associatio
     };
     let value: Value = serde_json::from_str(&encode_server_message(&response).unwrap()).unwrap();
     assert_eq!(value["data"], json!({"kind":"turn","value":"turn:one"}));
-    let raw = json!({"type":"agent.message.chunk.sync","address":"/demo/coder","turn":null,"generation":"free-request","sequence":1,"content":"summary","reasoning":""});
+    let raw = json!({"type":"agent.message.chunk.sync","tag":null,"address":"/demo/coder","turn":null,"generation":"free-request","sequence":1,"content":"summary","reasoning":""});
     let parsed: ServerMessage = serde_json::from_value(raw.clone()).unwrap();
     assert_eq!(
         serde_json::from_str::<Value>(&encode_server_message(&parsed).unwrap()).unwrap(),
@@ -486,7 +486,7 @@ fn returned_turn_and_free_generation_chunk_preserve_explicit_optional_associatio
 
 #[test]
 fn compact_message_roundtrips_with_assistant_fields_and_keeps_compact_type() {
-    let raw = json!({"type":"agent.message.full.sync","address":"/demo/coder","turn":null,"generation":null,"history_sequence":7,"message":{"type":"compact","sequence":7,"request_id":"summary-request","content":"summary","reasoning":"reason","tool_calls":[],"stop_reason":"completed"},"error":null});
+    let raw = json!({"type":"agent.message.full.sync","tag":null,"address":"/demo/coder","turn":null,"generation":null,"history_sequence":7,"message":{"type":"compact","sequence":7,"request_id":"summary-request","content":"summary","reasoning":"reason","tool_calls":[],"stop_reason":"completed"},"error":null});
     let message: ServerMessage = serde_json::from_value(raw).unwrap();
     let wire: Value = serde_json::from_str(&encode_server_message(&message).unwrap()).unwrap();
     assert_eq!(wire["message"]["type"], "compact");

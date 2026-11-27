@@ -182,7 +182,8 @@ async function importFiles(files: File[]) {
     if (generation === draftGeneration) draftImages.value.push(...imported);
   } catch (error) {
     if (generation === draftGeneration)
-      composerError.value = "Image import failed";
+      composerError.value =
+        error instanceof Error ? error.message : "Image import failed";
   } finally {
     if (generation === draftGeneration) importingImages.value = false;
   }

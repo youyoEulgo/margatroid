@@ -246,7 +246,7 @@ async fn execute_command(mut context: CommandContext) {
             () = request.cancel.cancelled() => { context.cancel.cancel(); operation.await },
             result = &mut operation => result,
         };
-        let audit_turn=match &context.operation{MclOperation::Effect{name,arguments}if matches!(name.as_str(),"inference"|"tool_call")=>explicit_turn(&context,arguments.get(1).cloned())?,_=>context.turn.clone()};
+        let audit_turn=match &context.operation{MclOperation::Effect{name,arguments}if matches!(name.as_str(),"inference"|"tool_call")=>explicit_inference_turn(&context,name,arguments)?,_=>context.turn.clone()};
         let audit = storage(&context, StorageOperation::AppendHistory { records: vec![storage_core::HistoryRecord {
             source: Some(request.source_address.clone()),
             turn: audit_turn, kind: "mcl".into(), content: request.instruction.text.clone(),
@@ -827,8 +827,37 @@ async fn execute_effect(
         }
         "inference" => {
             let messages = effect_messages(context, arguments.next().unwrap()).await?;
-            let turn = explicit_turn(context, arguments.next())?;
-            execute_inference(context, messages, turn).await
+            let turn_parameter = arguments.next();
+            let tag_parameter = arguments.next();
+            let turn = if tag_parameter.is_some()
+                && matches!(turn_parameter,Some(EffectParameter::Manual(index)) if context.request.instruction.arguments[index].is_null())
+            {
+                None
+            } else {
+                explicit_turn(context, turn_parameter)?
+            };
+            let tag = tag_parameter
+                .map(|parameter| match parameter {
+                    EffectParameter::Manual(index) => context
+                        .request
+                        .instruction
+                        .arguments
+                        .get(index)
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                        .ok_or_else(|| {
+                            error(
+                                MclErrorKind::ArgumentMismatch,
+                                "inference tag must be a nonempty string",
+                            )
+                        }),
+                    _ => Err(error(
+                        MclErrorKind::ArgumentMismatch,
+                        "inference tag must be passed explicitly with ?",
+                    )),
+                })
+                .transpose()?;
+            execute_inference(context, messages, turn, tag).await
         }
         "tool_call" => {
             let messages = tool_effect_messages(context, arguments.next().unwrap()).await?;
@@ -1108,6 +1137,20 @@ async fn finish_turn(context: &CommandContext) -> Result<MclValue, MclError> {
     .await
 }
 
+fn explicit_inference_turn(
+    context: &CommandContext,
+    name: &str,
+    arguments: &[EffectParameter],
+) -> Result<Option<String>, MclError> {
+    if name == "inference"
+        && arguments.len() == 3
+        && matches!(arguments.get(1),Some(EffectParameter::Manual(index)) if context.request.instruction.arguments[*index].is_null())
+    {
+        return Ok(None);
+    }
+    explicit_turn(context, arguments.get(1).cloned())
+}
+
 fn explicit_turn(
     context: &CommandContext,
     parameter: Option<EffectParameter>,
@@ -1141,6 +1184,7 @@ async fn execute_inference(
     context: &CommandContext,
     messages: Vec<Value>,
     turn: Option<String>,
+    tag: Option<String>,
 ) -> Result<MclValue, MclError> {
     let mut typed = Vec::new();
     for message in messages {
@@ -1166,6 +1210,7 @@ async fn execute_inference(
             id: request.id,
             agent: request.target,
             turn: expected_turn,
+            tag,
             messages: typed,
             config,
             cancel,

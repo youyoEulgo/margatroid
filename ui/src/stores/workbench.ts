@@ -79,6 +79,7 @@ export interface RuntimeLog {
   fields: { name: string; value: string }[];
 }
 interface StreamEntry extends ConversationEntry {
+  tag?: string | null;
   lastSequence: number;
   completed: boolean;
   frozen: boolean;
@@ -773,7 +774,7 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     () =>
       new Set(
         selectedHistoryEntries.value
-          .filter((entry) => entry.role === 'assistant')
+          .filter((entry) => entry.role === 'assistant' || entry.role === 'compact')
           .map((entry) => entry.id),
       ),
   );
@@ -1492,10 +1493,18 @@ export const useWorkbenchStore = defineStore('workbench', () => {
           lastSequence: -1,
           completed: false,
           frozen: false,
+          tag: event.tag,
         };
     // Chunk snapshots carry the complete text so far; replace, never append.
-    message.thinking = event.reasoning;
-    message.content = event.content;
+    if (event.tag === 'compact') {
+      message.thinking = [event.reasoning, event.content].filter(Boolean).join('\n\n');
+      message.content = '';
+      message.toolCalls = [];
+    } else {
+      message.thinking = event.reasoning;
+      message.content = event.content;
+    }
+    message.tag = event.tag;
     message.lastSequence = event.sequence;
     streams.value = new Map(streams.value).set(key, message);
   }
@@ -1696,26 +1705,30 @@ export const useWorkbenchStore = defineStore('workbench', () => {
       const row = decodeMessage(event.message)[0];
       if (row) {
         const old = streams.value.get(key);
+        const compact = event.tag === 'compact';
         streams.value = new Map(streams.value).set(key, {
           key,
           id: event.generation,
           workspaceKey: target.workspace,
           agent: target.agent,
-          role: row.role,
-          thinking: row.thinking,
-          content: row.content,
-          toolCalls: row.toolCalls,
+          role: compact ? 'assistant' : row.role,
+          thinking: compact
+            ? [row.thinking, row.content].filter(Boolean).join('\n\n')
+            : row.thinking,
+          content: compact ? '' : row.content,
+          toolCalls: compact ? [] : row.toolCalls,
           failed: row.failed || !!event.error,
-          images: row.images,
+          images: compact ? undefined : row.images,
           timestamp: old?.timestamp ?? currentMessageTime(),
           kind: 'stream',
           payload: event.message,
           source: null,
           messageType: event.message.type,
           sequence: null,
-          toolCallId: row.toolCallId,
-          toolName: row.toolName,
+          toolCallId: compact ? null : row.toolCallId,
+          toolName: compact ? null : row.toolName,
 
+          tag: event.tag,
           lastSequence: old?.lastSequence ?? -1,
           completed: true,
           frozen: old?.frozen ?? false,

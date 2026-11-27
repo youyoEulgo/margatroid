@@ -108,8 +108,8 @@ ServerMessage：响应及同步出站枚举，type之外的字段位于顶层，
     AgentLogSync { address: AddressDto, records: Vec<AgentLogRecordDto> }
     AgentMclRes { id: String, success: bool, address: AddressDto, records: Option<Vec<AgentMclRecordDto>>, next_before_sequence: Option<u64>, next_after_sequence: Option<u64>, error: Option<ProtocolErrorDto> }
     AgentMclSync { address: AddressDto, records: Vec<AgentMclRecordDto> }
-    AgentMessageChunkSync { address: AddressDto, turn: Option<String>, generation: String, sequence: u64, content: String, reasoning: String }
-    AgentMessageFullSync { address: AddressDto, turn: Option<String>, generation: Option<String>, history_sequence: Option<u64>, message: AgentMessageDto, error: Option<ProtocolErrorDto> }
+    AgentMessageChunkSync { address: AddressDto, turn: Option<String>, tag: Option<String>, generation: String, sequence: u64, content: String, reasoning: String }
+    AgentMessageFullSync { address: AddressDto, turn: Option<String>, tag: Option<String>, generation: Option<String>, history_sequence: Option<u64>, message: AgentMessageDto, error: Option<ProtocolErrorDto> }
     MclExecuteResult { id: String, success: bool, data: Option<MclExecuteDataDto>, error: Option<ProtocolErrorDto> }
 
     id(&self) -> Option<&str>
@@ -322,6 +322,9 @@ AgentMclRecordDto
     行为：投影MCL审计业务字段，移除source_instance及其他内部VM标识。
 AgentMessageChunkSync累计文本约束
     content、reasoning必须同时存在且为字符串；未收到对应内容时为""，不省略、不使用null。
+    chunk及full顶层tag是必填nullable执行标签，None序列化为null；Some非空、非全白、最多512字节且无控制字符，保留原始合法空白。
+    tag只关联本次generation的用途，例如compact；不进入AgentMessageDto、历史或厂商请求内容。普通未标记推理也显式tag=null。
+    同次生成的chunk、成功full及失败full保留同一tag；full的generation=null时tag必须为null，持久化投递不能冒充生成标签。
     每条表示同一generation截至sequence的完整已接受文本，至少一侧非空；未知delta字段严格拒绝，不提供旧格式别名。
     sequence用于丢弃同generation迟到或重复快照，跳号不需要补拼前缀；不冒充持久消息sequence。
     chunk不承载工具参数增量、usage或stop_reason，完整生成结果仍由原AgentMessageFullSync交付。

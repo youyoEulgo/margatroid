@@ -118,6 +118,7 @@ InferenceRequest：推理请求，公开事件
     id: String
     agent: Entity
     turn: Option<String>
+    tag: Option<String>--执行标记，普通None、压缩Some("compact")，不进入领域消息或厂商请求
     messages: Vec<InferenceMessage>
     config: InferenceParameters
     cancel: CancellationToken
@@ -173,8 +174,12 @@ handle_init_inference(world: &mut World, request: InitInference)
         不存在ActiveInference则挂载current=None的组件，已存在不覆盖；
         组件可查询后回复Ok(())，失败回复InferenceError。
 
+validate_execution_tag(tag: Option<&str>) -> Result<(), InferenceError>
+    行为：仅校验执行标记的值约束，保留合法字符串原始空白，不根据标记推导权限或请求语义。
+
 handle_inference(world: &mut World, request: InferenceRequest)
     行为：
+        校验tag为None或非空非全白、无控制字符且不超过512字节；非法返回InvalidParameters，不启动HTTP。tag不改变turn、取消或权限，不进入DomainRequest、InferenceMessage、响应内容或持久历史。
         认领reply，检查完整Agent Entity、当前Agent.instance及本次生成来源租约、请求取消能力及所需运行组件；Closing拒绝普通请求。
         turn=None时为自由调用：Starting/Running可受理，不要求Agent已有turn，当前恰有turn也不隐式绑定。
         turn=Some(id)时要求非空、Agent为Running且当前有效turn与id一致；失效或不匹配沿原中止响应收口，不创建HTTP或监督任务。
@@ -245,7 +250,7 @@ push_stream(delivery: &mut StreamDelivery, snapshot: StreamTextSnapshot)
     行为：
         按当前Clients槽位有界发送agent.message.chunk.sync，顶层content与reasoning均为必填字符串，表示同次接受门裁决之后的累计完整文本。
         不发送delta，不按reasoning布尔值选择某一侧单独追加；任一侧变化时两侧都随快照交付。
-        address/turn/generation保持原身份，sequence为同一生成的文本快照序号，不是历史序号，也不是上游SSE数量。
+        address/turn/tag/generation保持本次执行身份，sequence为同一生成的文本快照序号，不是历史序号，也不是上游SSE数量。
         发送发生在累积器提交之后且接受门锁外，慢连接不阻塞累积器；队列Full/Closed按既有规则关闭受影响连接，不因单帧字节数关闭连接，不截断累计文本或回退为增量。
         生成结束仍经push_full发送原完整消息及终态，chunk不携带半成品tool_calls、usage、stop_reason或持久序号。
 
@@ -254,7 +259,7 @@ finish_inference(context: &mut InferenceContext, result: Result<InferenceRespons
 
 push_full(delivery: &mut StreamDelivery, result: Result<&InferenceResponse, &InferenceError>)
     行为：
-        生成agent.message.full.sync，携带address、turn、generation及history_sequence=null，不输出消息sequence。
+        生成agent.message.full.sync，携带address、turn、tag、generation及history_sequence=null，不输出消息sequence。
         成功转换为完整内部assistant：reasoning/content、tool_calls、usage、stop_reason及request_id；工具name映射tool_name、arguments JSON值编码成字符串，空可选字段省略。
         失败转换内部error消息并保留request_id、稳定code及可选details，full.error含code/message；不制造assistant正文或持久序号，不带replay/data。
         只投影通用响应，不另建厂商内部消息或调用协议crate。
@@ -286,6 +291,7 @@ StreamDelivery：前端出口，私有类型
     agent: String--wire中为address
     instance: String
     turn: Option<String>
+    tag: Option<String>--请求受理时固定，chunk/full顶层始终出现，None输出null
     clients: Clients
     source_alive: Arc<AtomicBool>--本次InferenceHandle持有的来源租约，不来自Agent字段；Agent关闭或实际来源替换时显式退休；普通取消与回合中止保留租约，允许同generation终态full
 InferenceLaunchOutput：已将监督任务交给共享句柄的启动事实

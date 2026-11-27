@@ -59,6 +59,7 @@ pub(crate) struct StreamDelivery {
     pub id: String,
     pub agent: String,
     pub turn: Option<String>,
+    pub tag: Option<String>,
     pub clients: Clients,
     pub source_alive: Arc<std::sync::atomic::AtomicBool>,
 }

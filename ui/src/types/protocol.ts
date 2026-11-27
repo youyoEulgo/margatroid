@@ -359,6 +359,7 @@ export type ServerMessage =
   | ({
       type: 'agent.message.chunk.sync';
       turn: string | null;
+      tag: string | null;
       generation: string;
       sequence: number;
       content: string;
@@ -367,6 +368,7 @@ export type ServerMessage =
   | ({
       type: 'agent.message.full.sync';
       turn: string | null;
+      tag: string | null;
       generation: string | null;
       history_sequence: number | null;
       message: AgentMessage;
@@ -731,6 +733,7 @@ export function parseServerMessage(raw: string): ServerMessage | null {
           v.id === undefined &&
           target(v) &&
           nullableString(v.turn) &&
+          nullableString(v.tag) &&
           string(v.generation) &&
           integer(v.sequence) &&
           string(v.content) &&
@@ -741,6 +744,7 @@ export function parseServerMessage(raw: string): ServerMessage | null {
           v.id === undefined &&
           target(v) &&
           nullableString(v.turn) &&
+          nullableString(v.tag) &&
           nullableString(v.generation) &&
           (v.history_sequence === null || integer(v.history_sequence)) &&
           isAgentMessage(v.message) &&

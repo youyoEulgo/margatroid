@@ -141,11 +141,14 @@ fn inference_and_tools_accept_only_explicit_nonempty_optional_turns() {
             vec![json!([])]
         )
         .is_err());
-        assert!(parse(
-            &format!("EFFECT {effect} ? ? ?"),
-            vec![json!([]), json!("one"), json!("two")]
-        )
-        .is_err());
+        assert_eq!(
+            parse(
+                &format!("EFFECT {effect} ? ? ?"),
+                vec![json!([]), json!("one"), json!("two")]
+            )
+            .is_ok(),
+            effect == "inference"
+        );
     }
     assert!(parse(
         "EFFECT inference (session.messages) ?",
@@ -157,4 +160,42 @@ fn inference_and_tools_accept_only_explicit_nonempty_optional_turns() {
         vec![json!("turn:one")]
     )
     .is_ok());
+}
+
+#[test]
+fn inference_tag_is_explicit_and_null_turn_is_only_available_in_tagged_form() {
+    for turn in [json!(null), json!("turn:one")] {
+        assert!(parse(
+            "EFFECT inference (session.messages) ? ?",
+            vec![turn, json!("compact")]
+        )
+        .is_ok());
+    }
+    for tag in [
+        json!(null),
+        json!(""),
+        json!("  "),
+        json!(12),
+        json!([]),
+        json!("line\ntag"),
+        json!("x".repeat(513)),
+    ] {
+        assert!(parse("EFFECT inference ? ? ?", vec![json!([]), json!(null), tag]).is_err());
+    }
+    assert!(parse(
+        "EFFECT inference ? ? (session.messages)",
+        vec![json!([]), json!(null)]
+    )
+    .is_err());
+    assert!(parse(
+        "EFFECT inference ? (session.messages) ?",
+        vec![json!([]), json!("compact")]
+    )
+    .is_err());
+    assert!(parse("EFFECT inference ? ?", vec![json!([]), json!(null)]).is_err());
+    assert!(parse(
+        "EFFECT tool_call ? ? ?",
+        vec![json!([]), json!(null), json!("compact")]
+    )
+    .is_err());
 }

@@ -42,3 +42,6 @@ HTTP/SSE worker 只输出到容量 32 的 ProviderFragment 通道，不向前端
 清理通知不通过send_event_after循环等待。尚未结束的实际句柄由独立异步wait_finished等待，再提交一次World闭包，核对Agent.instance、request_id与同一生成租约后唤醒。模型公共投影从core的ModelObserverFactory取得通用回调，client_core只在plugin负责投递。本文描述源码实现，不表示运行中的daemon已更新。
 
 普通InferenceHandle.cancel只冻结接受门并请求取消，保留共享来源租约，使同generation的终态full能够交付。retire_source单独用于Agent真正关闭或来源替换，淘汰旧实例的已入队帧；调用方随后仍需cancel并等待真实清理。两者不可混同，回合中止不能提前退休终态来源。共享lease取消回归验证冻结文本、一次full、真实join及迟到文本拒绝。
+
+
+执行级tag由InferenceRequest.tag受理时固定到StreamDelivery；Assistant Driver普通推理显式Some("inference")，压缩推理Some("compact")，均在chunk/full顶层输出相同字符串；其他调用方省略tag时仍输出必填null。成功、错误和取消冻结后的终态沿同一generation及来源租约保留tag；退休来源的旧帧仍按原规则丢弃。tag不进入DomainRequest、厂商HTTP、InferenceMessage、assistant/error内容或历史，不改变turn和取消范围。非空标记须非全白、无控制字符且最多512字节，否则InvalidParameters。

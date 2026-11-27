@@ -2016,6 +2016,11 @@ async fn bundled_drivers_record_inference_error_messages_and_keep_running_while_
             let recorded = fixture.inference.clone();
             tick_until(&mut fixture.app, || recorded.lock().unwrap().len() > index).await;
             let request = recorded.lock().unwrap()[index].clone();
+            assert_eq!(
+                request.tag.as_deref(),
+                Some("inference"),
+                "ordinary Driver inference must carry its own execution tag"
+            );
             // The reply can precede task exit: finish_turn must retain this handle
             // and Working state until the inference supervisor really exits.
             let (release, waiting) = oneshot::channel();
