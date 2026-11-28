@@ -18,7 +18,7 @@ margatroid
 ├── process：start
 ├── driver：mcl、wait
 ├── tools：register
-└── task：return_result、finish、append_output、replace_output、read_output、send、receive
+└── task：return_result、finish、append_output、replace_output、read_output、list、send、receive
 ```
 
 上下文只有一个入口margatroid.context；arguments收进其中，version不再向脚本公开，null归data。公共方法按操作对象分组，mcl、agent、workspace、tools、task在自动执行和工具调用中同等开放。子对象只读，缺少实际目标或执行能力明确失败。configure只读元数据，执行确认前不开放IO或其他方法，不保留旧名称别名。
@@ -225,3 +225,10 @@ Bundled skill/MCP registrars save successful startup registration commands throu
 ## 读图预览
 
 read-image在返回模型图片前调用共享`data:image_prepare`，保留最长边1280默认比例及300KiB目标，可通过max_dimension、quality、target_bytes增加细节。opaque输出JPEG，透明输出lossless WebP，动画取首帧，原文件不写。工具结果注明实际预览元数据并提醒模型分析图片；此读取不是向用户展示或交付图片。原文件不再受旧5MiB输入截断规则限制，先进入压缩流程再返回预览，已有历史原图不自动重写。
+
+
+## 已返回后台任务列表
+
+新增无参数资源 `tool:margatroid/task-list:dev AS task_list`，Assistant默认配置模板已导入。底层通过共享 `margatroid.task:list()` 取得当前调用Agent已return、未完成清理的任务。输出 `{tasks:[{task_id,tool_name,has_unread_output,error}]}`，空时tasks为[]。tool_name为实际调用别名，error必有可空；不添加冗余returned/finished状态，也不把未读false解释为空闲或完成。
+
+查询使用轻量TaskListEntry，不调用完整snapshot、不复制缓存正文或原始参数，不推进共享cursor、消耗replaced或发布同步。未读标记包括replaced，空屏替换也可被发现；task_read仍是实际消费入口。任务可能在结果返回后清理，后续task_read/send/finish按实时存在性裁决。现有agent.task.req/sync保持原完整集合契约，不增加网络消息或MCL语法。已有Agent持久配置不会自动新增导入。

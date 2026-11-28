@@ -33,6 +33,7 @@ default = [
     { command = "IMPORT TOOL tool:margatroid/task-finish:dev AS task_finish", arguments = [] },
     { command = "IMPORT TOOL tool:margatroid/task-send:dev AS task_send", arguments = [] },
     { command = "IMPORT TOOL tool:margatroid/task-read:dev AS task_read", arguments = [] },
+    { command = "IMPORT TOOL tool:margatroid/task-list:dev AS task_list", arguments = [] },
     { command = "IMPORT SANDBOX sandbox:margatroid/workspace-write:dev AS workspace_write", arguments = [] },
     { command = "IMPORT SANDBOX sandbox:margatroid/read-only:dev AS read_only", arguments = [] },
     { command = "CREATE TEMP BLOCK msg (instructions, compact_prompt, compact_context)", arguments = [] },

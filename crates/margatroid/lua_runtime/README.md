@@ -106,3 +106,6 @@ URL 仅接受明确 http/https，拒绝URL内嵌账号密码和fragment。TLS必
 ## 图片预览转换
 
 `margatroid.data:image_prepare(bytes, {max_dimension?, target_bytes?, quality?})`已提供共享纯Rust图片处理，默认等比最长边1280、不放大小图，目标300KiB，opaque JPEG质量80/70/60阶梯、透明图片lossless WebP。仍超目标就进一步缩小，最小尺寸仍无法满足则明确报错。参数可显式调高，不新增隐藏预览quota。返回原始/实际尺寸、源字节数、实际预览data和media_type；不写源文件或临时文件，不依赖外部程序。此能力通过data::install同时服务Driver和工具，configure阶段不开放。read-image只把新生成预览加入工具结果，不改写已有历史图片。测试覆盖真实四格式、损坏图片、保持比例/alpha、字节目标、选项校验、只读及阶段约束。
+
+
+共享任务命名空间新增严格无参 `margatroid.task:list()`，仅execute阶段可用。通过各自既有公共宿主路径验证真实来源，返回调用Agent已return且未finish任务的轻量数组(task_id/tool_name/has_unread_output/error)，不读取缓存正文或推进游标。没有当前任务集合能力时明确失败，不把Workspace或其他Agent任务默认当作当前Agent任务；工具资源封装为task_list。

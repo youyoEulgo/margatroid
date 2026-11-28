@@ -89,6 +89,8 @@ ToolTasks：通用工具任务句柄集合，tool_core公开组件
     list(&self) -> Vec<(String, ToolTaskHandle)>
         行为：
             return entries中的活任务句柄克隆
+    list_returned(&self) -> Vec<TaskListEntry>
+        行为：在同一集合更新门内按entries的task_id排序调用handle.list_entry；只保留已returned且未cleanup_complete任务，不复制output，不触发发布、消费或清理。
     snapshot(&self) -> Vec<ToolTaskSnapshot>
         行为：在TaskSetShared更新门内取得当前完整活跃集合，按task_id稳定排序；快照版本与该次读取一致。
             每项包含完整保留窗口；不调用read、不推进cursor、不清除replaced、不发送reply、不触发取消或finish。
@@ -458,6 +460,11 @@ margatroid.task:replace_output(value: LuaValue) -> Future<Output = ()>
         仅execute阶段可用，替换当前输出缓冲，cursor=0且replaced=true
         替换与读取共用短锁，不改变任务存活状态
 
+margatroid.task:list() -> Future<Output = Vec<TaskListEntry>>
+    行为：严格无参、execute阶段开放；经既有task_list公共宿主回调核对执行身份，只从当前调用Agent的ToolTasks读取list_returned。
+        无实际任务集合明确失败，不跨Agent或Workspace查询；当前任务读取时尚未return，自动不列出。空数组保留JSON数组身份。
+        不读取原调用参数或缓存正文、不推进读取cursor、清除replaced、增加revision或发送sync。
+
 margatroid.task:read_output(target: TaskReference | String) -> Future<Output = TaskReadResult>
     行为：
         仅execute阶段可用，按结构化目标读取同Workspace实际任务的增量缓冲并推进cursor
@@ -680,6 +687,8 @@ ToolTaskHandle：可克隆的任务共享句柄，公开类型
     is_cleanup_complete(&self) -> bool
         行为：
             仅内部清理等待者查询清理是否完成，不提供对外completed状态或完成缓存。
+    list_entry(&self, task_id: &str) -> Option<TaskListEntry>
+        行为：持任务shared短锁检查returned且非cleanup_complete，仅复制id、alias到tool_name及error；has_unread_output为replaced或cursor小于output长度，不克隆缓存、推进cursor或清除replaced。
     snapshot(&self, task_id: &str) -> Option<ToolTaskSnapshot>
         行为：在任务shared短锁中原子读取call_id、alias、returned、output及error，cleanup_complete则None；不改变状态和脚本读游标。
     impl Clone
@@ -743,6 +752,11 @@ ToolTaskSnapshot：活跃任务的非破坏性只读快照，公开纯值类型
     output: Vec<serde_json::Value>--当前保留的完整结构化输出窗口，不是cursor之后的增量
     error: Option<ToolError>
 
+TaskListEntry：已return未finish任务的轻量纯值
+    task_id: String
+    tool_name: String--创建任务时实际工具别名
+    has_unread_output: bool--不表示idle或完成
+    error: Option<ToolError>--JSON必有nullable
 TaskReadResult：增量查询结果
     replaced: bool--true表示本次内容替换此前展示，false表示追加
     output: Vec<serde_json::Value>

@@ -80,7 +80,14 @@ async fn invoke(
      if method=="task_return_result"{acknowledge_execution(world,&identity);}Ok(Value::Null)
    }).await
   }
-  "task_receive"=>{
+  "task_list"=>{
+    if !arguments.is_null(){return Err(failure("task.list takes no arguments"));}
+    world(sender,move|world|{validate_execution(world,&identity)?;
+     let tasks=world.get_component::<tool_core::ToolTasks>(identity.source).ok_or_else(||failure("tasks missing"))?;
+     serde_json::to_value(tasks.list_returned()).map_err(failure)
+    }).await
+   }
+   "task_receive"=>{
    let cancel=identity.cancel.clone();let input=world(sender,move|world|{validate_execution(world,&identity)?;Ok(world.get_component::<tool_core::LuaExecutionTask>(identity.source).ok_or_else(||failure("execution task missing"))?.input.clone())}).await?;
    tokio::select!{biased;_=cancel.cancelled()=>Err(failure("execution cancelled")),value=async{input.lock().await.recv().await}=>value.ok_or_else(||failure("execution mailbox closed"))}
   }

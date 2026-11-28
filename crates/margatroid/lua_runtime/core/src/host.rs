@@ -171,6 +171,7 @@ const NAMESPACE_METHODS: &[(NamespaceKind, &str, &str, bool)] = &[
         true,
     ),
     (NamespaceKind::Task, "finish", "task_finish", true),
+    (NamespaceKind::Task, "list", "task_list", true),
     (
         NamespaceKind::Task,
         "append_output",
@@ -209,14 +210,7 @@ fn callback(callbacks: &Callbacks, name: &str) -> mlua::Result<Function> {
         .cloned()
         .ok_or_else(|| unavailable(&format!("margatroid callback {name} unavailable")))
 }
-impl HostNamespace {
-    fn callback(&self, kind: NamespaceKind, key: &str) -> mlua::Result<Function> {
-        if self.kind != kind {
-            return Err(invalid_context());
-        }
-        callback(&self.callbacks, key)
-    }
-}
+
 impl Margatroid {
     pub fn install(lua: &Lua, mut definition: HostDefinition) -> mlua::Result<AnyUserData> {
         let context = definition.context.as_object_mut().ok_or_else(|| {
@@ -302,21 +296,37 @@ impl UserData for HostNamespace {
         });
     }
     fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
-        for &(kind, name, key, asynchronous) in NAMESPACE_METHODS {
+        let mut registered = std::collections::BTreeSet::new();
+        for &(_, name, _, asynchronous) in NAMESPACE_METHODS {
+            if !registered.insert(name) {
+                continue;
+            }
             if asynchronous {
                 methods.add_async_function(
                     name,
                     move |_, (object, args): (AnyUserData, MultiValue)| {
-                        let function = object
-                            .borrow::<Self>()
-                            .and_then(|host| host.callback(kind, key));
+                        let function = object.borrow::<Self>().and_then(|host| {
+                            let key = NAMESPACE_METHODS
+                                .iter()
+                                .find_map(|(kind, candidate, key, _)| {
+                                    (*kind == host.kind && *candidate == name).then_some(*key)
+                                })
+                                .ok_or_else(invalid_context)?;
+                            callback(&host.callbacks, key)
+                        });
                         async move { function?.call_async::<MultiValue>(args).await }
                     },
                 );
             } else {
                 methods.add_function(name, move |_, (object, args): (AnyUserData, MultiValue)| {
-                    let function = object.borrow::<Self>()?.callback(kind, key)?;
-                    function.call::<MultiValue>(args)
+                    let host = object.borrow::<Self>()?;
+                    let key = NAMESPACE_METHODS
+                        .iter()
+                        .find_map(|(kind, candidate, key, _)| {
+                            (*kind == host.kind && *candidate == name).then_some(*key)
+                        })
+                        .ok_or_else(invalid_context)?;
+                    callback(&host.callbacks, key)?.call::<MultiValue>(args)
                 });
             }
         }

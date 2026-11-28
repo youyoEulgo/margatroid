@@ -39,6 +39,14 @@ impl ToolExecuteResponse {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskListEntry {
+    pub task_id: String,
+    pub tool_name: String,
+    pub has_unread_output: bool,
+    pub error: Option<ToolError>,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct TaskReadResult {
     pub replaced: bool,
@@ -386,6 +394,20 @@ impl ToolTaskHandle {
             state.replaced = true;
             append_cache(&mut state, value, self.inner.cache_bytes);
             Ok(((), true))
+        })
+    }
+
+    /// Metadata-only listing does not copy or consume the output cache.
+    pub fn list_entry(&self, task_id: &str) -> Option<TaskListEntry> {
+        let state = lock(&self.inner.shared);
+        if !state.returned || state.cleanup_complete {
+            return None;
+        }
+        Some(TaskListEntry {
+            task_id: task_id.to_owned(),
+            tool_name: state.alias.clone(),
+            has_unread_output: state.replaced || state.cursor < state.output.len(),
+            error: state.error.clone(),
         })
     }
 

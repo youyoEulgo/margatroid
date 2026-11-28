@@ -1257,3 +1257,93 @@ fn test_agent_context() -> agent_core::AgentUpdateContext {
 fn test_probe<T>() -> std::sync::Arc<dyn Fn(T) + Send + Sync> {
     std::sync::Arc::new(|_| {})
 }
+
+#[test]
+fn task_list_resource_lists_only_returned_tasks_without_consuming_output() {
+    let mut f = Fixture::new();
+    f.tool("background", "function configure() return {timeout_ms=0} end function execute() margatroid.task:return_result('ready'); margatroid.task:receive() end");
+    f.tool("pending", "function configure() return {timeout_ms=0} end function execute() margatroid.task:receive() end");
+    let started = f.execute("returned-service", "background", json!({}));
+    assert!(!f.response(started).unwrap().failed);
+    let mut pending = f.execute("pending-service", "pending", json!({}));
+    let tasks = f.tasks();
+    let service = tasks.get("returned-service").unwrap();
+    service.replace(json!("retained screen")).unwrap();
+    service.set_error(ToolError::new(Kind::ExecutionFailed, "service diagnostic"));
+
+    let foreign_tasks = ToolTasks::new();
+    let (reply, _receiver) = oneshot::channel();
+    let (foreign, _input) = tool_core::ToolTaskHandle::new(
+        &ToolExecutionLimits::default(),
+        "foreign-call".into(),
+        "foreign-tool".into(),
+        reply,
+        foreign_tasks.update_context(),
+        None,
+        test_support::finish(),
+    )
+    .unwrap();
+    foreign_tasks
+        .register("foreign-service".into(), foreign.clone())
+        .unwrap();
+    foreign
+        .return_result(Ok(ToolExecuteResponse {
+            call_id: "foreign-call".into(),
+            alias: "foreign-tool".into(),
+            content: "ready".into(),
+            images: vec![],
+            failed: false,
+        }))
+        .unwrap();
+    let foreign_agent = f.app.world_mut().spawn();
+    f.app
+        .world_mut()
+        .insert_component(foreign_agent, foreign_tasks.clone());
+
+    let response = f.call("task-list", json!({}));
+    assert!(!response.failed, "{}", response.content);
+    let listed: Value = serde_json::from_str(&response.content).unwrap();
+    let entries = listed["tasks"]
+        .as_array()
+        .expect("task-list must preserve array identity");
+    assert_eq!(
+        entries.len(),
+        1,
+        "pending, foreign and the listing invocation must be absent"
+    );
+    assert_eq!(entries[0]["task_id"], "returned-service");
+    assert_eq!(entries[0]["tool_name"], "background");
+    assert_eq!(entries[0]["has_unread_output"], true);
+    assert_eq!(entries[0]["error"]["message"], "service diagnostic");
+    assert_eq!(
+        entries[0].as_object().unwrap().len(),
+        4,
+        "listing must not include cached output or invocation parameters"
+    );
+    assert!(
+        pending.try_recv().is_err(),
+        "listing cannot return a pending call"
+    );
+    let output = tasks.read("returned-service").unwrap();
+    assert!(
+        output.replaced,
+        "listing cannot consume the replacement marker"
+    );
+    assert_eq!(output.output, vec![json!("retained screen")]);
+
+    let response = f.call("task-list", json!({}));
+    let listed: Value = serde_json::from_str(&response.content).unwrap();
+    assert_eq!(listed["tasks"][0]["has_unread_output"], false);
+    assert_eq!(listed["tasks"][0]["error"]["message"], "service diagnostic");
+    assert!(tasks.read("returned-service").unwrap().output.is_empty());
+
+    tasks.cancel("returned-service").unwrap();
+    tasks.cancel("pending-service").unwrap();
+    f.removed("returned-service");
+    f.removed("pending-service");
+    let response = f.call("task-list", json!({}));
+    let listed: Value = serde_json::from_str(&response.content).unwrap();
+    assert_eq!(listed, json!({"tasks":[]}));
+    assert!(foreign_tasks.get("foreign-service").is_ok());
+    assert!(foreign_tasks.complete_cleanup("foreign-service", &foreign, None));
+}

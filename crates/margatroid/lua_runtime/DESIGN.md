@@ -277,7 +277,7 @@ Margatroid：共享Lua userdata
     workspace: agents--实时成员
     wait(agent_address: String)--根对象异步方法
     tools: 工具定义子对象--register
-    task: 运行任务子对象--return_result、finish、append_output、replace_output、read_output、send、receive
+    task: 运行任务子对象--return_result、finish、append_output、replace_output、read_output、list、send、receive
 
 HostNamespace：只读子对象
     namespace: Files | Data | Text | Process | Http | Tools | Task | Workspace | Mcl | Agent
@@ -404,6 +404,9 @@ margatroid.agent:create({node_name: Option<String>, alias: Option<String>, proje
         公共服务按Tool设计检查节点归属、准备文件、连接存储、登记记录，再发送携带已连接句柄的StartAgent等待原reply；创建的Agent绑定真实创建任务，Lua Future取消不丢失创建监督。
 margatroid:wait(agent_address: String) -> Future<()>
     行为：公共服务取得目标Agent.wake并调用agent_core::AgentWakeSlot::wait，唤醒和取消只操作相同等待代号；初次等待交接自动执行启动，Agent.ready不拥有VM。
+margatroid.task:list() -> Future<Value>
+    行为：共享namespace将严格无参调用映射task_list，执行阶段才启用。插件通过既有LuaServices或工具worker Host回调转交当前Agent的ToolTasks::list_returned，纯值数组返回，不触及任务缓存及cursor。
+
 HostNamespace::callback(name: &str) -> Result<Function, LuaError>
     行为：
         根据命名空间和固定执行身份查找冻结的回调，具体共享方法签名见Tool设计

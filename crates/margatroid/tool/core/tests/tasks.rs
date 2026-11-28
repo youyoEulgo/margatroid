@@ -655,3 +655,104 @@ async fn turn_abort_preserves_free_calls_and_other_turns() {
         assert!(!result.await.unwrap().unwrap().failed);
     }
 }
+
+#[test]
+fn returned_task_listing_is_metadata_only_ordered_and_does_not_consume_unread_state() {
+    let tasks = test_tasks();
+    let (first, _) = handle_for(&tasks);
+    let (second, _) = handle_for(&tasks);
+    tasks.register("z".into(), first.clone()).unwrap();
+    tasks.register("a".into(), second.clone()).unwrap();
+    assert!(tasks.list_returned().is_empty());
+    first
+        .return_result(Ok(tool_core::ToolExecuteResponse::aborted(
+            "call".into(),
+            "tool".into(),
+        )))
+        .unwrap();
+    second
+        .return_result(Ok(tool_core::ToolExecuteResponse::aborted(
+            "call".into(),
+            "tool".into(),
+        )))
+        .unwrap();
+    first.write(json!("x".repeat(1024 * 1024))).unwrap();
+    second.set_error(ToolError::new(
+        ToolErrorKind::ExecutionFailed,
+        "safe failure",
+    ));
+    let listed = tasks.list_returned();
+    assert_eq!(
+        listed
+            .iter()
+            .map(|row| row.task_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["a", "z"]
+    );
+    assert!(!listed[0].has_unread_output);
+    assert!(listed[0].error.is_some());
+    assert!(listed[1].has_unread_output);
+    assert_eq!(listed[1].tool_name, "tool");
+    assert!(serde_json::to_string(&listed).unwrap().len() < 1024);
+    assert_eq!(
+        first.read().unwrap().output[0].as_str().unwrap().len(),
+        1024 * 1024
+    );
+    assert!(!first.list_entry("z").unwrap().has_unread_output);
+    first.replace(json!("replacement")).unwrap();
+    assert!(tasks.list_returned()[1].has_unread_output);
+    assert!(tasks.list_returned()[1].has_unread_output);
+    let read = first.read().unwrap();
+    assert!(read.replaced);
+    assert_eq!(read.output, vec![json!("replacement")]);
+    tasks.complete_cleanup("z", &first, None);
+    assert!(first.list_entry("z").is_none());
+    assert_eq!(tasks.list_returned().len(), 1);
+    assert!(
+        serde_json::to_value(&tasks.list_returned()[0])
+            .unwrap()
+            .get("output")
+            .is_none()
+    );
+}
+
+#[test]
+fn replaced_empty_cache_is_unread_until_explicit_read() {
+    let tasks = test_tasks();
+    let (tx, _) = oneshot::channel();
+    let (handle, _) = ToolTaskHandle::new(
+        &ToolExecutionLimits {
+            cache_bytes: 1,
+            ..Default::default()
+        },
+        "call".into(),
+        "tool".into(),
+        tx,
+        tasks.update_context(),
+        None,
+        test_finish(),
+    )
+    .unwrap();
+    tasks
+        .register("empty-replacement".into(), handle.clone())
+        .unwrap();
+    handle
+        .return_result(Ok(tool_core::ToolExecuteResponse::aborted(
+            "call".into(),
+            "tool".into(),
+        )))
+        .unwrap();
+    handle.replace(json!({"too_large":"cannot fit"})).unwrap();
+    assert!(
+        handle
+            .snapshot("empty-replacement")
+            .unwrap()
+            .output
+            .is_empty()
+    );
+    assert!(tasks.list_returned()[0].has_unread_output);
+    assert!(tasks.list_returned()[0].has_unread_output);
+    let output = handle.read().unwrap();
+    assert!(output.replaced && output.output.is_empty());
+    assert!(!tasks.list_returned()[0].has_unread_output);
+}

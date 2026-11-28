@@ -922,12 +922,14 @@ async fn execute_lua(
             ("task_send", "task_send"),
             ("task_finish", "task_finish"),
             ("task_receive", "task_receive"),
+            ("task_list", "task_list"),
         ] {
             let services = services.clone();
             let identity = identity.clone();
             let method = method.to_owned();
             callbacks.set(callback,lua.create_async_function(move|lua,args:mlua::MultiValue|{let services=services.clone();let identity=identity.clone();let method=method.clone();async move{
                 let values=args.into_iter().map(|value|host::data::from_lua(&lua,value)).collect::<mlua::Result<Vec<_>>>()?;
+                if method=="task_list" && !values.is_empty(){return Err(mlua::Error::external(failure(LuaRuntimeErrorKind::InvalidRequest,"task.list takes no arguments")));}
                 let arguments=if method=="mcl_execute"{serde_json::json!({"target":values.first(),"instruction":values.get(1),"arguments":values.get(2).filter(|value|!value.is_null()).cloned().unwrap_or_else(||serde_json::json!([]))})}else if method=="task_send"{serde_json::json!({"target":values.first(),"value":values.get(1)})}else{values.first().cloned().unwrap_or(serde_json::Value::Null)};
                 let value=services.call(identity,method,arguments).await.map_err(mlua::Error::external)?;host::data::to_lua(&lua,value)
             }}).map_err(lua_error)?).map_err(lua_error)?;

@@ -60,6 +60,7 @@ async fn configure_is_metadata_only_and_identity_fields_are_readonly_copies() {
         "margatroid.tools:register({})",
         "margatroid.process:start('/bin/true', {})",
         "margatroid.task:append_output('x')",
+        "margatroid.task:list()",
     ] {
         let error = lua.load(expression).exec_async().await.unwrap_err();
         assert!(
@@ -159,6 +160,7 @@ async fn every_group_dispatches_plain_callbacks_and_rejects_wrong_capabilities()
             &[
                 "return_result",
                 "finish",
+                "list",
                 "append_output",
                 "replace_output",
                 "read_output",
@@ -173,7 +175,7 @@ async fn every_group_dispatches_plain_callbacks_and_rejects_wrong_capabilities()
             .iter()
             .map(|(_, methods)| methods.len())
             .sum::<usize>(),
-        23
+        24
     );
     for kind in [HostKind::Driver, HostKind::Tool] {
         let (lua, object) = host(kind);

@@ -1,0 +1,3 @@
+schema_version = 1
+name = "task_list"
+description = "List this Agent's returned but unfinished tool tasks, such as persistent Bash terminals, MCP servers and background subagents. Returns task_id, tool_name (the invoked tool alias), has_unread_output and error for each task. Use task_read to retrieve output, task_send to interact, and task_finish to stop a task. Listing does not read cached output or advance its shared cursor. has_unread_output=false does not mean idle or completed. Finished tasks are absent."

@@ -1,7 +1,9 @@
 use crate::sync::update_task;
 use crate::types::lock;
 use crate::{TaskChangeObserver, TaskRetireObserver, TaskSnapshotSource, TaskUpdateContext};
-use crate::{TaskReadResult, ToolError, ToolErrorKind, ToolTaskHandle, ToolTaskSnapshot};
+use crate::{
+    TaskListEntry, TaskReadResult, ToolError, ToolErrorKind, ToolTaskHandle, ToolTaskSnapshot,
+};
 use core_plugin::Component;
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -116,6 +118,14 @@ impl ToolTasks {
         lock(&self.shared.entries)
             .iter()
             .map(|(id, handle)| (id.clone(), handle.clone()))
+            .collect()
+    }
+
+    pub fn list_returned(&self) -> Vec<TaskListEntry> {
+        let _gate = lock(&self.shared.gate);
+        lock(&self.shared.entries)
+            .iter()
+            .filter_map(|(id, handle)| handle.list_entry(id))
             .collect()
     }
 

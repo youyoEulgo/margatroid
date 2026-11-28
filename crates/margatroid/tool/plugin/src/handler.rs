@@ -2112,6 +2112,33 @@ async fn run_tool_worker<R: AsyncBufRead + Unpin + Send + 'static>(
     let task_bridge = bridge.clone();
     callbacks
         .set(
+            "task_list",
+            lua.create_async_function(move |lua, arguments: mlua::MultiValue| {
+                let bridge = task_bridge.clone();
+                async move {
+                    if !arguments.is_empty() {
+                        return Err(mlua::Error::external(error(
+                            Kind::InvalidArguments,
+                            "task.list takes no arguments",
+                        )));
+                    }
+                    let value = bridge
+                        .call(|request_id| RunnerFrame::Host {
+                            request_id,
+                            method: "task_list".into(),
+                            arguments: Value::Null,
+                        })
+                        .await
+                        .map_err(mlua::Error::external)?;
+                    data::to_lua(&lua, value)
+                }
+            })
+            .map_err(lua_failure)?,
+        )
+        .map_err(lua_failure)?;
+    let task_bridge = bridge.clone();
+    callbacks
+        .set(
             "task_read_output",
             lua.create_async_function(move |lua, value: LuaValue| {
                 let bridge = task_bridge.clone();
