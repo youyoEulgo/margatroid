@@ -1,90 +1,73 @@
 # mcp-client
 
-An independent MCP protocol host. It knows nothing about Agents, tasks, Lua, ECS,
-resource installation, or tool aliases. One process owns at most one server connection.
-It never downloads or installs a server or another executable.
+`mcp-client` 是供工具资源调用的 MCP 协议进程。一个进程承载一次服务注册，
+将调用方的 JSON Lines 请求转换为 MCP JSON-RPC，通过 stdio 或 Streamable HTTP 访问服务。
+Agent 配置和工具别名由调用它的
+[mcp-register 资源](../../resources/tools/margatroid/mcp-register/dev/main.lua)处理。
 
-Build from the workspace root with `cargo build --offline --release -p mcp-client`.
-The artifact is `target/release/mcp-client`; the resource author delivers that binary
-as `mcp-register/dev/bin/mcp-client`. The host does not build it automatically.
-Run `cargo test --offline -p mcp-client` for integration tests. These require `python3`
-and use only Python's standard library, real child pipes, and loopback HTTP.
-On Linux, `cargo test --offline -p mcp-client --test host_integration` also runs the
-actual bundled Lua resource through App/ToolPlugin, copies the built MCP client into
-a temporary resource, checks concurrent routing, and verifies owner cleanup. Its
-custom test executable reuses the public tool runner entry in supervisor/worker mode;
-there is no extra product binary or dependency on a prebuilt external tool runner.
+## 构建与进程连接
 
-## Private JSON Lines protocol
+从 workspace 根目录构建：
 
-Use raw stdin/stdout pipes, with no PTY. Every request and response is a single UTF-8
-JSON object terminated by a newline. stdout contains only response objects. stderr
-contains diagnostics and server notifications; consume it independently. Each request
-must have a unique active string or integer `id`. Responses copy that id exactly and
-may arrive in any order. Do not close stdin until you intend to tear down the session:
-EOF aborts unfinished requests, kills and waits for the stdio child, kills its dedicated
-Unix process group (including descendants), and exits. No hidden request deadline is
-imposed. This is the actual final wire format:
-
-```json
-{"id":"register-1","operation":"register","server":{"transport":"stdio","command":"python3","args":["server.py"],"env":{"EXAMPLE":"value"}}}
-{"id":"register-1","result":{"tools":[{"name":"echo","description":"Echo text","inputSchema":{"type":"object","properties":{"text":{"type":"string"}}}}]}}
-{"id":"call-1","operation":"call","tool":"echo","arguments":{"text":"hello"}}
-{"id":"call-1","result":{"content":[{"type":"text","text":"hello"}],"isError":false}}
-{"id":"call-2","error":{"code":-32602,"message":"Remote validation failed","data":{"detail":"example"}}}
+```sh
+cargo build --release -p mcp-client
 ```
 
-The `env` and `args` fields default to empty. Environment entries override inherited
-process variables. A second register operation is rejected even when the first fails;
-start a new client process to retry. Calls before completed registration are rejected.
-`arguments` defaults to `{}` and must be an object. `tool` is the original remote tool
-name. Tool definitions and tools/call results are returned intact; in particular a
-remote `isError: true` remains inside `result`, while JSON-RPC errors appear in `error`
-and retain their remote code, message, and data. Discovery follows all `nextCursor`
-pages. Register returns only after initialize, initialized notification, and discovery.
+产物为 `target/release/mcp-client`。安装器将 helper 放入 mcp-register 的 `dev/bin`，
+资源从该位置启动进程，建立原始 stdin/stdout 管道并独立消费 stderr。
+每个输入和输出帧都是以换行结束的 UTF-8 JSON 对象，stdout 承载响应，stderr 承载诊断。
+调用方在会话期间保持 stdin 开启，结束时关闭输入并等待进程退出。
 
-For Streamable HTTP use the same register operation with this server object:
+## 一次注册与调用
+
+先发送 `register`，等待对应响应后再发送 `call`。以下输入使用
+[测试服务](tests/fixtures/server.py)，路径相对 workspace 根目录：
 
 ```json
-{"id":"register-1","operation":"register","server":{"transport":"http","url":"http://127.0.0.1:3000/mcp","headers":{"Authorization":"Bearer example"}}}
+{"id":"register","operation":"register","server":{"transport":"stdio","command":"python3","args":["apps/mcp-client/tests/fixtures/server.py"],"env":{"MCP_FIXTURE_ENV":"present"}}}
 ```
 
-HTTP URLs must use http or https. TLS uses native roots. Redirects are disabled.
-Requests include `Accept: application/json, text/event-stream`, JSON Content-Type,
-and, after initialization, negotiated `MCP-Protocol-Version` and any server-issued
-`Mcp-Session-Id`. Notifications require HTTP 202. Request POSTs support both ordinary
-JSON responses and incrementally decoded SSE events (comments, CRLF, fragmented UTF-8,
-and multiline `data:`). The matching response completes a POST SSE reader immediately;
-it need not wait for the server to close a persistent stream. Multiple POSTs run
-concurrently. HTTP response bodies and headers are never logged.
+注册依次执行 `initialize`、`notifications/initialized` 和完整分页 `tools/list`，
+以 `result.tools` 返回原始工具定义。注册完成后可发送：
 
-The implementation uses standard MCP JSON-RPC 2.0, proposes version `2025-06-18`, and
-accepts negotiation to `2024-11-05`, `2025-03-26`, `2025-06-18`, or `2025-11-25` for this
-basic tools subset. It advertises no optional client capabilities. Server `ping`
-requests are answered; unsupported server requests receive method-not-found. Server
-notifications are accepted without generating private stdout frames. The optional
-standalone GET notification stream, SSE reconnection/replay, DELETE session cleanup,
-legacy HTTP+SSE transport, OAuth flows, and private cancel operation are not implemented.
-A server needing those extra features requires an expanded client implementation.
+```json
+{"id":1,"operation":"call","tool":"echo","arguments":{"text":"hello"}}
+```
 
-## Budgets and failure behavior
+响应携带原请求 `id`，成功值位于 `result`，JSON-RPC 错误位于 `error`。
+远端工具结果中的 `isError` 保留在 `result` 内，远端错误的 code、message、data 原样保留。
+`id` 使用当前活动请求间唯一的字符串或整数；并发响应按实际完成顺序到达。
+`arguments` 默认 `{}`，类型要求为对象，`tool` 使用远端原始名称。
+stdio 的 `args`、`env` 默认为空；`env` 条目覆盖继承环境中的同名变量。
+重复注册返回错误，重试注册使用新进程。
 
-Frames and individual SSE events have a 128 MiB limit. Tool discovery has a 64 MiB aggregate
-budget, repeated pagination cursors are rejected, and local and remote in-flight requests
-and the stdio write queue are limited to 8192. The stdout writer is unique and its queue
-is bounded. Oversized responses produce an explicit error rather than a truncated result.
-Invalid JSON produces a null-id parse error; invalid ids produce a null-id invalid-request
-error. Duplicate active local ids or an oversized/incomplete input frame terminate the
-session with a stderr diagnostic because safe per-request attribution is impossible.
+HTTP 服务通过同一入口选择传输：
 
-Stdio writes use a separate bounded writer and never block the server reader. Remote
-EOF, malformed JSON-RPC, server process exit, and write/read failure fail every pending
-remote request. Unknown remote response ids are discarded with a diagnostic. Server
-stderr is inherited directly. HTTP request/stream failure is reported to the matching
-local request. EOF cleanup cancels HTTP work by dropping requests; it does not wait for
-an optional server DELETE response. There is no synthesized timeout; the calling Lua
-resource owns its time and cancellation policy.
+```json
+{"id":"register","operation":"register","server":{"transport":"http","url":"http://127.0.0.1:3000/mcp","headers":{"Authorization":"Bearer example"}}}
+```
 
-Transport reference: <https://modelcontextprotocol.io/specification/2025-06-18/basic/transports>.
+HTTP 接受 http/https URL，TLS 使用 native roots；请求携带 JSON 与 SSE Accept 类型，
+初始化后携带协商版本及服务返回的 session id。POST 响应支持 JSON 和增量 SSE，
+匹配响应到达即完成当前请求。通知 POST 以 HTTP 202 确认。
+协议提出版本 `2025-06-18`，接受 `2024-11-05`、`2025-03-26`、`2025-06-18`、`2025-11-25`。
 
-The Lua mcp-register resource persists its successful registration command in the target Agent initialization.custom through existing CONFIG GET/SET. Startup replays reconnect and recreate a serving task; identical instructions are not appended again. Save failure is reported as partial success while the current serving task remains alive. These policies remain in Lua; the mcp-client protocol and process have no Agent configuration responsibilities.
+## 会话边界与错误
+
+单帧和单个 SSE event 预算为 128 MiB，发现目录总预算为 64 MiB，
+本地与远端活动请求、stdio 写队列的容量各为 8192。
+JSON 解析错误返回 null-id 错误帧；重复活动 id、超限或中断的输入帧触发会话清理。
+远端进程退出、读写失败或协议错误会使所有等待中的远端请求返回错误。
+
+stdin EOF 取消活动调用并等待会话任务结束；stdio 服务的直接子进程被终止并等待，
+Unix 下同时终止其专属进程组。调用方通过资源层管理期限和取消策略。
+
+## 源码与测试导航
+
+- [main.rs](src/main.rs)：`Server` 描述传输；`Session` 管理连接、请求映射、初始化与关闭；`operation` 分派注册和调用，`main` 管理 JSON Lines。
+- [protocol.rs](tests/protocol.rs)：真实子进程管道、分页工具发现、并发乱序响应、远端错误、HTTP JSON/SSE 和 EOF 清理。
+- [server.py](tests/fixtures/server.py)：Python 标准库实现的 stdio 与 HTTP 测试服务。
+- [host_integration.rs](tests/host_integration.rs)：Linux 下通过真实 Lua 资源和 ToolPlugin 验证并发路由与 owner 清理。
+
+协议测试使用 `cargo test -p mcp-client --test protocol`，测试服务依赖 `python3`。
+传输规范参考 [MCP transports](https://modelcontextprotocol.io/specification/2025-06-18/basic/transports)。

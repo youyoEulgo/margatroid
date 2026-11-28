@@ -1,23 +1,72 @@
-# tool_plugin
+# tool_plugin：执行工具程序
 
-分组API已实现：公共能力分为files/data/text/process，Driver协调、工具定义、运行任务分别为driver/tools/task。文件类工具已移除shell-client依赖；内存、日志、取消、真实清理及System/Event契约保持不变。详见领域DESIGN与README。
+`tool_plugin` 把工具资源、Agent/Workspace 状态和沙箱策略组合为真实工具执行。
+它提供 `ToolPlugin` 与独立 `tool_runner`，使用 [tool_core](../core/README.md) 保存运行任务，
+使用 [lua_runtime_core](../../lua_runtime/core/README.md) 安装共享 Lua 宿主能力。
+依赖和 runner 构建目标见 [Cargo 清单](Cargo.toml)。
 
-独立工具执行 plugin，依赖自己的 tool core、只读 Agent/Workspace 状态、工具及沙箱资源 core，以及 mecs 和通用库。只安装同步 InitToolTasks 路由和工具执行路由，不依赖其他领域 plugin，不执行 MCL 或修改 Agent turn。
+## 接入时需要的对象
 
-`ToolPlugin::new()`、Default 使用 update schedule 和当前程序同目录的 tool_runner，支持 with_schedule、with_runner_path、with_limits；schedule仅允许UPDATE或POST_UPDATE，拒绝PRE_UPDATE及无法证明顺序的自定义schedule。安装前需要 RuntimePlugin 和 AsyncRuntimePlugin；配置校验预算并拒绝重复安装。独立二进制 tool_runner 由本 crate 提供，runner_main 是其公共启动入口。
+| 对象 | 作用 |
+| --- | --- |
+| `ToolPlugin` | 配置执行调度、runner 路径、预算和任务观察者 |
+| `ToolExecuteRequest` | 通过 `Registered` 或 `Path` 提交一次调用 |
+| `ToolTasks` | 调用宿主持有的活动任务集合 |
+| `ToolExecutionLimits` | 配置 VM 内存与输出窗口 |
+| `TaskObserverBinder` | 任务集合初始化时安装观察能力 |
+| `LuaServices` | 使用执行身份转交 MCL、Agent 与任务等业务操作 |
 
-InitToolTasks 仅在存活 Agent 上初始化空 ToolTasks，已有集合保留。执行请求在System受理时核对完整Agent Entity及Starting/Running；Some(turn)额外要求Running及当前有效回合匹配，None自由调用，显式turn不匹配时直接返回保留call_id/alias的failed中止结果，不创建任务。工具入口、选中沙箱入口及 Workspace project_root 均固定为 owned 数据后提交监督任务，不跨 await 借用 World。
+公开安装接口见 [lib](src/lib.rs)，业务服务安装入口为 `install_lua_services`，runner 入口为 `runner_main`。
 
-每次执行按alias查询当前Tools，取得记录中的schema、path及私有owner_task_id/binding，在blocking worker按path只读取Lua程序及选中策略；按Tools记录schema校验参数，文件metadata变化不隐式更新记录。owner_task_id/binding仅放执行context，不作为模型参数。worker先加载脚本并调用必需的configure(arguments, context)，通过Configured帧往返确认唯一timeout_ms存活配置（0不限时）后才开放执行能力并调用execute；总执行时间从配置确认开始，不给准备及配置阶段设置默认wallclock限时。配置阶段仍受Lua内存上限与取消约束，只允许纯计算，脚本只加载一次。ToolExecutionLimits只提供每个工具Lua VM分配器上限及每任务输出缓冲窗口，ToolTask持有Lua配置确定的唯一存活deadline，不另设RPC或清理限时。任务持有独立取消 token，ToolTasks 与监督任务克隆同一个共享句柄。正常Return和中止强制Return共享同一锁内的returned状态及唯一reply所有权，只交付一次。回合中止先清turn，再由ToolTasks::abort_unreturned同步裁决未return任务、强制回复并请求终止；已return未finish任务保持运行。
+## 跑通一次路径调用
 
-worker 在独立进程中运行 Lua。全局 instruction hook 覆盖异步 coroutine；只有Lua VM分配器受memory_bytes约束，Rust缓冲、worker其他分配和全部外部进程不受该内存限额，缓存满自动滚出旧内容；执行时间使用工具configure声明的timeout_ms，不再设置其他宿主资源配额。task_return 校验文本/图片结果并回复一次，VM 继续执行；重复 Return 记录 AlreadyReturned。task_finish 自身通过外层执行选择器退出，即使放在 pcall 内也不会继续后续 Lua 语句。自然退出而未 Return 返回 MissingReturn。
+[路径执行测试](tests/path.rs) 展示完整的最小应用：安装 `RuntimePlugin`、`AsyncRuntimePlugin`、
+`ClosurePlugin` 与 closure system，再安装 `ToolPlugin`，给执行实体挂载 `ToolTasks::new()`。
+应用把实际 runner 路径传入安装函数：
 
-版本化双向 NDJSON 协议只在 stdout 传输帧，日志走 stderr。Return、Write、Replace、Read、Send 和 Finish 均通过宿主确认；Input 保留任意 JSON 值。task_read、task_send、task_finish 只使用本 Agent 的共享集合。task_receive 异步等待输入，不持有缓存锁。覆盖及 cursor/replaced 语义由 tool core 统一实现。
+```rust
+use core_plugin::App;
+use std::path::PathBuf;
+use tool_plugin::ToolPlugin;
 
-可信 Linux supervisor 在沙箱外充当 child subreaper；被选中时通过 landstrip run -p 启动受限 worker，后端失败不会改为无限制运行。未选中策略则直接启动 worker。MARGATROID_SANDBOX_BACKEND 可指定后端，否则从 PATH 查找 landstrip。具体策略 schema 由后端校验。
+fn install_tool_plugin(app: &mut App, runner: PathBuf) {
+    app.add_plugin(ToolPlugin::new().with_runner_path(runner));
+}
+```
 
-supervisor 扫描并回收包括 setsid 后代在内的进程，完成后才发送真实清理证明。宿主同时等待 supervisor、管道和临时目录清理，才完成finish并从ToolTasks移除、释放缓存，不保存finished条目或完成缓存。TaskReadResult仅含replaced/output/error；finish后read/send/finish均返回TaskMissing，这是领域错误，不是未知宿主函数。需在finish前读完输出；is_cleanup_complete仅供内部清理等待者使用，不对外暴露completed。取消只请求退出，不 abort 监督任务。清理失败记录 CleanupFailed、完成尚未回复的调用，并保留监督能力继续清理，不先标记finished再异步清理；中止时原LLM回复仍及时交付。外部进程启动不再创建内存组或systemd scope，ToolRuntime不持有全局内存池；可信supervisor仍通过subreaper与后代扫描完成回收。本 crate 使用共享process:start原始管道、wait_any和分组任务API；package.config在执行环境初始化，os.execute/io.popen明确报错并提示process:start。shell、PTY和VT100由资源Lua及独立shell-client bin提供，宿主全局和margatroid入口不安装shell/terminal_open，不解码shell IPC。
+随后发送 `ToolExecuteRequest::Path { initiator, path, arguments, reply }` 并推进应用调度，
+从 reply 读取结果，继续等待任务集合清空；测试同时演示真实 schema 校验。
+注册入口的调用、原调用 ID 和 alias 关联见 [执行测试](tests/execution.rs)。
+`ToolPlugin::new()` 选择当前程序同目录的 runner；`with_schedule` 接受 UPDATE 或 POST_UPDATE。
+`with_limits` 配置预算，`with_task_observer` 配置任务观察者。
 
-测试位于 tests，使用真实 runner 进程和资源文件，覆盖 Return 后交互、Finish、自身控制退出、跨任务访问、turn受理、唯一reply裁决、程序按次读取、Tools缓存schema、预算、图片、超时、setsid 后代清理和后端失败关闭。
+## 一次执行的所有权交接
 
-动态注册使用{agent?,tools}，工具项lifetime={agent?,task_id}绑定实际任务作用域。任务持有Weak World精确撤销动作，工具集合持有解绑凭证；取消/结束关闭作用域，Return不关闭，不扫描或取消其他已受理调用。context注入真实Workspace信息和agent_info.address，workspace:agents实时查询成员，跨Agent任务操作均在既有World闭包核对当前调用身份及同Workspace目标。
+1. System 校验执行实体和可选 turn，取得工具记录、程序路径、工作目录及选中策略的 owned 数据。
+2. 注册任务并启动监督器；worker 加载 Lua，调用 `configure(arguments, context)`。
+3. worker 通过 Configured 协议等待宿主确认 `timeout_ms`，然后开放能力并运行 execute。
+4. Return 帧交付原调用结果；Write/Replace、输入和宿主请求继续服务活动任务。
+5. 结束时监督器回收 worker、后代、管道与临时资源，再通过 core 完成移除。
+
+协议帧经 stdout 的双向版本化 NDJSON 传输，诊断使用 stderr；相关实现入口见 [handler](src/handler.rs)。
+`return_result` 保留任务存活，自身 `finish` 通过执行控制结束 Lua，结束其他任务则等待实际清理。
+配置确认后的任务 deadline 覆盖执行与后续交互，零表示持续存活；预算说明见 [配置测试](tests/configuration.rs)。
+
+## 来源身份与业务能力
+
+工具的真实资源路径、任务实例和 binding 由宿主放入 context，参数按该工具 schema 解释。
+`install_lua_services` 建立带 `LuaExecutionIdentity` 的服务边界，在 World 闭包中核对来源与目标。
+动态注册项通过实际 `TaskScope` 绑定生命周期；作用域结束撤销工具定义，已受理调用继续独立收口。
+Agent 创建的存储、启动回复与子 Agent 关闭由同一次任务监督，入口见 [services](src/services.rs)。
+日志和执行故障沿宿主诊断能力记录：绑定 Agent 的记录使用 AgentStorage，其余执行使用 tracing。
+[诊断测试](tests/diagnostics.rs) 展示来源关联、原始 traceback 保存与调用方错误结果。
+
+## 平台与后续导航
+
+Linux 工具监督器支持真实后代回收，选中 Landstrip 0.22.5 沙箱时使用 container 后端。
+
+- 完整 Return、Send、Read、Finish 交互：[执行测试](tests/execution.rs)。
+- 沙箱启动及安全诊断：[runner 测试](tests/runner.rs)。
+- 实际文件、终端与 task-list 工具：[资源集成测试](tests/bundled.rs)。
+- worker 内 HTTP 请求：[HTTP 测试](tests/http.rs)。
+- VM 分配器与外部进程生命周期：[内存测试](tests/memory.rs)。

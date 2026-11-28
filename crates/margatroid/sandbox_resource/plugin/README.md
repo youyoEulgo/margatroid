@@ -1,15 +1,49 @@
 # sandbox_resource_plugin
 
-负责 `sandbox_resource_core::ImportSandbox` 的异步校验及路径发布，不依赖 address、Agent 或其他资源领域。调用方负责地址定位、资源类型匹配和跨类别 alias 唯一性。
+本 crate 异步校验 `ImportSandbox` 指定的策略文件，并向 owner 的 `Sandboxes` 发布规范路径。
+调用入口负责地址解析、资源种类检查及跨类别 alias 协调。
 
-公共入口 `SandboxResourcePlugin::new()` 与 Default 使用 update schedule，支持 `with_schedule(schedule)`、`with_limits(SandboxReadLimits)`。安装前需要 RuntimePlugin、AsyncRuntimePlugin 和目标循环 schedule；拒绝重复安装，不要求安装 ClosurePlugin。
+## 主要对象
 
-请求先认领唯一 oneshot 回复端，校验完整 owner、identifier alias 和取消状态。alias 首字符为 ASCII 字母或下划线，其余允许 ASCII 字母、数字、下划线和短横线。路径必须为无父目录跳转的绝对路径。
+| 对象 | 用途 |
+| --- | --- |
+| `SandboxResourcePlugin` | 公开插件入口，配置 schedule 与策略读取预算 |
+| `ImportSandbox` | core 提供的导入事件和唯一回复协议 |
+| `SandboxReadLimits` | `with_limits` 接受的策略字节预算 |
+| `SandboxObserverFactory` | 装配方提供的 owner 列表和选择变化回调工厂 |
+| `ImportSandboxReply` | 共享 oneshot sender，发送 `Result<(), SandboxResourceError>` |
+| `Sandboxes` | 成功导入后可查询的 alias 与规范路径集合 |
 
-私有 ImportContext、ImportOutput、ImportError 位于 types。System 仅路由 Import 请求和 Result 校验结果，Handler 提交异步服务，在 spawn_blocking 中规范化路径、调用 core 同步读取并丢弃本次正文。异步服务等待真实 JoinHandle 完成后发送 Result 并唤醒 ECS，不提前返回取消结果或脱离读取任务。
+## 最小导入流程
 
-Handler 收到结果后再次核对完整 owner 和 cancel，成功时从sandbox_resource_core::SandboxObserverFactory取得通用列表回调，创建缺失的Sandboxes，再更新单个alias规范路径，其他条目保持不变，然后回复原 oneshot。失败保持旧条目；原 index 被复用也不会向新 Entity 发布迟到结果。不同请求的同 alias 顺序由调用入口串行协调。
+[导入测试](tests/imports.rs) 的 `app`、`import_request`、`finish` 展示真实异步流程：
 
-导入只保存路径。每次使用由对应 core 的同步读取函数重新读取，使用方安排 blocking worker 并等待完成。测试位于 tests，使用真实异步运行时覆盖更新、失败保留、取消、Entity generation、唯一回复、预算、自定义 schedule、路径规范化及安装约束。
+1. 创建 `App`，插入 `SandboxObserverFactory`，依次安装 `RuntimePlugin`、`AsyncRuntimePlugin` 和 `ClosurePlugin`，为 `RuntimePlugin::UPDATE` 调用 `add_closure_system`。
+2. 安装 `SandboxResourcePlugin`，创建 owner，准备绝对策略路径和 alias。
+3. 创建 oneshot channel，包装 sender 为 `Arc<Mutex<Option<_>>>`，构造 `ImportSandbox`。
+4. 调用 `world.emit_event(request)`，持续驱动 App 并接收最终结果。
+5. 成功后通过 owner 的 `Sandboxes` 或 `sandbox_path` 取得登记路径。
 
-ObserverFactory由装配方作为core Resource提供，plugin不依赖client_core或其他业务plugin的绑定类型；仍在原有导入结果入口完成发布和唯一回复，不增加同步事件。该说明对应当前源码，不表示运行服务已经更新。
+`new` / `default` 使用 `RuntimePlugin::UPDATE`，`with_schedule` 选择已注册闭包执行器的循环 schedule，
+`with_limits` 设置策略预算。插件安装检查运行时、唯一安装和 schedule，配置错误触发断言。
+发布时创建 `Sandboxes` 需要 `SandboxObserverFactory` Resource；装配方在处理请求前提供它。
+
+## 校验与完成语义
+
+导入 alias 首字符为 ASCII 字母或下划线，后续支持 ASCII 字母、数字、下划线和短横线。
+入口采用绝对路径，父目录跳转返回 `InvalidPath`。策略支持 UTF-8 JSON 对象，
+读取预算及错误分类见 [core 文档](../core/README.md)。
+
+Handler 认领回复端后提交异步服务，blocking worker 规范化路径并调用 `read_sandbox`。
+服务等待 worker 完成，ECS 结果入口再次检查完整 Entity 与取消状态。
+成功时取得 owner 的通用列表回调，创建所需集合，再插入单个 alias 并回复。
+同 alias 成功导入会替换路径；失败保留原有条目。集合保存规范路径，策略正文属于本次校验材料。
+选择与后续活动读取使用 core 的独立接口。
+
+## 接口参考
+
+- [公开插件及安装检查](src/lib.rs)。
+- [Handler](src/handler.rs)：worker、工厂绑定、发布、取消与回复守卫。
+- [System](src/system.rs)、[内部类型](src/types.rs)：事件路由与异步结果。
+- [真实异步导入测试](tests/imports.rs)：路径替换、失败保留、预算和 Entity generation。
+- [领域设计](../DESIGN.md)。

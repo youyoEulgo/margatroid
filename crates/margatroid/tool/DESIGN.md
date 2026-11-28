@@ -264,14 +264,22 @@ run_runner(context: &mut ToolExecutionContext, request: RunnerRequest, policy: O
         清理失败保持监督，不以丢弃Future或收到Return冒充清理成功。
         Return不是进程终态；Stopped(cleanup_proven=true)、child.wait及writer/diagnostics实际join全部完成才作为执行清理证明。无证明时持续保留监督，不complete_cleanup。
 
+sandbox_diagnostic(bytes: &[u8]) -> Option<SandboxDiagnostic>
+    行为：只解析Landstrip空行分隔key=value诊断，接受internal/launch/usage及固定启动错误code白名单；message映射为预定义安全短句，不回显路径、URL、认证信息或任意工具stderr。
+diagnostic_drain<R: AsyncRead + Unpin>(pipe: R) -> Future<Output = Result<Option<SandboxDiagnostic>, ToolError>>
+    行为：并发持续排空真实stderr，仅保留最后8192字节用于EOF时识别安全启动故障，不创建日志存储；任意长诊断不阻塞stdout协议。
+with_sandbox_diagnostic(result: Result<(), ToolError>, diagnostic: Option<SandboxDiagnostic>) -> Result<(), ToolError>
+    行为：仅附加安全code与固定分类说明至已有失败，取消/超时不覆盖；正常结果不因stderr或权限拒绝记录而变失败。
+
 supervisor_main(args: Vec<OsString>) -> Future<Output = i32>
     行为：
         Linux入口安装child subreaper，解析可选sandbox参数，校验私有请求协议和Lua限额。
-        直接构造worker或sandbox run -p policy -- worker命令，不调用内存入组入口。
+        直接构造worker或sandbox命令；Linux受限命令明确为landstrip run --backend container -p policy -- worker，避免auto选择KVM，其他平台不传Linux后端选项。不调用内存入组入口。
+        worker stderr独立piped并由diagnostic_drain并发读取，不写入stdout协议；后代清理、worker实际wait及管道结束后，只有已选择沙箱且Configured尚未到达的失败才附加安全启动原因，经原Stopped回复与日志链交付。
         传递Configured与原host/worker协议，等待终结结果、取消或退出信号。
         扫描、终止并回收全部后代，包括setsid和双重fork后代，等待worker及输出管道结束。
         只有真实清理完成才发送Stopped(cleanup_proven=true)，无内核OOM内存组状态映射。
-        非Linux入口保持既有不可用行为，本次不新增跨平台进程回收实现。
+        cfg(not(target_os="linux"))入口直接返回3，尚无对应平台的进程回收实现。
 
 run_tool_worker(request: RunnerRequest) -> Result<(), ToolError>
     行为：
@@ -553,6 +561,10 @@ TaskFinish注入闭包：每次执行的独立清理能力
         持cleanup异步锁，已清理直接成功，否则等handle.wait_execution_ended并要求cleanup_proven；无runner清理证明返回CleanupFailed并保留任务。
         调用services::finish_task等待在途Agent创建并释放诊断/调用登记，再finish_children及retry_cleanups，全部成功才tasks.complete_cleanup。
         清理失败set_error并回复；下一次finish重新执行尚未完成清理，不缓存失败结果，不重跑工具业务。
+SandboxDiagnostic：plugin私有安全启动诊断
+    code: &'static str
+    message: &'static str
+    行为：仅持白名单code及固定说明，不保存原始stderr，非网络DTO。
 ToolContext：发送给工具worker的纯值
     agent_name: String
     agent_address: String

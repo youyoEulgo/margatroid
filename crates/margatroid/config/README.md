@@ -1,6 +1,18 @@
 # Config
 
-config_core定义MargatroidConfig和配置值，只依赖mecs及通用库。config_plugin读取并校验config.toml，安装Resource，不依赖其他领域core或plugin，不创建System、查询事件或文件监听。
+Config 领域提供 daemon 启动时使用的服务器入口、日志和工具容量配置。
+文件入口读取 `config.toml`，校验后形成 `MargatroidConfig`，
+由应用装配为 World Resource，供服务器和工具执行设施取值。
+
+## 核心概念
+
+- `MargatroidConfig` 是校验后的启动配置快照。
+- `IngressPolicy` 表达回环、全部地址或 IP/CIDR 列表策略，并检查 Origin 与 Host。
+- `LogLevel` 与可选 filter 提供日志装配参数，filter 指定时作为完整过滤表达式。
+- `FileToolConfig` 保留配置文件中的可选容量，compose 补齐工具领域默认值。
+- `ConfigPlugin` 负责文件读取和 Resource 安装。
+
+## 配置一个本地实例
 
 ```toml
 [server]
@@ -15,20 +27,24 @@ lua_vm_memory_limit = "2G"
 task_output_buffer_window = "128M"
 ```
 
-ConfigPlugin::open在启动阶段读取，build只发布已校验值。filter若提供须非空，完整替代level；tracing表达式由应用装配日志设施时校验。未绑定Agent的诊断直接使用tracing；日志级别及过滤器继续生效。
+`server.bind` 为 IP 与端口组成的 SocketAddr。allow 默认 localhost，
+也支持 all 和 IP/CIDR 字符串数组；回环 bind 配合回环入口策略。
+请求带 Origin 时按 HTTP(S) 协议、主机名与有效端口检查同源。
 
-allow缺省localhost，支持all或IP/CIDR数组；回环bind不能搭配放行非回环的策略。带Origin的请求要求Host同源。状态、任务和记录同步统一交付注册的webui客户端，不再提供出站目标配置。入口策略不等于客户端身份认证。
+日志级别默认 info，支持 off、error、warn、info、debug、trace。
+filter 采用含有效字符的字符串，tracing 表达式语法由应用日志装配校验。
+工具容量使用正整数容量字符串，K/M/G/T 按 1024 进制，可附 B 或 iB。
+工具默认值由工具领域提供：Lua VM 2 GiB，任务输出窗口 128 MiB。
+前者约束工具 VM 分配器，后者控制宿主保存的任务输出窗口。
 
-模型路由归Inference，Workspace路径及统一定义/启动缓存归Workspace，Agent setting.toml归Storage。Config不复制这些定义或充当万能配置表。Config不保存或转换客户端选择器。整体重载不在此定义独立流程。
+应用启动时调用 ConfigPlugin::open，再安装快照；修改配置后重启 daemon 加载新值。
+具体调用见 [config_plugin](plugin/README.md)，程序构造见 [config_core](core/README.md)。
 
-`[tools]` 接受两个容量字符串：`lua_vm_memory_limit` 默认 2 GiB，`task_output_buffer_window` 默认 128 MiB。整个段或任意字段均可省略，compose 只从工具领域的 `ToolExecutionLimits::default()` 补齐默认值。单位后缀大小写不敏感，按 1024 进制解释：`K/M/G/T`，可选 `B` 或 `iB`（例如 `2G`、`128MiB`）；也可使用不带后缀的正数字节数。序列化使用可无损表达的最大单位。只接受正整数容量字符串，零、负数、小数、未知单位、整数类型及溢出均拒绝。旧的 `[tools.limits]`、`memory`、`cache` 和字节命名字段严格拒绝。
+## 开发导航
 
-`lua_vm_memory_limit` 只限制每个工具Lua VM的分配器，覆盖顶层加载、configure和execute。它不限制宿主Driver VM，也不限制Rust缓冲、helper、Bash、MCP服务或其他外部子孙进程。已删除进程树总额度及total_task_memory_limit字段，不再创建内存cgroup或systemd scope，也不保留旧字段兼容。
+- [文件读取与安装](plugin/README.md)：TOML、错误和启动调用。
+- [配置值与入口判断](core/README.md)：程序化构造和 IngressRequest。
+- [compose](../compose/README.md)：把文件容量转换为工具执行限额。
+- [设计](DESIGN.md)：配置对象和职责关系。
 
-`task_output_buffer_window` 是每个任务在宿主中保留的输出窗口，超限自动滚出旧内容，不是最终返回结果的容量上限，与Lua内存限额独立。工具 timeout 继续由工具 configure 配置。
-
-配置在启动时读取；修改数据目录中的 `config.toml` 后重启 daemon 即生效，无需重新编译。config_core 只持有自有 `FileToolConfig`，不依赖工具领域也不复制工具默认值；compose 转换并校验完整预算后才安装 ToolPlugin。配置失败保留配置文件路径，程序化零值错误标明对应的 `tools` 字段路径。
-
-单VM内存配置名称为lua_vm_memory_limit，旧task_memory_limit和total_task_memory_limit均明确报未知字段；不提供别名或静默忽略。工具内部对应字段为lua_vm_memory_bytes。
-
-[outbound]及logs/backend_state字段已删除，旧配置段会明确报未知字段；使用新程序前请从自己的config.toml移除整个[outbound]段，保留server/log/tools。本次源码修改不自动编辑用户主目录配置。
+运行 `cargo test -p config_core -p config_plugin` 验证配置值与文件解析。

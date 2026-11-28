@@ -1,32 +1,46 @@
 # Tool Resource
 
-本轮共享Client槽位、统一写入口与异步监控已实现，尚未提交。具体函数和边界见本领域DESIGN及[DTO说明](../dto/README.md)；运行进程需使用新构建。
-tool_resource_core定义工具记录集合、文件读取方法、导入事件和错误，目标通过client_core共享发送能力连接网络，仍不依赖DTO或服务器plugin。tool_resource_plugin负责异步校验和记录登记，不依赖其他领域plugin，也不让core依赖address或其他领域core。
+工具资源将磁盘上的工具定义登记到实体的 `Tools` 集合，供推理和工具执行方按 alias 查询。
+开发入口按用途分为 [core](core/README.md) 与 [plugin](plugin/README.md)。
 
-## 导入与路径
+## 核心对象与资源结构
 
-调用方plugin校验资源种类、Driver依赖和跨类别alias冲突，通过address定位tool.toml后发送ImportTool。本插件校验文件，成功在Tools中登记alias对应的完整ToolEntry，保存规范路径、description及input_schema，owner_task_id与binding为None；不保存来源定位字符串或程序正文。
+| 对象 | 用途 |
+| --- | --- |
+| `ToolInput` | 一次读取产生的描述、schema、Lua 文本和规范入口路径 |
+| `ToolEntry` | 登记后的定义、入口路径及任务绑定信息 |
+| `Tools` | 实体上的 alias 集合与注册生命周期凭证 |
+| `ImportTool` | 携带 owner、路径、取消令牌和回复端的导入请求 |
+| `ToolResourcePlugin` | 调度异步文件校验并发布登记结果 |
 
-MCL对同一目标的IMPORT串行受理，跨类别alias唯一性由MCL入口协调；各资源core只管理自己的集合，不新增通用绑定表或资源注册表。重复alias返回AliasConflict，不覆盖原记录；取消、目标失效或校验失败保留旧记录；发布成功后才通过原oneshot回复，不发送导入结果观察事件。
+一个工具目录包含以下文件：
 
-## 导入定义与执行程序
+```text
+sample/
+  tool.toml          # schema_version = 1；description 为有效描述文本
+  input.schema.json  # JSON Schema 对象，支持 # 开头的内部引用
+  main.lua           # UTF-8 程序文本
+```
 
-read_tool在导入校验时从入口路径读取tool.toml、input.schema.json和main.lua；推理直接使用已登记的定义。执行时按已登记path只读取main.lua。校验清单版本、非空描述、JSON对象schema及Lua文件UTF-8；schema拒绝外部引用；不执行Lua。读取发生在blocking worker，使用方等待真实完成，不阻塞ECS线程。导入时校验不保证日后程序仍存在或合法；执行时重新读取程序，失败明确报错。文件metadata变化不会隐式改写已登记描述或schema。
+`read_tool` 在 core 中完成文件读取和定义校验，包括 JSON Schema 编译检查。
+导入后，集合保存描述和 schema；后续读取集合直接取得登记时的定义。
+Lua 文本属于本次读取结果，执行流程由 [Tool 领域](../tool/README.md) 承担。
 
-工具描述和schema在导入时读取并登记，供推理直接遍历Tools记录；程序在实际执行调用时重新读取。文件后续变化不改变Tools中的描述及schema。工具执行方用当前Tools记录的schema校验实际参数。
+## 最小调用流程
 
-## 职责
+1. 调用入口解析资源地址，准备存活实体、合法 alias 与绝对入口路径。
+2. 安装运行时和 `ToolResourcePlugin`，发送 `ImportTool`。
+3. plugin 的 blocking worker 调用 `read_tool`，等待读取完成后交回规范路径、描述和 schema。
+4. ECS 结果入口复核 owner 与取消状态，通过 `Tools::insert` 原子登记，再回复 `Result<(), ToolResourceError>`。
+5. 使用方通过 `WorldToolResourceExt::tool_entry` 或 `Tools::get` 取得定义。
 
-本领域登记工具记录、解析工具文件；进程、Lua运行、沙箱和工具调用结果归tool执行领域。集合保存BTreeMap<String, ToolEntry>，不使用ResourceID、LibraryComponent或通用ResourceSet；加载后的临时值不再携带资源身份。路径用于打开文件，不代替沙箱与文件访问检查。
+相同 alias 的再次登记返回 `AliasConflict`。动态工具注册使用同一个 `Tools` 集合，
+通过 `RegistrationId` 与 guard 精确管理任务生命周期；请求结构和集合接口见 core 文档。
+跨类别 alias 协调与资源地址解析由调用入口承担。
 
-异步校验返回Result<ImportOutput, ImportError>，既有异步闭包通过ImportTaskError承载校验与运行设施错误；System只路由，Handler负责发布及oneshot回复。所有结果保留原owner Entity，迟到结果不写入复用index的新实体。文件读取失败报告alias、实际路径和底层原因，不回显文件正文。
+## 接口导航
 
-## 统一工具记录
-
-IMPORT校验资源后只向Agent.Tools增加一条记录，保存description、input_schema及path；每次推理直接遍历这些记录构造schema，工具调用按名称查询并使用记录中的schema，程序按path读取。普通导入和动态注入使用同一结构，没有第二份工具集合或选择清单。
-
-动态注入由tool_plugin通过现有宿主帧和World闭包调用Tools.insert_registered_batch；入口路径由宿主固定，lifetime指定实际Agent任务，缺省不绑定发起任务，binding作为工具自己的不透明数据传入执行context。Tools.insert与insert_batch校验alias、绝对路径、非空描述和schema；整批出现无效定义或alias冲突则原子失败；指定所有者任务清理时移除属于它的入口，不级联清理调用任务；静态入口随Agent.Tools存在。ToolResource不增加注入System或事件，进程通信和任务清理仍属Tool领域。
-
-工具集合构造必须绑定UpdateProbe，普通导入和动态注册共用insert_batch原子入口，任务关闭按alias和RegistrationId精确revoke；成功变动调用publish_current。完整校验成功且集合变化后同步维护Agent公共Tools视图并直接发布agent.sync；失败和只读查询不发布，不能留下直接可变entries旁路。
-
-本轮已实现：Lua工具注册使用{agent?, tools}，每项lifetime={agent?, task_id}独立指定任务生命周期；后端任务持有精确撤销句柄，关闭拒绝新绑定并主动注销，Return不关闭，不终止已受理工具调用。跨Agent操作限当前Workspace，环境提供workspace固定信息与实时agents查询。具体Rust接口已对齐设计，不新增System或同步事件。
+- [core 使用说明](core/README.md)：同步读取、集合与注册对象。
+- [plugin 使用说明](plugin/README.md)：安装前提、导入请求与完成语义。
+- [设计对应](DESIGN.md)：领域结构及函数行为。
+- [读取与集合测试](core/tests/resources.rs)、[异步导入测试](plugin/tests/imports.rs)：真实文件和 ECS 调用流程。

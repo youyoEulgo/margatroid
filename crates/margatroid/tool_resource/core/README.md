@@ -1,15 +1,53 @@
 # tool_resource_core
 
-独立领域 core，只依赖 `core_plugin` 和通用库；不依赖 address、其他领域 core 或 plugin。
+本 crate 提供工具文件读取、实体工具集合和导入协议，依赖 `core_plugin` 与通用库。
+文件 I/O 的入口是同步函数 `read_tool`；异步调用方将它安排在 blocking worker。
 
-`Tools`使用私有entries和registrations保存公开定义与唯一生命周期凭证，不可Clone。new要求同步UpdateProbe，get/iter过滤已关闭作用域，insert/insert_batch/insert_registered_batch共用整批校验和提交入口；remove按alias删除，revoke按alias及RegistrationId精确撤销，不再按owner扫描。目标集合销毁或主动删除时，guard释放并解除任务侧登记。TaskScope由tool_core持有，跨领域只用类型擦除的guard和Weak可用性回调，不建立tool_resource_core到tool_core的依赖。
+## 主要对象
 
-ToolEntry增加可信owner_agent，与owner_task_id共同描述生命周期任务；二者只由宿主实际解析lifetime得到。Lua RegisterToolsRequest使用agent和tools，InjectedToolDefinition使用alias、description、input_schema、可选lifetime及binding；旧owner_task_id输入明确拒绝。WorldToolResourceExt保持按完整Entity/alias只读借用，不访问文件系统。
+| 对象 | 用途与入口 |
+| --- | --- |
+| `Tools` | `new` 创建集合，`observe` 绑定变化回调，`get` / `iter` 查询可用条目 |
+| `ToolEntry` | 保存入口路径、描述、schema、任务归属和 binding，字段见 [types](src/types.rs) |
+| `ToolInput` | `read_tool` 返回的临时读取材料，包含程序文本 |
+| `RegistrationId` / `RegistrationBinding` | 唯一注册凭证、guard 和可用性回调 |
+| `RegisterToolsRequest` | 动态工具请求；每项 `lifetime` 用 `TaskReference` 指定任务 |
+| `WorldToolResourceExt` | 按完整 Entity 与 alias 借用 `tool_entry` 或 `tool_path` |
+| `ImportTool` | 异步导入事件，共享可认领一次的 oneshot 回复端 |
 
-`read_tool(path)` 是不额外限制文件字节数的同步读取函数，供使用方在 blocking worker 调用。该函数用于导入校验，返回描述及schema后由Tools保存；已返回的临时材料不受之后文件变化影响。读取入口 TOML、同目录 `input.schema.json` 与 `main.lua`，要求 `schema_version = 1`、非空 description、合法 JSON 对象 schema 和 UTF-8 Lua 文本。允许内部 schema 引用，禁止外部引用；返回校验后的工具定义及程序文本，不执行 Lua。执行方按记录path只读取main.lua，不重读清单或schema；文件metadata变化不会隐式改写Tools记录。
+## 最小读取流程
 
-读取入口通过 canonicalize 定位真实普通文件。相邻依赖的真实路径必须仍在入口父目录内。完整读取各文件并校验 UTF-8；分别返回 FileMissing、InvalidPath、InvalidUtf8、InvalidDefinition、ReadFailed，错误携带实际路径，解析失败不回显文件正文。调用方负责文件使用权限及使用时路径策略。
+准备包含有效清单、schema 和 Lua 文本的工具目录，然后调用：
 
-`ImportTool` 是携带完整 owner、alias、入口 path、CancellationToken 和共享 oneshot 回复的事件。core 只定义协议；异步校验和发布集合条目由 plugin 负责。同一请求的克隆共享一个可认领的回复端。
+```rust
+use std::path::Path;
+use tool_resource_core::{read_tool, ToolResourceError};
 
-`ToolResourceError` 公开 kind、path、message，提供 new 和 with_path。临时输入类型定义在 types 模块并于 crate 根导出。测试全部在 tests 目录，覆盖集合更新、Entity generation、回复唯一性、按次读取和边界校验。
+fn description(entry: &Path) -> Result<String, ToolResourceError> {
+    let input = read_tool(entry)?;
+    Ok(input.description)
+}
+```
+
+读取器规范化入口并确认普通文件，读取同目录的 `input.schema.json` 与 `main.lua`。
+相邻文件的真实路径须位于入口父目录内，所有文件采用 UTF-8。
+清单要求 `schema_version = 1` 和包含有效文本的 `description`；schema 要求 JSON 对象，
+支持内部引用，并通过 `jsonschema` 编译校验。外部引用返回 `InvalidDefinition`。
+
+## 登记与生命周期
+
+`insert`、`insert_batch` 和 `insert_registered_batch` 共用整批校验入口，检查 alias、
+绝对路径、描述及 schema；整批校验成功后提交集合并调用 `publish_current`。
+重复 alias 返回 `AliasConflict`。`remove` 按 alias 移除，`revoke` 按 alias 与注册 ID 精确撤销。
+`get` 和 `iter` 根据注册的可用性回调筛选条目，guard 随登记移除或集合销毁而释放。
+
+动态请求通过 `agent` 选择目标，每项 `lifetime` 记录任务引用；宿主解析后生成
+`ToolEntry` 的任务归属字段和 `RegistrationBinding`。具体字段以 [类型声明](src/types.rs)
+及 [集合实现](src/components.rs) 为准。
+
+## 接口参考
+
+- [crate 导出与读取实现](src/lib.rs)：`read_tool`、World 扩展及 schema 校验。
+- [导入事件](src/events.rs)、[错误类型](src/error.rs)：`kind`、`path`、`message` 和回复协议。
+- [真实文件与集合测试](tests/resources.rs)：可执行用例和边界输入。
+- [异步导入方](../plugin/README.md)、[领域设计](../DESIGN.md)。

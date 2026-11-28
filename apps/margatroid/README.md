@@ -1,48 +1,70 @@
-# Margatroid
+# margatroid 应用入口
 
-margatroid是统一应用入口，定位~/.margatroid，调用Compose装配并运行App。配置读取由各领域负责，daemon不处理协议或定义业务System。
+`margatroid` 包把 Compose 装配结果作为服务进程运行，并提供安装器入口。
+维护应用启动、信号处理和安装行为时，从本包进入；领域装配见
+[compose](../../crates/margatroid/compose/README.md)，使用与安装步骤见[项目 README](../../README.md)。
 
-```text
-~/.margatroid/
-├── config.toml
-├── models.toml
-├── agent-drivers/
-├── tools/
-├── prompts/
-├── sandboxes/
-└── workspaces/<workspace>/
-    ├── workspace.yaml
-    └── agents/<agent>/
-        ├── state.sqlite
-        ├── setting.toml
-        └── state.sqlite.blocks/
-            └── <block>/
-                ├── timeline.sqlite
-                └── snapshot_<id>.sqlite
+## 两个可执行入口
+
+[Cargo.toml](Cargo.toml) 声明两个 binary：
+
+- `margatroid`：定位数据目录、创建资源目录、调用 `build_app`，持续推进应用运行与关停。
+- `margatroid-install`：接收 checkout 路径，安装构建产物、配套资源与初始配置。
+
+服务入口从 Unix 的 `HOME` 或 Windows 的 `USERPROFILE` 取主目录，使用其中的
+`.margatroid`，并将当前可执行文件路径交给 `ApplicationOptions.runner_path`。
+启动时建立 `workspaces`、`agent-drivers`、`prompts`、`sandboxes` 和 `tools` 目录；
+配置由 Compose 装配的领域读取。主目录变量缺失、配置读取失败或装配失败时返回错误。
+[config.example.toml](config.example.toml) 展示监听地址、来源和日志等级配置。
+
+## 一次服务运行
+
+从 workspace 根目录构建并启动：
+
+```sh
+cargo build --release -p margatroid
+./target/release/margatroid
 ```
 
-定义加载目标统一为全量重载并发布缓存，不自动启动所有Workspace。Workspace及Agent启动/重启前先完成同一全量重载，再从本次缓存快照选择定义及成员参数；重载失败不启动，不以旧缓存兜底，也不单独回源某个Workspace。
+准备好的数据目录包含 `config.toml`、`models.toml` 以及所需资源定义。
+`run` 创建 App、取得 `AxumHandle` 与 `RuntimeHandle`，随后进入 `run_until`。
+Axum 成功绑定后，启动提示通过 tracing 输出实际监听地址、Web UI 和 `/ws` 地址。
+监听端口为 `0` 时提示使用实际分配端口；通配监听地址的浏览器链接使用相应回环地址。
 
-Workspace拥有专属线程，Agent和Lua分别管理生命周期和VM退出；停止遵守活动真实收口、VM退出、线程join的顺序。进程退出或连接断开不自动等价于业务清理完成。
+Unix 的 SIGINT、SIGTERM，以及其他平台的 Ctrl+C，设置停止标记并唤醒运行循环。
+退出循环后，入口反复等待 `compose::shutdown_app` 完成领域清理；清理期间继续监听信号。
+领域清理错误进入诊断与继续监督流程，Axum 最终错误在领域收口后作为进程错误返回。
+完整时序见 [main.rs](src/main.rs) 与[关停测试](tests/shutdown.rs)。
 
-DTO原生WebSocket读取后提交DtoRequest，回合中止通过专属控制事件直接进入PRE_UPDATE。Inference在单通道出口累积并推流，中止受理冻结内容，真实清理后才回复。前端静态资源编译期嵌入，修改UI后必须重新构建并编译daemon。
+## 工具 runner 模式
 
+首个参数为 `--margatroid-tool-supervisor` 或 `--margatroid-tool-worker` 时，
+入口创建单线程 Tokio runtime 并交给 `tool_plugin::runner_main`，以其返回值作为退出码。
+Linux supervisor 接受 `--margatroid-tool-supervisor --sandbox <backend> <policy>`，
+worker 使用 `--margatroid-tool-worker`；参数解析、JSON 协议和子进程监督见
+[tool handler](../../crates/margatroid/tool/plugin/src/handler.rs)。
+服务通过同一可执行文件承载这些模式，独立工具入口另见
+[tool_runner.rs](../../crates/margatroid/tool/plugin/src/bin/tool_runner.rs)。
 
-Ctrl+C和SIGTERM先唤醒并停止正常运行循环，随后调用Compose关停；World继续推进，直到Workspace、Agent、推理、工具VM、子进程及后代、管道和Axum全部收口后，daemon才返回终端。信号监听保持到清理结束，重复Ctrl+C不跳过清理，也不设置超时后强退。清理失败报告诊断并继续监督；已完成领域清理后的Axum运行错误仍以非零状态退出。SIGKILL或操作系统强制终止不经过这条路径。
+## 安装器职责
 
-启动时向终端stderr输出数据目录；Axum实际绑定成功后输出启动成功、真实监听地址、前端HTTP URL及WebSocket URL。配置端口为0时显示操作系统分配的实际端口。监听0.0.0.0或::时，浏览器链接分别使用127.0.0.1或[::1]，监听行仍显示实际绑定地址。启动提示直接输出，独立于业务日志等级及筛选配置。
+调用形态为 `margatroid-install <checkout> [--skip-landstrip] [--update-resources]`。
+安装器检查 checkout 内的 release 产物 `margatroid`、`tool_runner`、`shell-client`、
+`mcp-client`，以及主 UI、assistant UI 与 subagent UI 的预编译入口。
+默认可执行文件目录为主目录下的 `.local/bin`，`MARGATROID_BIN_DIR` 指定另一安装目录。
 
-```text
-margatroid: starting (data directory: /home/example/.margatroid)
-margatroid: started successfully (listening on 127.0.0.1:3939)
-Webui:  http://127.0.0.1:3939/
-WebSocket: ws://127.0.0.1:3939/ws
-```
+默认流程下载并校验 Landstrip 0.22.5，执行版本与 doctor 检查；
+`--skip-landstrip` 选择直接安装本地构建产物。资源复制保留目标中已有文件，
+`--update-resources` 选择覆盖资源。两种模式都刷新 bash、bash-exec、mcp-register 的 helper。
+`config.toml` 与 `models.toml` 在目标首次创建时写入，已有配置继续保留。
+文件先写入同目录 staging 文件，完成同步后 rename 到目标；路径检查遇到符号链接返回错误。
+安装与归档校验的实现及单元测试见 [install.rs](src/install.rs)。
 
-绑定失败时结束正常帧循环，执行既有清理并以非零状态返回实际错误。成功标识只在真实监听之后打印一次。
+## 源码与测试导航
 
-应用退出覆盖所有Workspace状态：Starting/Running/Error均提交原StopWorkspace；Stopping等待已有监督及其原reply，不重复关闭。Starting中的Lua立即收到取消，仍等待初始化和进程真实退出。回归直接在启动失败后发送SIGINT/SIGTERM，不预先调用workspace.stop，并验证未完成初始化的Lua子进程在daemon退出前已回收。
-
-未绑定Agent的日志直接通过既有tracing输出，遵守配置的日志级别和过滤器；不创建独立运行日志数据库、不强制保存运行级报告。绑定Agent的日志沿原AgentStorage及提交探针处理。
-
-唯一主程序包和编译产物均名为margatroid，入口位于apps/margatroid，不再构建旧CLI工作区控制客户端或单独daemon程序。使用cargo build --release -p margatroid，再运行./target/release/margatroid启动服务；工具worker/supervisor仍由同一可执行文件内部模式启动。mcp-client和shell-client是工具辅助程序，继续独立保留。
+- [main.rs](src/main.rs)：服务启动、runner 分派、监听地址提示与信号处理。
+- [lifecycle.rs](tests/lifecycle.rs)：初始目录创建与显式配置要求。
+- [shutdown.rs](tests/shutdown.rs)：真实进程、失败启动、重复信号和后代回收。
+- [bundled_drivers.rs](tests/bundled_drivers.rs)：随包 Driver、资源及模型文件 API。
+- [mcp_update.rs](tests/mcp_update.rs)：MCP 注册更新与初始化指令保存。
+- [web_tools.rs](tests/web_tools.rs)：随包 Web 工具请求与结果处理。

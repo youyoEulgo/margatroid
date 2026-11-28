@@ -54,3 +54,53 @@ async fn unavailable_selected_backend_never_falls_back_to_unrestricted_worker() 
     assert_eq!(frame["frame"]["result"]["Err"]["kind"], "RunnerStartFailed");
     assert!(!root.path().join("unsafe").exists());
 }
+
+#[tokio::test]
+async fn sandbox_startup_failure_preserves_safe_backend_diagnostic_without_raw_stderr() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = tempfile::tempdir().unwrap();
+    let backend = root.path().join("fake-landstrip");
+    std::fs::write(&backend, "#!/bin/sh\n[ \"$1\" = run ] && [ \"$2\" = --backend ] && [ \"$3\" = container ] && [ \"$4\" = -p ] || exit 42\nprintf 'arbitrary private API_KEY=do-not-report\\n\\nkind=internal\\ncode=INTERNAL_ERROR\\nmessage=unsupported guest exit\\n\\n' >&2\nexit 1\n").unwrap();
+    std::fs::set_permissions(&backend, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let policy = root.path().join("policy.json");
+    std::fs::write(&policy, "{}").unwrap();
+    let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_tool_runner"))
+        .arg("--margatroid-tool-supervisor")
+        .arg("--sandbox")
+        .arg(&backend)
+        .arg(&policy)
+        .current_dir(root.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let request = json!({
+        "protocol_version":1,
+        "program":"function configure()return {timeout_ms=30000}end function execute()error('must not run')end",
+        "arguments":{},
+        "context":{"agent_name":"fixture","agent_address":"/agent","workspace":{"address":"/workspace","project_root":"/tmp"},"owner_agent":null,"turn":null,"source_origin":"fixture.lua","task_id":"sandbox-test","call_id":"call","alias":"tool","owner_task_id":null,"binding":null,"resource_dir":root.path(),"project_root":root.path(),"temp_dir":root.path()},
+        "limits":ToolExecutionLimits::default()
+    });
+    let mut input = child.stdin.take().unwrap();
+    let mut bytes = serde_json::to_vec(&request).unwrap();
+    bytes.push(b'\n');
+    input.write_all(&bytes).await.unwrap();
+    let output = tokio::time::timeout(Duration::from_secs(5), child.wait_with_output())
+        .await
+        .unwrap()
+        .unwrap();
+    drop(input);
+    assert!(output.status.success(), "{:?}", output.status);
+    let frame: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(frame["frame"]["cleanup_proven"], true);
+    let error = &frame["frame"]["result"]["Err"];
+    let message = error["message"].as_str().unwrap();
+    assert!(
+        message.contains("sandbox INTERNAL_ERROR: unsupported guest exit"),
+        "{error}"
+    );
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("do-not-report"));
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("do-not-report"));
+}

@@ -1,26 +1,39 @@
 # Sandbox Resource
 
-本文描述当前源码的路径登记与通用观察契约，不表示运行中的daemon已经更新。具体入口见本领域DESIGN。
-sandbox_resource_core定义沙箱路径集合、文件读取方法、导入事件和错误，只依赖mecs与通用库，不依赖client_core、DTO或其他业务core。sandbox_resource_plugin负责异步校验和路径登记，不依赖其他领域plugin，也不让core依赖address或其他领域core。
+沙箱资源将 JSON 策略文件登记为实体上的 alias，并维护当前选择。
+开发入口分为 [core](core/README.md) 的集合、选择与读取接口，以及 [plugin](plugin/README.md) 的异步导入。
 
-## 导入与路径
+## 核心对象与文件
 
-调用方plugin校验资源种类和跨类别alias冲突，通过address定位policy.json后发送ImportSandbox。本插件校验文件，成功只登记Sandboxes中的alias与规范路径，不保存来源定位字符串或正文。
+| 对象 | 用途 |
+| --- | --- |
+| `Sandboxes` | 保存 alias 到规范策略路径的映射 |
+| `SelectedSandbox` | 保存当前选中的可选 alias |
+| `SandboxInput` | 一次读取的 JSON 策略和规范来源路径 |
+| `SandboxReadLimits` | 策略文件字节预算 |
+| `SandboxObserverFactory` | 为 owner 提供列表和选择变化回调 |
+| `ImportSandbox` | 导入请求与唯一回复协议 |
 
-MCL对同一目标的IMPORT串行受理，跨类别alias唯一性由MCL入口协调；各资源core只管理自己的集合，不新增通用绑定表或资源注册表。取消、目标失效或校验失败保留旧路径；发布成功后才通过原oneshot回复，不发送导入结果观察事件。
+一个沙箱资源以 `policy.json` 为入口，文件采用 UTF-8，内容为 JSON 对象。
+core 完成通用 JSON 解析，执行方负责具体后端策略 schema 和活动生命周期。
+`Sandboxes` 保存路径，`SelectedSandbox` 保存 alias；活动创建方在使用时读取当前策略。
+本次返回的 `SandboxInput` 由本次活动持有，文件编辑作用于后续读取。
 
-## 按次读取
+## 最小调用流程
 
-每次使用从登记路径读取policy.json。校验策略是非空UTF-8及合法JSON对象；具体后端schema由执行方校验。读取发生在blocking worker，使用方等待真实完成，不阻塞ECS线程。导入时校验不保证日后文件仍存在或合法；使用时重新校验，失败不退回旧副本。
+1. 调用入口完成资源地址解析、资源种类和跨类别 alias 检查。
+2. 装配运行时、`SandboxObserverFactory` 与 `SandboxResourcePlugin`。
+3. 为存活 owner 发送 `ImportSandbox`，提供合法 alias、绝对路径、取消令牌和回复端。
+4. blocking worker 调用 `read_sandbox`，完成后由 ECS 登记规范路径并回复。
+5. 为 owner 装配 `SelectedSandbox`，通过 `sandbox_select` 选择已登记 alias。
+6. 活动创建方按登记路径调用 `read_sandbox`，取得本次执行策略。
 
-sandbox_use只选择alias，不缓存policy正文。每次Sandbox活动创建时读取当前选中路径，策略作为本次执行临时材料；文件变化不修改已经执行中的活动。选择修改不改变已开始任务持有的本次策略材料。
+同 alias 成功导入会替换路径。选择为 `None` 时清空当前选择，选择有效 alias 时检查集合条目。
+集合和选择的实际变动经统一方法通知装配方提供的回调。
 
-## 职责
+## 接口导航
 
-本领域不启动runner、不停止活动，不将选中策略放进Agent组件；真实清理由各执行plugin负责。集合只保存BTreeMap<String, PathBuf>，不使用ResourceID、LibraryComponent或通用ResourceSet；加载后的临时值不再携带资源身份。路径用于打开文件，不代替沙箱与文件访问检查。
-
-异步校验直接返回Result<ImportOutput, ImportError>，System只路由，Handler负责发布及oneshot回复。所有结果保留原owner Entity，迟到结果不写入复用index的新实体。文件读取失败报告alias、实际路径和底层原因，不回显文件正文。
-
-Sandboxes与SelectedSandbox的同步可见变动分别经Sandboxes.insert/remove及SelectedSandbox.set统一入口，通过构造时注入的通用Arc回调通知。导入/替换、删除和选择提交成功后同步维护Agent公共沙箱视图并直投agent.sync；路径查询及策略读取不触发同步。
-
-SandboxObserverFactory由装配方注入，只提供每owner的列表/选择通用回调，不在core绑定网络身份。首次MCL sandbox_use可据此创建缺失的空集合和选择组件；空选择允许，非空alias仍须真实导入。实体地址使用绝对节点路径；文件资源继续由address解析type:scope/name:tag且tag必填，ImportSandbox携带解析后的真实path。
+- [core 使用说明](core/README.md)：读取例子、选择与观察接口。
+- [plugin 使用说明](plugin/README.md)：安装前提、异步请求和完成语义。
+- [读取与选择测试](core/tests/resources.rs)、[导入测试](plugin/tests/imports.rs)。
+- [设计对应](DESIGN.md)：领域结构及函数行为。

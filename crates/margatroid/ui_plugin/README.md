@@ -1,23 +1,33 @@
-# UI
+# ui_plugin
 
-UiPlugin将ui/dist编译期嵌入daemon，并在已有HTTP服务提供页面。浏览器通过同源/ws连接并注册webui；网络请求及领域操作由DTO处理。UI修改后需重新构建前端并编译daemon。
+`ui_plugin` 将构建好的 Web UI 静态文件嵌入后端二进制，并通过原生 Axum 路由提供页面。它适合由同一个 daemon 分发页面和后端接口的部署方式。
 
-## 工作区与会话
+## 接入静态页面
 
-侧栏显示Workspace树及其Agent，展示条目来自path和cache，运行状态来自后端实例。列表同步读取后端内存展示缓存，不触发扫描、Catalog刷新或配置写入。启动提交path，目标设计由后端先统一全量重载定义，再从本次发布缓存取启动数据；前端不上传配置正文，重载失败不能沿用旧缓存启动。
+应用完成 `AxumPlugin` 装配后，在首次 tick 前调用 `app.add_plugin(UiPlugin::new())`。插件将页面 Router 合并到 HTTP 服务。服务装配顺序见 [axum_plugin 接入示例](../axum_plugin/README.md)。
 
-保留Workspace的Start和Stop操作；本轮不增加Workspace或Agent重启按钮。配置文件增删改及重新加载不由前端发送旧成员变更协议完成，不将运行停止等同于删除配置或数据库。右侧保留日志及MCL审计入口，不增加重复快捷入口。
+也可以将页面 Router 合并进自行管理的原生 Axum Router：
 
-## 输入与历史
+```rust
+use axum::Router;
+use ui_plugin::UiPlugin;
 
-Idle允许发送用户消息，Working允许中止；Starting、Restarting、Stopping均不能发送。图片通过拖入或加号上传，预览独占一行，正文另起一行。支持PNG/JPEG/GIF/WebP，每条最多8张、单张5MiB、合计20MiB，data为标准base64；失败保留草稿，切换目标隔离迟到结果。
+fn main() {
+    let router: Router = Router::new().merge(UiPlugin::router());
+    let _application_routes = router;
+}
+```
 
-消息以权威历史为准，不因发送请求乐观插入最终记录。时间使用created_at_ms，未知值不渲染为epoch。上下文比例使用最近推理usage及context_window_tokens，不把累计用量或缓存命中重复相加。
+`UiPlugin` 提供插件安装与 `router()` 两种入口；`UiPluginInstalled` 是 World 中的安装标记资源。通过插件入口重复安装会触发安装检查 panic。
 
-## 流与中止
+## 路由与资源生命周期
 
-显示只接受当前实例的递增分片。点击中止立即冻结当前请求，拒绝迟到delta并等待sync；受理回执不等于清理完成，不提前显示Idle。后端仍走两帧控制路径：先清turn，再取消当前推理，原子强制return并终止未return工具；已return后台任务保留。只有通道出口已接受的分片进入后端累积器及前端流。
+- `GET /` 返回嵌入的 `index.html`。
+- `GET /assets/{*path}` 根据完整请求路径读取嵌入资源。
+- fallback 根据请求路径查询其余嵌入文件。
 
-sync以持久历史校正显示，可能与点击时内容略有差异。中止以普通completed结束，渲染已有正文及思考，不染红、不加标签、不填取消文案。finished是显示终态，不代替历史或任务清理证明。
+资源通过 `rust-embed` 从 [Web UI 构建目录](../../../ui/dist/) 收集。发布构建将资源嵌入二进制；更新发布页面时，先生成 Web UI 构建产物，再重新编译 daemon。
 
-Workspace文件后端路由与平台静态资源优先级已实现；前端相对资源解析仍待接入：普通Markdown的./路径以消息所属Workspace工作目录解析，已知Markdown文件以该文件父目录解析，生成指向实际daemon origin和完整Workspace Address编码段的HTTP URL。平台/assets路由必须优先，不改变全页base，不通过read_image或临时turn渲染普通项目图片。
+响应依据文件扩展名设置 Content-Type。资源查找失败返回 `404 Not Found`，响应构造失败返回 `500 Internal Server Error`。浏览器的 WebSocket 协议入口由 [dto](../dto/README.md) 装配，页面服务与协议路由共同使用已有 HTTP 服务。
+
+入口、资源路径、MIME 映射与响应行为见[后端实现](src/lib.rs)，结构与函数说明见 [DESIGN.md](DESIGN.md)。

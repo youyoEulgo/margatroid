@@ -1,109 +1,60 @@
 # Storage
 
-本文描述当前源码中的存储和显式关闭契约，不表示运行中的daemon已经更新。具体入口见本领域DESIGN。
-storage_core定义AgentStorage、Block、历史、Agent日志和设置操作及其文件实现，只依赖mecs、SQLite、TOML等通用库，不依赖其他领域core。storage_plugin取得组件句柄并调度blocking worker，通过原请求oneshot回复，不提供额外结果事件。Agent日志另由storage_core公开函数直接读写，不进入StorageOperation或StorageRequest。
+Storage 管理单个 Agent 的消息历史、MCL 审计、运行日志、消息 Block 和 TOML 设置。
+首次接入可先阅读 [storage_core](core/README.md) 的同步调用示例；
+使用 ECS 请求调度时，再阅读 [storage_plugin](plugin/README.md)。
+结构、持有关系和函数行为见 [DESIGN](DESIGN.md)。
 
-当前管理库schema版本为5，Block文件schema版本为2。旧version 3 JSON Block、旧三表或其他不匹配结构明确返回SchemaMismatch，不迁移、不兼容、不生成额外备份。测试仅操作临时目录，不操作用户数据库。
+## 先认识数据与句柄
 
-## Block文件与快照
+| 概念 | 用途 | 入口 |
+| --- | --- | --- |
+| AgentStorage | Agent Entity 上的共享存储句柄 | [组件](core/src/components.rs) |
+| 历史 | 消息与 MCL 记录共用真实递增 sequence | [历史操作](core/src/lib.rs) |
+| Agent 日志 | 使用独立 sequence 的诊断记录 | [日志](core/src/logs.rs) |
+| 消息 Block | 按字段组织消息数组，支持选择、替换和快照 | [Block](core/src/blocks.rs) |
+| 设置 | 逐次读取和原子替换 TOML 文件 | [配置操作](core/src/lib.rs) |
+| 提交水位 | 观察消息、MCL、日志的已提交高水位 | [分页与水位](core/src/pages.rs) |
 
-持久Block位于<管理库完整路径>.blocks/<真实Block逻辑名>/timeline.sqlite，快照为同目录snapshot_<id>.sqlite，每个子项对应f0、f1等宿主生成表。Block名严格采用字母/下划线起始、后续字母数字下划线连字符规则，禁止路径片段；表名不拼接用户输入。TEMP及其快照只保存在内存，不产生目录、数据库文件、映射、intent或SQLite侧文件。
+持久 Agent 使用以下布局；路径由创建 Agent 的调用方准备并传入：
 
-管理库block_snapshots每Block有一条kind=timeline、snapshot_id=0的工作映射，以及若干kind=snapshot、snapshot_id>0的只读记录。管理库只保存持久Block，instance约束为空字符串，snapshot_id、上游引用和编号按block_name独立。TEMP以调用方提供的真实运行instance和Block名作为纯内存集合键；Agent上的MCL使用Agent.instance，与持久映射分开。fields_json仅保存子项到表的映射，不保存消息数组。
+```text
+<Agent目录>/
+  state.sqlite
+  setting.toml
+  state.sqlite.blocks/<Block名>/
+    timeline.sqlite
+    snapshot_<id>.sqlite
+```
 
-公开同步函数snapshot_block(storage,name,instance)返回Unit语义，完整复制timeline为快照，新快照继承旧上游，timeline再指向新快照，工作文件和正文不变。read_block_snapshots返回JSON对象：timeline含file_name、fields_json、upstream_id；snapshots按ID升序，每项另有snapshot_id。timeline内部ID=0不在该JSON中暴露；TEMP查询的file_name为null，不伪造磁盘路径。Some(instance)优先选择所属TEMP，没有则按原选择器规则回退持久Block；其他实例的TEMP不可见。
+管理库保存历史、日志和持久 Block 映射，Block 正文保存在各自的 SQLite 文件。
+TEMP Block 以运行 instance 与 Block 名为键保存在内存，快照同样采用内存副本。
+`DropTemporaryBlocks` 负责释放指定 instance 的 TEMP 集合。
 
-restore_block(storage,name,instance,snapshot_id)先checkpoint并关闭工作库，持久登记restore_intent，将原timeline改名归档为新快照，再完整复制目标到受控暂存文件并发布回固定timeline路径。最后管理库单事务登记归档、更新子项映射和目标上游、清除intent。回档前归档继承原上游；timeline指向目标快照，而非回档前新快照。目标快照及旧分支不改动。
+## 一次存储调用的路径
 
-例如快照1上游为空，快照2上游为1；回档1时新归档3的上游为2，timeline上游为1，之后快照4的上游为1。ID大小不是父子关系。回档只改变指定Block，不回退消息历史、日志、设置或工具副作用。
+1. 创建方在 blocking worker 调用 `open_storage`，获得已连接的 `AgentStorage`。
+2. Agent 装配流程把该句柄挂到 Entity；业务方选择同步 core 函数或 `StorageRequest`。
+3. core 取得共享管理连接锁，执行对应数据库、Block 或设置操作并返回结果。
+4. 历史或日志确认提交后更新 watch 水位，监控方按真实 sequence 分页追齐记录。
+5. Agent 生命周期等待任务、记录写入和文件 worker 收口，再显式调用 `close_storage`。
 
-快照使用SQLite一致性复制API，包含已提交WAL，不复制活动主文件。副本完成校验和文件/目录持久化后才提交映射。CREATE及快照先把完整归属记录原子发布为publish_*.json：先写.pending并fsync，再改名，之后才创建副本。启动时仅按这些记录回收明确未发布文件；已提交映射保留文件并移除marker，未完成.pending只移除marker本身。不根据未知文件名猜测归属，不删除外部文件。这些文件是提交元数据，不是额外备份。
+同一开放管理库的重复打开与句柄克隆共享连接、TEMP 集合和受理锁。
+持久 Block 连接在该锁内按操作打开并释放；设置使用额外的文件锁协调读改写。
+关闭使全部共享句柄退休；成功后再次打开文件会建立独立共享状态。
 
-restore_intent保障回档在中断后完成同一次操作。初始化在开放一般Block IO前完成登记的intent，已归档时不再次改名当前工作文件、不再分配ID；失败封闭存储并报告实际错误。跨文件的复制/改名与管理库并非一个SQL事务，中间态由共享管理连接锁及持久intent隔离，不能把rename本身当成整体原子性证明。
+## 选择合适的接口
 
-TEMP内容与快照只属于本次运行instance，以纯内存消息向量和快照深副本保存。DropTemporaryBlocks只移除指定实例的内存集合，其他实例和持久Block不变；丢弃存储管理器自然释放全部TEMP。TEMP快照ID独立、上游分支及回档前归档语义与持久Block一致，但没有任何磁盘副作用。
+历史追加使用 `append_message_history`，返回带真实 sequence 的内部消息。
+Block 数组位置使用 `MessageSelection`，历史关联使用消息自身的 sequence。
+消息与 MCL 共用时间线，Agent 日志水位按其独立序列解释。
+分页使用排他 before/after 边界和正数 limit，结果按 sequence 升序返回。
 
-所有消息统一拆为sequence、role、content、data、tool_call、payload，Block另有position表达数组位置，sequence绝不当作索引。system/user/tool_call结果的content直存文本，assistant/compact的content为包含reasoning和content的JSON对象，inject的content为消息数组JSON，error的message直存content。内部data原值独立存JSON，tool_calls独立存tool_call，payload只保留其余字段。读取重建原内部格式，拒绝replay、images别名和重复保留字段。
+`snapshot_block` 完整复制工作 timeline；`restore_block` 先归档当前 timeline，再恢复目标快照。
+快照上游表达分支关系，快照 ID 表达分配顺序；恢复范围为所选 Block。
+恢复意图与发布记录负责跨文件操作的中断恢复，详见 [快照实现](core/src/blocks.rs)。
 
-append_message_history(storage,messages,turn)在一个事务中按消息与MCL记录共享时间线分配真实sequence，返回带sequence消息。每次显式追加均分配新sequence，输入携带的sequence不触发历史查找、内容比对、幂等复用或去重。Block消息可选携带sequence；后端只保存字段，不校验它是否存在于历史或是否内容一致，也不自动生成Block局部序号。
-
-## 初始化与生命周期
-
-Driver的创建Agent注入方法准备文件后在blocking worker调用open_storage，取得已连接、可直接使用的AgentStorage，随后通过StartAgent事件交给实体装配System同步挂载。数据库不存在则创建，已有数据库保留内容并校验schema。Agent设置文件不存在才使用Driver默认模板创建；数据库与设置分别判断。模板可为空，已有设置不覆盖、不合并，格式损坏直接报错。
-
-AgentStorage独立挂载到Agent Entity，持有数据库句柄及设置路径，不嵌入Agent。克隆共享连接、TEMP内存和文件锁，不缓存持久Block或设置正文。is_open()只报告共享来源是否仍开放；settings_path()提供真实配置路径供监控，data_dir()返回其父目录。
-
-close_storage(&AgentStorage)是同步显式关闭入口，异步生命周期必须在blocking worker执行并等待真实结果。它与全部数据库、配置、日志及Block访问共用管理锁；Block连接只在该门内临时打开，取得锁时这些操作已返回。关闭将所有克隆退休，再物理关闭管理Connection并释放TEMP。
-
-SQLite关闭失败返回CloseFailed并保留Connection，来源保持退休，所有普通访问返回Closed；再次close_storage可重试，成功部分不重新打开。成功关闭后旧克隆始终Closed；open_storage相同文件可以创建独立新共享状态，不复活旧克隆。仅drop一个Arc不等于关闭共享连接。
-
-Agent关闭先停止受理、等待MCL/推理/工具及记录和文件监控worker，然后显式关闭存储；所有owned日志引用需在此之前完成写入。无Agent诊断使用既有tracing，不建立额外日志库。Block提交失败导致的封闭仍保留CleanupFailed及原恢复语义，不能误当成正常显式关闭。
-
-storage_core只认识路径和存储操作，不读取Workspace配置、定位Driver、加载工具或管理VM。文件路径由创建注入方法准备后确定，配置指令不允许改成任意文件路径。
-
-## 消息Block
-
-管理库包含agent_messages、mcl_records、agent_logs、block_snapshots四张表；持久Block正文位于独立文件，TEMP正文只在实例内存中。PRAGMA user_version标记目标schema，表及约束严格校验；已登记文件缺失、子项schema/映射错误或快照祖先不存在/成环均拒绝打开，不猜测修复。
-
-Block字段只保存结构化消息数组，不保存TOOL、SANDBOX、资源地址或alias绑定。消息结构由调用方按消息领域契约校验，存储层保留结构化值，不依赖消息core，也不根据字段名推测用途。
-
-CREATE字段名不带类型，不存在则创建，存在且字段及生命周期一致则打开；不清空消息，不返回created标志，冲突不重建数据。
-
-多选择器GET通过同一管理连接锁固定内部读写视图。INJECT先在该受理门内读完全部来源，再在目标Block文件单个写事务中读取目标、校验范围和替换；自引用先读完再写，不宣称跨Block文件共享SQL事务。外部Prompt等文件内容由调用方读取后作为Literal传入，不在SQL事务中加载资源文件。
-
-## 历史
-
-消息与MCL记录分别保存到agent_messages和mcl_records，共用真实递增sequence；agent_logs序号独立。消息表不保存source，role来自内部type，其他消息内容使用上面的同一拆列规则；payload不再重复整个消息。ReadAgentMessages及合并历史重建完整内部消息并附带真实sequence。MCL记录仍保存真实来源地址、原始content和完整审计payload，不保存Entity编号。AppendHistory入口对消息使用相同拆列映射及每次新分配序号，返回Unit不改变原事件契约。
-
-消息写入以内部消息为权威，不再把HistoryRecord.content另存为第二份不同正文。读取HistoryRecord.content对应实际SQL列，assistant/compact和inject为JSON文本；读取payload为重建内部对象，两者不是SQL中完整重复的消息副本。
-
-消息历史由显式history_append写入，指令审计由MCL另行发起。存储不自动记录推理、工具或Block操作结果。Block修改和历史追加位于不同数据库，分别提交。
-
-## Agent日志
-
-agent_logs是独立的管理库日志表，仅保留sequence、created_at_ms、level、source、stage、message、details_json、context_json、origin、raw_error、traceback。sequence使用SQLite INTEGER PRIMARY KEY，由同一写事务内该表自身MAX(sequence)+1生成，空表从1开始，不使用AUTOINCREMENT，不共享历史序号。level仅debug、info、warn、error；source仅driver、tool、host；stage是load、configure、execute、driver、hostlog等阶段描述，不建立阶段枚举或调度语义。details_json可选且为对象；context_json同样可选，其turn、task、call、alias、driver_instance关联均可缺省，避免为每种运行上下文增加列。origin保存可确定的程序来源地址，raw_error和traceback可空。
-
-公开的append_agent_log(storage: &AgentStorage, record: AgentLogRecord) -> Result<StoredAgentLog, StorageError>与read_agent_logs(storage: &AgentStorage, after_sequence: Option<u64>, limit: usize) -> Result<Vec<StoredAgentLog>, StorageError>均为同步core函数。写入在现有共享连接串行锁内完成独立事务；读取同样共锁，按sequence升序读取严格大于after_sequence的记录，None从开头、limit为0返回空数组。不借出或并行使用raw Connection。异步host克隆AgentStorage后spawn_blocking并await真实join；日志方法成功表示已确认落库，不能仅发送IPC或提交worker就回复成功。read_agent_logs供core诊断调用；网络日志分页使用read_agent_log_page，不依赖脚本自动读取，也不消费日志。
-
-ToolPlugin和LuaRuntimePlugin只依赖storage_core取得日志能力，不依赖storage_plugin或借用ECS World。Driver与工具使用统一host及能力集合，可信运行身份仅绑定实际来源和取消归属；日志入口复用该host，脚本主动调用margatroid:log()只提交级别、消息和可选结构化详情。source始终由host保留原始运行身份：Driver日志为driver，工具日志为tool，宿主自身诊断才为host；转交统一host不能把Driver或工具日志改标host。stage、origin及context_json中的关联由host补齐，脚本无权声明或覆盖这些可信字段。
-
-Lua加载、配置、执行、Driver回调及清理等边界的自动故障捕获，在格式化业务错误前取得完整raw_error与可用的traceback，并由host附带来源和已知关联写入日志。自动故障与主动日志共享写入能力；worker跨IPC仅使用私有Log frame及对应完成确认，不改变StorageRequest的operation载荷、不增加StorageOperation variant或SystemEvent，不在事件路由内加入日志行为。自动日志写入失败回落现有诊断通道，保留并继续交付原业务错误，不递归自动记日志；主动日志写入失败如实返回调用方。日志写入不触发history_append，不进入历史时间线或推理消息。
-
-独立日志表用于保留运行诊断及完整故障信息，既不改变消息和MCL审计的业务语义，也不要求所有日志具备任务关联。最少列与可选JSON关联允许Driver、工具和host共用同一存储契约；现有AgentStorage生命周期覆盖清理写入即可，不增加工作任务或身份注册机制。
-
-## TOML设置
-
-每次配置操作重新读取当前文件，不维护长期解析副本。同一设置文件的读改写串行执行。
-
-CONFIG GET取得完整table。SET按点分路径新增或整体替换值，缺失中间table自动建立，已有非table中间节点返回错误。DELETE删除指定键，目标缺失视为成功，不清理空父table。路径不支持数组索引；不以nil或空数组表示删除。
-
-修改先解析及校验，序列化完整新文件，写入同目录临时文件并同步，再原子替换目标及同步目录。替换前失败保留旧文件；替换已发生但持久性确认失败返回CommitUnknown，不谎称旧文件未变。临时文件失败不作为设置成功，不自动用默认模板恢复。
-
-SQLite事务和TOML文件修改互相独立，不承诺跨文件事务；初始化一项成功、另一项失败时如实返回错误，重试不覆盖已存在数据。TOML键值保留语义，不承诺保留手工注释和排版。
-
-## 取消与错误
-
-取消前已提交的修改保持成功事实；只有确认未提交且清理完成才能报告Cancelled。无法确认提交事实返回CommitUnknown，不自动重做操作。
-
-回滚或连接清理失败返回CleanupFailed，将共享连接标记不可用并拒绝后续IO。调用方在真实worker退出或明确清理失败后交付结果，不能提前通知Agent或Workspace已安全停止。设置操作同样等待真实文件worker，不靠丢弃Future中断写入。
-
-
-read_message_page、read_mcl_page、read_agent_log_page及read_record_watermarks是纯core同步读取能力。范围使用排他before/after及limit，输出升序和双向游标，读取只针对所属表，不修改消息或消费日志。网络层在blocking worker调用，Storage不引用wire DTO，不新增StorageOperation或事件。页中消息由规范列重建完整AgentMessage，SQL残余payload不能冒充完整网络消息。新增sync按已提交sequence增量读取，消息/MCL与日志水位不能混用。
-
-范围参数必须能表示为SQLite整数，limit必须非零，双界必须after<before；非法范围返回InvalidRange。页数据、两个继续游标和剩余记录判断在同一读事务取得；游标只说明原查询范围内是否还有更早或更新记录，不跨越原边界。历史分页保持已落库消息的真实sequence，查询重复读取不消费数据。
-
-## 提交观察与范围查询
-
-管理库共享状态的record_changes，保存消息、MCL及日志三个真实已提交高水位，并以Tokio watch提供独立观察。新增记录确认COMMIT后通知，读操作、空批次、失败及回滚均保持通知值；显式history_append每次分配新序号并形成新提交。该通知是进程内状态变化能力，不是Storage ECS事件，也不保存第二份记录正文。
-
-Agent实际存储初始化时通过Agent实际资源安装回调建立一个长期异步监控，先订阅再取得初始基线，后续等待changed。watch通知可以合并，监控以实际sequence追齐记录。提交在读取期间发生时仍保留通知，未读完的同次变化继续分页；追齐后等待下次真实提交。SQL worker完成后只回到监控本身，不额外触发World调查。
-
-范围及游标查询按实际边界构造sequence主键谓词，无下界以0作为排他最小值，无上界以SQLite最大整数作为包含边界，实际存在的边界保持排他，保持现有排他界及升序输出。去除可空OR导致的全表SCAN，增量为空时通过主键边界直接结束。写事务通知不改变Schema、持久记录序号或查询副作用边界。
-
-run_record_watch不产出WebSocketMessageSend；它把非空实际记录编码为有序帧并调用Clients.send_scoped，直接按当前注册者发送。消息/MCL/日志使用各自真实sequence，不作状态覆盖或注册重放；数据库字节/WAL变化不能代替确认COMMIT通知。监控随存储生命周期关闭，取消等待真实SQL worker。
-
-未绑定Agent的日志直接通过既有tracing输出，遵守配置的日志级别和过滤器；不创建独立运行日志数据库、不强制保存运行级报告。绑定Agent的日志沿原AgentStorage及提交探针处理。
-
-compact为assistant消息别名：存储原type=compact，文本/思考、工具调用、usage及请求关联按assistant可逆拆装；不新增表或迁移已有schema。
-
-显式关闭测试覆盖实际SQLite BUSY失败后的同连接重试、共享克隆统一退休、关闭等待在途受理锁、TEMP释放、配置/日志/分页/Block关闭拒绝及提交水位不变；原Block快照与崩溃恢复测试继续验证既定语义。
+设置路径、schema 和消息形状按 core 契约校验，调用方通过 `StorageError.kind` 选择处理方式。
+管理库要求 schema v5，持久 Block 要求 schema v2，结构冲突返回 `SchemaMismatch`。
+完整接入与边界案例可从 [core 测试](core/tests/storage.rs)、
+[快照测试](core/tests/snapshots.rs) 和 [插件请求测试](plugin/tests/plugin.rs) 进入。

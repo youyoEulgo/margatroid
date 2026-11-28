@@ -1,6 +1,5 @@
 /target
-/resources/tools/margatroid/mcp-register/dev/bin/mcp-client
-/resources/tools/margatroid/*/dev/bin/shell-client
+/resources/tools/margatroid/*/dev/bin/*
 .margatroid
 compose.toml
 .DS_Store

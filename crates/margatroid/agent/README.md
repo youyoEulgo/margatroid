@@ -1,61 +1,41 @@
 # Agent
 
-本轮共享Client槽位、统一写入口与异步监控已实现，尚未提交。具体函数和边界见本领域DESIGN及[DTO说明](../dto/README.md)；运行进程需使用新构建。
-agent_core定义Agent自身组件、生命周期状态、事件和错误，目标通过client_core共享发送能力连接网络，仍不依赖DTO或服务器plugin。agent_plugin依赖agent_core、address和所需领域core，负责跨领域生命周期编排，不依赖其他plugin。
+Agent 是 Workspace 中承载 MCL、工具任务、推理和持久会话的运行实体。
+Lua 任务通过创建请求得到 `AgentHandle`，等待 ready 后开展交互；
+创建任务通过 child 绑定监督 Agent 的关闭。
 
-本文其余业务契约沿用已提交基线，新同步路径以当前实际实现为准。Tools是当前Agent唯一工具记录集合，保存alias、path、description、input_schema及私有执行归属owner_task_id和binding；后两者仅经执行context提供，不进入模型schema或公开wire。动态定义属于注册目标Agent完整Entity及Driver实例，可以绑定同Workspace其他Agent的实际任务作用域；绑定任务关闭或目标实例结束时撤销，已受理调用独立收口；数据库和settings继续承担原有持久化业务。MCP协议由工具侧处理。
+## 核心概念
 
-## 同步受理
+- `Agent` 保存所属 Workspace、实际父实体与任务、实例标识、项目目录、状态和 turn。
+- `AgentState` 包含 `Starting`、`Running`、`Closing`；创建完成处于 Starting，ready 后进入 Running。
+- turn 是 Running 状态中的回合标识，开始返回当前或新建标识，结束和中止清除关联。
+- `AgentHandle` 提供实体标识、ready 等待与异步关闭能力。
+- `AgentUpdateContext` 将实体变化、公共工具/模型/沙箱信息和来源生命周期交给装配层观察。
 
-状态只包含Starting、Running、Error、Stopping，turn独立。Handler在一次同步调用中检查状态白名单并切换状态，随后提交异步闭包。
+## 一次创建与关闭
 
-Starting从实体创建覆盖资源挂载和应用初始化，资源挂载完成仍为Starting；MCL在Starting/Running可用，只有ready进入Running。Running下start_turn无则创建、有则返回当前标识；推理及工具显式携带turn才检查关联，省略允许自由调用；开始/中止/结束只改变turn。Error拒绝普通MCL，仅接受查询及清理，Stopping表示实际关闭监督。Starting/Running/Error可停止，重复Stopping拒绝。重启只封装普通StopAgent和StartAgent，不因活跃任务或常驻任务拒绝，不存在Restarting。
+调用方先准备运行中的 Workspace、父实体上的实际工具任务与已打开的 Agent 存储，
+再提交 `StartAgent<AgentStorage>`。请求携带父地址下的 Agent 地址、
+绝对项目目录和 UI 目录，以及接收结果的 oneshot。
 
-stop_agent_system、restart_agent_system、start_agent_system依次挂载于同一Schedule，直接使用mecs按添加顺序同步执行的机制。同帧关闭优先于重启；先受理者同步修改状态，后者按白名单拒绝。不增加统一生命周期事件、排序队列或手写优先级分发器。优先级不取消前一帧已受理的操作。
+AgentPlugin 在调度帧中校验这些条件并创建实体，安装 MCL 队列、工具集合、
+工具任务、推理状态和存储，再把 handle 绑定到创建任务。
+调用方获得 handle 后，通过 ready 流程进入 Running，随后使用 MCL 开始回合。
 
-## 请求
+关闭可以从 `AgentHandle::close()` 发起，也可提交按地址定位的 `StopAgent`。
+前者关闭该 Agent；后者找到其创建任务并等待任务 finish，连同绑定的 Agent 一起收口。
+关闭过程等待子任务、推理、来源观察、MCL 和存储清理，成功后移除实体。
+完整创建夹具与两种关闭路径见 [生命周期测试](plugin/tests/lifecycle.rs)。
 
-StartAgent携带creator/id/workspace/name/parameters/reply，RestartAgent携带id/workspace/name/parameters/reply。启动创建Entity；重启在指定Workspace内按名称定位成员，随后固定使用完整Entity。Agent start/stop/restart网络入口已删除；内部生命周期仍供Lua、Workspace和任务scope使用；重启从目标AgentResources取得原创建参数，不在关闭前重载定义或校验新启动条件。关闭失败不启动；启动失败沿普通StartAgent原错误路径返回。
+## 开发入口
 
-## 异步流程
+| 位置 | 适用工作 |
+| --- | --- |
+| [agent_core](core/README.md) | 操作状态与 turn，接入 ready、handle 和更新观察 |
+| [agent_plugin](plugin/README.md) | 安装生命周期系统，提交创建与关闭请求 |
+| [Storage](../storage/README.md) | 准备 AgentStorage 与持久配置 |
+| [LuaRuntime](../lua_runtime/README.md) | 从实际 Lua 任务创建和操作 Agent |
+| [设计](DESIGN.md) | 查阅领域结构与调用关系 |
 
-启动参数的文件路径固定为Workspace定义所在目录的agents/<成员名>/state.sqlite及setting.toml；不接受旧设置文件名或兼容读取。setting.toml缺失时仅从Driver同名默认模板创建，已有文件不覆盖。持久Block由存储领域放在state.sqlite.blocks/<Block逻辑名>/，TEMP Block与其快照仅保留内存。
-
-启动受理后创建Starting实体，并保留明确的AgentStartParameters。持久配置不存在时，受监督blocking worker从initial_settings_path读取并校验初值，通过原open_storage持久化；配置已存在时不再读取或覆盖初值。ui_path仅是实际UI目录引用，每个Agent直接监控这一路径，不复制UI，不依赖程序目录或旧Agent本地UI。Agent不创建Lua VM，挂载完成仍须显式ready。配置和UI引用随原创建参数保留，内部重启使用原创建参数，不用Workspace成员的程序目录替换它们。
-
-关闭受理时同步关闭新操作受理。关闭闭包只请求Agent自有任务/推理取消，由任务scope停止其创建的Agent，不终止创建者VM，等待活动真实退出及MCL收口；结果Handler确认后销毁Entity。
-
-重启直接调用普通StopAgent并等待其真实清理和Entity销毁，成功后提交普通StartAgent创建新Entity及AgentSession；资源挂载完成不代替ready。StartAgent建立StartupBarrier；StopAgent先等待在途初始化的blocking worker及全部领域回复真正完成，不能提前销毁宿主。
-
-每个步骤和最终结果核对完整Entity及对应生命周期状态。oneshot关闭或闭包异常不是清理完成证明；无法确认清理时保留宿主，发送失败结果。启动或重启挂载成功保持Starting，关闭成功销毁Entity；启动或重启失败且清理完成时销毁Entity。
-
-## 运行组件初始化
-
-Agent启动闭包在原有运行组件准备阶段同一轮发送InitToolTasks和InitInference，再用tokio::join!等待两个oneshot；与原有资源初始化一起完成，全部成功后才启动Driver。任何一项失败也先收齐另一项结果，再统一处理启动失败。重启复用同一启动流程。
-
-InitToolTasks由tool_plugin挂载空ToolTasks，InitInference由inference_plugin挂载current=None的ActiveInference。Agent只依赖这两个领域core中的事件契约，不直接创建对应组件，不新增统一execution组件或System。
-
-## 数据归属
-
-Agent的同步可见状态改为共享只读视图，状态、turn、故障及公共信息只经update_agent修改；业务资源事实仍由原领域持有，公共Tools/沙箱/模型值由相应成功写入口同步维护。Address独立挂载，仅供边界寻址。Driver运行组件、MCL队列、数据库、历史和各资源集合由各领域core定义，作为并列组件挂到Agent Entity。
-
-中止控制事件被受理后，调用方plugin同步调用agent_abort_turn检查并清除turn，随后取消ActiveInference.current句柄，并由ToolTasks::abort_unreturned原子强制交付未return任务的原调用中止结果、请求终止清理；已return未finish后台任务保留；专属控制事件直接进入PRE_UPDATE完成本帧裁决；agent_core不额外提供中止结果事件或中止闭包。Agent始终Running，turn是否为空表达回合有效性，结束等待实际推理退出后清turn。turn已空或不匹配的重复中止直接拒绝，不保存上轮中止关联。Agent不修改Workspace配置文件。Agent由实际创建者任务显式提供初始材料；重启只封装停止和启动，不增加定义重载。底层Agent不扫描Workspace文件。
-
-基线已包含AgentResources和UI观察。本轮将监控创建/取消移到实际来源和存储的安装/替换/停止流程，不再让DTO活动帧扫描发现它们。生命周期与中止的原有受理顺序保留。
-
-StartTurn、FinishTurn和AbortTurn同属唯一Agent更新入口，turn变化和完整Agent列表变化直接投递共享槽位。错误、资源导入、动态工具移除、沙箱选择及模型公共信息提交也必须更新同一派生视图。来源替换先失效旧租约并等待UI/记录监控真实结束，不能使旧实例迟到更新复活。
-
-
-当前工作树已实现统一Lua：复用既有资源挂载、Storage、MCL队列、任务监督、进程回收及同步入口。Workspace先启动独立Lua任务；Agent创建由公共Lua注入能力提交StartAgent，Agent不再启动/持有/终止Lua VM。执行者与目标分开，Agent统一归属Workspace，创建来源由实际任务绑定记录，配置按明确初值文件初始化持久化，UI按创建时传入目录直接监控，模型通过EFFECT model_set配置。公共mcl.execute指定目标，wait(agent)登记本次唤醒句柄；关闭Agent使用margatroid.agent:stop(address)注入方法提交原StopAgent并外部监督，不经过MCL。EFFECT tool_call只接收调用数组。Driver专用manifest依赖裁剪取消；工具发现元数据保持。初始化及全新子代理资源已实现；前端源码不在本轮修改范围内。
-
-四态契约：Agent/Workspace公开starting、running、error、stopping；Agent挂载完成不是ready，MCL允许starting/running，推理和工具显式携带turn时要求running且匹配，省略时为Starting/Running自由调用。Lua创建的Agent在返回信息前绑定创建者真实任务scope与AgentSession；return_result不结束生命周期，任务取消/退出会提交原StopAgent并等待全部绑定Agent实际移除后才确认任务清理。主动停止Agent会解绑；异常日志沿原Agent存储处理，正常结束和取消不误报故障。关闭使用Lua agent.stop注入，不提供MCL agent_stop。
-
-agent_ready作为Agent领域统一入口验证状态和turn，MCL只转交；回合开始/结束/中止也由Agent core方法验证。MCL不按具体指令维护第二套受理条件。
-
-Agent创建注入接口为name/config_path/ui_path，拒绝旧resource_dir创建参数。配置仅首次从config_path初始化至Agent持久setting.toml，后续重启保留已修改配置；ui_path始终直接引用与监控，不创建Agent本地UI，不复制、覆盖、删除已有UI副本，也不把旧副本作为回退来源。Lua程序加载只读取程序文件，不推导或读取同目录配置。
-
-显式可选turn契约：start_turn取得并返回当前turn，已有回合返回同一标识；推理和工具显式携带turn时严格校验，省略为None自由调用，不自动继承当前turn。自由调用仍受实际会话、权限、生命周期、取消及原有并发限制；Starting允许初始化所需自由调用，Error/Stopping拒绝。回合中止/收尾只作用于明确绑定该turn的请求，Agent关闭仍监督全部调用。详见本域DESIGN。运行中的旧进程仍需使用新构建。
-
-所有Agent（包括子Agent）地址统一为agent:<workspace.scope>-<workspace.name>-<workspace.tag>/<显式name>:dev，创建者不参与地址作用域计算，不生成父地址哈希。创建关系由AgentTaskBinding.creator表达，同一作用域同名地址按现有唯一性检查拒绝。
-
-AgentOwner及Lua owner参数已移除。全部Agent使用同一Workspace作用域和Workspace/agents/<name>平级持久路径，同名地址统一拒绝。任务绑定组件AgentTaskBinding在内存中保存只读creator={address,task_id}；宿主从真实执行来源产生，禁止Lua指定，不落数据库、不从创建者反推目录。creator安装与Changed发布使用同一core入口，agent.res/sync读取同一绑定数据；StartAgent必须携带真实creator，在实体注册前保存；不存在绑定前null或无来源创建兜底。关闭传播仅沿Agent自己的ToolTasks及创建者scope，不再查询owner树。
+建议先运行 `cargo test -p agent_core -p agent_plugin`，
+再阅读 [装配集成测试](../compose/tests/agent_creation_paths.rs) 中的真实创建路径。

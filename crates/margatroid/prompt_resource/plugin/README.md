@@ -1,13 +1,46 @@
 # prompt_resource_plugin
 
-负责 `prompt_resource_core::ImportPrompt` 的异步校验及路径发布，不依赖 address、Agent 或其他资源领域。调用方负责地址定位、资源类型匹配和跨类别 alias 唯一性。
+本 crate 异步校验 `ImportPrompt` 指定的文件，并向 owner 的 `Prompts` 集合发布规范路径。
+调用入口负责资源地址解析、种类检查及跨类别 alias 协调。
 
-公共入口 `PromptResourcePlugin::new()` 与 Default 使用 update schedule，支持 `with_schedule(schedule)`、`with_limits(PromptReadLimits)`。安装前需要 RuntimePlugin、AsyncRuntimePlugin 和目标循环 schedule；拒绝重复安装，不要求安装 ClosurePlugin。
+## 主要对象
 
-请求先认领唯一 oneshot 回复端，校验完整 owner、identifier alias 和取消状态。alias 首字符为 ASCII 字母或下划线，其余允许 ASCII 字母、数字、下划线和短横线。路径必须为无父目录跳转的绝对路径。
+| 对象 | 用途 |
+| --- | --- |
+| `PromptResourcePlugin` | 公开安装入口，配置 schedule 与读取预算 |
+| `ImportPrompt` | core 提供的事件及唯一回复端 |
+| `PromptReadLimits` | `with_limits` 接受的清单、正文字节预算 |
+| `ImportPromptReply` | 共享 oneshot sender，发送 `Result<(), PromptResourceError>` |
+| `Prompts` | 成功导入后可查询的 alias 与规范路径集合 |
 
-私有 ImportContext、ImportOutput、ImportError 位于 types。System 仅路由 Import 请求和 Result 校验结果，Handler 提交异步服务，在 spawn_blocking 中规范化路径、调用 core 同步读取并丢弃本次正文。异步服务等待真实 JoinHandle 完成后发送 Result 并唤醒 ECS，不提前返回取消结果或脱离读取任务。
+## 最小导入流程
 
-Handler 收到结果后再次核对完整 owner 和 cancel，成功时创建或更新 `Prompts` 的单个 alias 规范路径，其他条目保持不变，然后回复原 oneshot。失败保持旧条目；原 index 被复用也不会向新 Entity 发布迟到结果。不同请求的同 alias 顺序由调用入口串行协调。
+[导入测试](tests/imports.rs) 的 `app`、`import_request`、`finish` 展示可执行流程：
 
-导入只保存路径。每次使用由对应 core 的同步读取函数重新读取，使用方安排 blocking worker 并等待完成。测试位于 tests，使用真实异步运行时覆盖更新、失败保留、取消、Entity generation、唯一回复、预算、自定义 schedule、路径规范化及安装约束。
+1. 创建 `App`，依次安装 `RuntimePlugin`、`AsyncRuntimePlugin`、`ClosurePlugin`，为 `RuntimePlugin::UPDATE` 调用 `add_closure_system`，再安装 `PromptResourcePlugin`。
+2. 创建 owner，准备提示词目录的绝对入口路径与 alias。
+3. 创建 oneshot channel，包装 sender 为 `Arc<Mutex<Option<_>>>`，构造 `ImportPrompt`。
+4. 调用 `world.emit_event(request)`，持续驱动 App 并接收最终回复。
+5. 成功后通过 `WorldPromptResourceExt::prompt_path` 取得路径，按次读取提示词。
+
+`new` / `default` 使用 `RuntimePlugin::UPDATE`；`with_schedule` 选择已注册闭包执行器的循环 schedule，
+`with_limits` 调整默认读取预算。插件安装检查运行时资源、唯一安装和 schedule，配置错误触发断言。
+
+## 校验与发布
+
+导入 alias 首字符为 ASCII 字母或下划线，后续支持 ASCII 字母、数字、下划线和短横线。
+入口采用绝对路径，父目录跳转返回 `InvalidPath`。
+Handler 认领回复端后，提交异步服务；blocking worker 规范化路径并调用 `read_prompt`。
+服务等待 worker 完成，将规范路径交回 ECS。
+
+结果入口再次检查完整 owner Entity 与取消令牌，创建所需 `Prompts` 并插入单个 alias。
+同 alias 的成功结果替换旧路径，失败保留原条目；发布后发送 `Result<(), PromptResourceError>`。
+正文在本次校验完成后释放，集合保存路径。后续内容读取使用 [core 入口](../core/README.md)。
+
+## 接口参考
+
+- [公开插件与安装检查](src/lib.rs)。
+- [Handler](src/handler.rs)：blocking worker、发布、取消与回复守卫。
+- [System](src/system.rs)、[内部类型](src/types.rs)：事件路由与异步结果。
+- [真实异步导入测试](tests/imports.rs)：路径替换、失败保留、预算、取消和 Entity generation。
+- [领域设计](../DESIGN.md)。

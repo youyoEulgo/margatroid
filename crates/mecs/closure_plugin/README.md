@@ -1,27 +1,41 @@
-# ClosurePlugin
+# closure_plugin
 
-`ClosurePlugin` 允许把一次性同步闭包发送到指定 Schedule。闭包执行时临时取得
-`&mut World`，执行结束后立即释放借用。
+`closure_plugin` 将一次性同步闭包投递到指定 Schedule。闭包在目标阶段取得 `&mut World`，适合将外部线程的状态更新交回 ECS 线程。
+
+## 注册阶段并发送闭包
 
 ```rust
 use app_runtime_plugin::RuntimePlugin;
 use closure_plugin::{AppClosureExt, ClosurePlugin, WorldClosureExt};
-use core_plugin::App;
+use core_plugin::{App, Resource};
 
-let mut app = App::new();
-app.add_plugin(RuntimePlugin::default())
-    .add_plugin(ClosurePlugin)
-    .add_closure_system(RuntimePlugin::UPDATE);
+struct Counter(u32);
+impl Resource for Counter {}
 
-app.world().send_closure(RuntimePlugin::UPDATE, |world| {
-    // 在UPDATE阶段同步访问world
-});
-app.tick(); // 下一事件帧由目标ClosureSystem执行闭包
+fn main() {
+    let mut app = App::new();
+    app.add_plugin(RuntimePlugin::default())
+        .add_plugin(ClosurePlugin)
+        .add_closure_system(RuntimePlugin::UPDATE);
+    app.world_mut().insert_resource(Counter(0));
+    app.world().send_closure(RuntimePlugin::UPDATE, |world| {
+        world.get_resource_mut::<Counter>().unwrap().0 += 1;
+    });
+    app.tick();
+    assert_eq!(app.world().get_resource::<Counter>().unwrap().0, 1);
+}
 ```
 
-`send_closure` 内部仍然使用 Runtime 的事件发送入口，因此事件入队与唤醒逻辑只有一份。
-`ClosureSystem` 必须由开发者显式挂载；插件不会自行决定哪些 Schedule 可以执行闭包。
-请求在下一事件帧可读，闭包按目标 Schedule 中该 System 的注册位置执行。普通事件仍可被多个
-System 读取；这里仅通过包装类型中的 `Mutex<Option<_>>` 转移一次闭包所有权。
-同步闭包的 panic 会沿当前 tick 传播，插件不捕获它，也不提供取消已排队闭包的 API。
-单次 Schedule 仅运行一次，其执行后发送到该阶段的请求不会再被处理。
+## 公开入口与执行时机
+
+- `ClosurePlugin`：安装闭包阶段注册表，依赖先安装的 `RuntimePlugin`。
+- `AppClosureExt::add_closure_system`：在目标 Schedule 的当前位置注册执行器。
+- `WorldClosureExt`：通过 `send_closure` 发送，或用 `closure_sender` 取得绑定阶段的发送器。
+- `WorldClosureSender`：可克隆并移入其他线程，通过 `send` 提交闭包。
+- `ClosureError`：安装与阶段注册错误。
+
+闭包满足 `FnOnce(&mut World) + Send + 'static`。请求经 Runtime 事件入口入队并唤醒，在后续事件帧由目标执行器取出一次。闭包按执行器在 Schedule 中的注册位置运行，执行结束释放 World 借用；panic 沿当前 tick 传播。
+
+为持续接收投递选择循环 Schedule。单次 Schedule 的接收窗口是它实际执行的那一帧。发送器绑定当前 World 与已注册阶段，在 Runtime 销毁前停止外部生产者并释放克隆。
+
+[发送器接入测试](tests/sender.rs) 展示跨线程投递；[执行器实现与测试](src/plugin.rs) 展示阶段选择和执行顺序；完整接口见 [DESIGN.md](DESIGN.md)。

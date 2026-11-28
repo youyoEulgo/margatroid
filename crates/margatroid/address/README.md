@@ -1,35 +1,57 @@
 # address
 
-address提供实体对外寻址和磁盘文件定位，不提供Plugin、图书馆组件、通用资源集合、类型注册表或资源生命周期管理。
+`address` 把对外地址转换为 ECS 实体或资源文件路径。开发者在接收用户输入、查找运行节点、导入文件资源和列举资源时使用这个 crate。
 
-## 依赖
+## 两种地址
 
-address位于core层，只依赖mecs、标准库及通用基础库，不依赖其他领域core或plugin。领域plugin使用address解析外部输入；其他领域core不依赖address。
+| 对象 | 示例 | Rust 类型 |
+| --- | --- | --- |
+| 运行节点 | `/demo`、`/demo/assistant` | `Address` |
+| 文件资源 | `tool:margatroid/task-list:dev` | `ParsedAddress` |
 
-## 实体寻址
+`Address` 是挂载到实体上的组件。`ParsedAddress` 保存资源的类型、作用域、名称和标签。两类地址分别进入实体查找和文件解析流程。
 
-Address作为独立组件挂载到需要公开寻址的Entity。实体地址使用完整绝对节点路径，例如/、/demo、/demo/coder/reviewer；按大小写原样保存。拒绝相对路径、空段、尾部斜杠、.或..段、反斜杠、冒号和控制字符，返回InvalidNodePath。不会补齐路径、创建父实体、推导所有权或映射为磁盘目录。World扩展只提供按地址查找Entity和地址查重；不维护第二份索引。挂载或改名的调用方在同一ECS修改流程中先查重，再写组件。
+## 查找实体
 
-外部地址在入口解析一次，内部组件关联、事件和Handler使用完整Entity。异步操作保留解析时的Entity，不按旧地址重新寻找替代实例。对外响应需要地址时读取Address组件。
+先校验地址，再将组件写入 World，随后通过 `WorldAddressExt` 查找对应实体：
 
-## 文件定位
+```rust
+use address::{Address, WorldAddressExt};
+use core_plugin::World;
 
-资源字符串使用type:scope/name:tag，必须显式提供非空tag，不补齐默认值。文件定位函数将字符串解析为真实文件路径；磁盘布局和资源入口由各资源领域约定。实体地址查询和文件定位互不兜底。
+fn main() -> Result<(), address::AddressError> {
+    let mut world = World::new();
+    let entity = world.spawn();
+    world.insert_component(entity, Address::new("/demo/assistant")?);
 
-提示词和沙箱导入后登记alias与规范入口路径；工具集合另外保留description和input_schema等工具定义，实际执行仍按路径读取程序。各集合由所属core定义，不在address建立统一资源注册表。
+    assert!(world.address_exists("/demo/assistant")?);
+    assert_eq!(world.entity_by_address("/demo/assistant")?, entity);
+    Ok(())
+}
+```
 
-## 随用随取
+调用方在写入地址前完成查重。`entity_by_address` 返回完整的 `Entity`，后续领域操作以该实体为关联。查找结果分别通过 `EntityMissing` 和 `DuplicateAddress` 表示空结果与地址冲突。
 
-每次实际打开资源从登记路径读取；工具执行使用登记时固定的Schema和描述，不隐式重导入metadata，其余资源按所属领域契约读取；文件删除、权限变化或格式错误直接返回失败，不回退旧内容。实际打开文件时仍检查路径和执行权限。
+## 解析文件资源
 
-一次推理、工具执行、沙箱执行或Driver启动可持有本次所需的临时数据，文件变化不修改在途操作。Driver在每次启动时读取程序，不在运行中热替换。显式写入对话Block的内容属于对话数据，不是文件资源缓存。
+`ParsedAddress::parse` 解析完整的 `type:scope/name:tag`。`resolve_file` 接收对应类型的根目录和资源地址，返回规范化后的入口文件路径。
 
-resolve_file的root为对应类型根目录：driver使用agent-drivers，tool使用tools，prompt使用prompts，sandbox使用sandboxes；函数不读取HOME或创建目录。
+| 类型 | `ResourceRoots` 下的目录 | 入口文件 |
+| --- | --- | --- |
+| `driver` | `agent-drivers` | `base.lua` |
+| `tool` | `tools` | `tool.toml` |
+| `prompt` | `prompts` | `prompt.toml` |
+| `sandbox` | `sandboxes` | `policy.json` |
 
-实体路径与文件资源解析分别由Address和ParsedAddress负责，不互相兜底。该说明对应当前源码；运行中的daemon是否使用此实现由部署版本决定。域内测试分别覆盖节点校验/完整Entity查找和文件资源tag/真实文件边界。
+例如，工具地址 `tool:margatroid/task-list:dev` 对应工具根目录下的 `margatroid/task-list/dev/tool.toml`。文件解析逐层检查真实路径与资源根的包含关系。
 
-## 资源查询
+`query_resources` 接收 `ResourceRoots` 和 `ResourceQuery`，完成一次资源枚举。筛选项为类型、作用域和名称，结果包含全部匹配标签，并按地址各段排序。每条 `ResourceFile` 包含资源地址、入口路径及可选的工具启动清单路径。异步调用方通过 blocking worker 执行这类文件系统操作。
 
-`query_resources` 在传入的 `ResourceRoots` 下按 `type`、`scope`、`name` 精确组合筛选，省略表示不限，返回全部 tag，按类型／作用域／名称／标签稳定排序。调用方在 blocking worker 执行一次扫描，函数不建立缓存或监控、不读取程序正文、不创建目录。不存在的类型根返回空列表，读取失败明确返回错误。
+## 接口与示例
 
-结果保留 `type:scope/name:tag` 地址及 `resolve_file` 的实际入口：Driver 为 `base.lua`，工具为 `tool.toml`，提示词为 `prompt.toml`，沙箱为 `policy.json`。另以可空的 `tool_path` 提供工具启动入口：工具等于其入口，Driver 存在同目录工具清单时指向该清单，其余为 null。这样前端不用推导文件布局，也不会将 Lua 文件当作工具清单启动。
+- [公开导出与World扩展](src/lib.rs)
+- [节点地址组件](src/components.rs)
+- [资源地址、根目录和查询类型](src/types.rs)
+- [文件解析与枚举](src/handler.rs)
+- [节点查找示例](tests/parsing.rs)、[文件解析示例](tests/files.rs)、[资源查询示例](tests/resources.rs)
+- [实现设计](DESIGN.md)

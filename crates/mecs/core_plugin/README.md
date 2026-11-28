@@ -1,47 +1,56 @@
-# CorePlugin
+# core_plugin
 
-## 介绍
+`core_plugin` 提供 mecs 的同步 ECS：应用拥有 World 和调度阶段，System 在阶段内读取事件、查询组件并修改资源。适合构建由调用方逐帧推进的程序，也作为运行循环与异步插件的基础。
 
-`core_plugin` 提供 mecs 的最小 ECS：Entity、Component、Resource、Event、System、Schedule、
-World 与 App。它不知道 Runtime、异步执行、日志、信号和网络。
-
-Core 遵循 KISS，只定义所有上层 Plugin 共同依赖且无法继续下沉的基本规则。事件发送不要求
-配置期注册；具体事件首次到期时自动建立本帧读取存储，从未出现过的类型返回空读取器。
-
-公开 API 保留具体类型和普通闭包，统一存储时才在内部擦除。Core 的 `emit_event` 只负责入队，
-不猜测应用是否存在运行循环，也不产生隐式唤醒。
-
-同步事件传递具体类型，System 则由开发者传入闭包。System 在本帧发送的事件要到下一帧才能
-读取，读取器只访问本帧中对应类型的事件。读取返回 `&E`，不会消费事件；同帧多个 System
-可以独立读取同一事件。Core 不提供通用事件 `take` API；闭包、异步请求或支流句柄中显式设计的
-一次性所有权转移属于各自包装类型的内部约束。
-
-`App` 拥有 `World` 和 Schedule，`World` 拥有实体、组件、按类型唯一的 Resource 及事件存储。
-Resource 是当前 World 的单例，不是进程全局业务状态。`Entity` 同时包含索引和 generation；
-删除后复用索引会推进 generation，旧标识无法访问新实体，generation 耗尽的索引永久退役。
-实体标识仅在所属 World 内使用，不是跨 World 或持久化的业务 ID。
-
-## 使用说明
+## 从一个事件开始
 
 ```rust
-use core_plugin::{App, Event, World};
+use core_plugin::{App, Event, Resource, World};
 
-struct Notice(&'static str);
+struct Notice(u32);
 impl Event for Notice {}
 
-let mut app = App::new();
-app.add_schedule("update".into())
-    .add_system("update", |world: &mut World| {
-        for notice in world.event_reader::<Notice>() {
-            println!("{}", notice.0);
-        }
-    });
+#[derive(Default)]
+struct Total(u32);
+impl Resource for Total {}
 
-app.world().emit_event(Notice("hello"));
-app.tick();
+fn main() {
+    let mut app = App::new();
+    app.world_mut().insert_resource(Total::default());
+    app.add_schedule("update".into())
+        .add_system("update", |world: &mut World| {
+            let sum: u32 = world.event_reader::<Notice>()
+                .into_iter().map(|notice| notice.0).sum();
+            world.get_resource_mut::<Total>().unwrap().0 += sum;
+        });
+    app.world().emit_event(Notice(7));
+    app.tick();
+    assert_eq!(app.world().get_resource::<Total>().unwrap().0, 7);
+}
 ```
 
-没有 RuntimePlugin 时由调用方主动调用 `tick`。安装 RuntimePlugin 后应改用它提供的
-`send_event`，使事件入队时同时唤醒运行循环。
+先创建 Schedule，再按执行顺序注册 System。`tick()` 更新本帧事件读取存储，然后按 Schedule 注册顺序运行各阶段；同一阶段内的 System 串行执行。
 
-完整类型、函数和执行逻辑见 [DESIGN.md](DESIGN.md)。
+## 核心对象
+
+- `App`：装配插件、Schedule 与 System，提供 `tick()` 和 `fast_forward_tick()`。
+- `World`：持有实体、组件、资源和事件队列，提供查询与修改入口。
+- `Entity` / `Component`：实体标识与按实体保存的类型化数据。
+- `Resource`：按 Rust 类型保存的 World 级单例。
+- `Event` / `EventReader`：事件数据与当前帧的共享读取视图。
+- `System` / `Schedule`：同步执行单元与有序执行阶段。
+- `Plugin`：通过 `build(self, &mut App)` 装配应用能力。
+
+## 数据与事件生命周期
+
+`Entity` 包含索引与 generation。删除实体后，复用索引会推进 generation；实体标识的作用域是创建它的 World。资源随 World 持有，组件随所属实体持有。
+
+`emit_event` 将事件加入队列。本帧 System 发送的事件在后续帧进入读取存储；多个 System 可在同一帧读取同一批 `&E`。读取存储每帧更新，需要长期使用的值由业务复制到资源或组件中。
+
+`emit_pending::<T, E>()` 返回 `EventHandle<Result<T, E>>`；调用 `complete` 后，响应节点进入普通事件分发流程。安装运行循环后，可使用 `app_runtime_plugin::WorldEventExt::send_event` 同时入队并唤醒循环。
+
+## 继续阅读
+
+- [公开入口](src/lib.rs)、[App 装配与逐帧执行](src/app.rs)、[World 数据访问](src/world.rs)。
+- [外部 crate 接入测试](tests/public_api.rs)：组件、资源、插件及独立 Schedule 的组合。
+- [设计与完整接口](DESIGN.md)。

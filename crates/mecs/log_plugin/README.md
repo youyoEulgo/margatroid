@@ -1,38 +1,45 @@
 # log_plugin
 
-## 介绍
+`log_plugin` 为 mecs 应用装配进程级 `tracing` Subscriber。普通诊断通过 `tracing` 宏记录；需要参与 ECS 事件传播的记录使用 `EventLog`，由日志 System 投影到相同的日志输出。
 
-`log_plugin` 为 mecs App 安装进程级 `tracing` Subscriber，并将通过 ECS
-传播的 `EventLog` 投影为 tracing Event。
-
-日志遵循 Rust `tracing` 的正常使用方式，不为了架构一致性牺牲诊断路径性能。Plugin 只封装
-Subscriber 和 Layer 配置；需要 ECS 传播语义的日志才使用 EventLog。
-
-SystemLog 直接通过 tracing 宏记录，由 Layer 决定去向。EventLog 先通过 ECS 传播，再由日志
-System 汇入 tracing。每个进程只安装一个 Subscriber，但可以组合多个 Layer；Plugin 配置
-日志机制，业务仍然决定记录什么。
-
-## 使用说明
+## 安装并记录
 
 ```rust
 use app_runtime_plugin::RuntimePlugin;
 use core_plugin::App;
 use log_plugin::{LogLevel, LogPlugin, WorldEventLogExt};
 
-let mut app = App::new();
-app.add_plugin(RuntimePlugin::default())
-    .add_plugin(LogPlugin::default());
-
-tracing::info!("system diagnostic");
-app.world().event_log(LogLevel::Info, "workspace started");
-app.tick();
+fn main() {
+    let mut app = App::new();
+    app.add_plugin(RuntimePlugin::default())
+        .add_plugin(LogPlugin::default());
+    tracing::info!(component = "example", "application started");
+    app.world().event_log(LogLevel::Info, "workspace started");
+    app.tick();
+}
 ```
 
-默认向 stderr 输出 `Info` 级 Compact 日志。可选 Layer 包括滚动文件和有界进程内
-`TracingStream`；默认不启用这两者。`with_filter` 的显式表达式完全覆盖
-`with_level` 生成的过滤指令，不与默认级别叠加，也不自动读取 `RUST_LOG`。
+默认配置在 `POST_UPDATE` 处理 `EventLog`，以 Compact 格式向 stderr 输出 Info 及以上级别记录。`in_schedule(name)` 可选择应用已创建的阶段。
 
-`TracingStream` 是临时的有界广播：订阅只接收订阅后的记录，无接收者时直接丢弃，
-慢订阅者收到 `Lagged` 并累计丢失数。它不保存历史、不重放、不保证可靠送达或持久化；
-文件输出必须显式配置。应用守护进程采用的 stderr 加容量 256 诊断流是应用配置，
-不是 `LogPlugin::default()` 的框架默认值。
+## 输出与过滤入口
+
+- `LogPlugin`：通过 `with_level`、`with_filter`、`with_format` 配置过滤与格式。
+- `LogLevel` / `LogFormat`：日志级别与 Compact、Pretty、Json 输出格式。
+- `ConsoleTarget` / `FileLogOptions`：控制台目标与显式启用的滚动文件输出。
+- `EventLog` / `WorldEventLogExt`：创建携带日志级别与消息的 ECS 事件。
+- `TracingStream`：通过 `with_stream(capacity)` 启用的有界进程内广播资源。
+- `TracingSubscription` / `TracingRecord`：异步订阅读取入口与结构化记录。
+
+`with_filter(expression)` 使用表达式作为完整过滤配置；省略时使用 `with_level` 对应的级别指令。读取环境配置的应用可先取得环境变量，再将表达式传给 `with_filter`。
+
+## 订阅与进程生命周期
+
+启用流后，从 World 取得 `TracingStream` 并调用 `subscribe()`。订阅从创建时开始接收记录，`recv().await` 返回结构化记录；慢订阅者收到 `TracingStreamError::Lagged(count)`，并可通过 `dropped_count()` 查看累计丢失量。流用于实时诊断，持久输出通过 `with_file` 配置。
+
+Subscriber 配置在进程内共享。多个 App 使用相同配置时复用 Subscriber 与流，每个 App 安装自己的日志 System；冲突配置触发 `LogError::ConflictingConfiguration` panic。文件输出的 worker guard 由进程级安装状态持有。
+
+## 继续阅读
+
+- [装配与配置](src/plugin.rs)、[日志选项](src/options.rs)、[订阅流](src/stream.rs)。
+- [安装与事件投影测试](tests/install.rs)：并发装配、共享流及同帧事件读取。
+- [设计与完整接口](DESIGN.md)。

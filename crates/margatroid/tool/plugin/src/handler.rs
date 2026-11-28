@@ -941,7 +941,7 @@ fn sandbox_backend() -> Option<PathBuf> {
         .or_else(|| {
             std::env::var_os("PATH").and_then(|paths| {
                 std::env::split_paths(&paths)
-                    .map(|path| path.join("landstrip"))
+                    .map(|path| path.join(format!("landstrip{}", std::env::consts::EXE_SUFFIX)))
                     .find(|path| path.is_file())
             })
         })
@@ -976,16 +976,122 @@ fn filtered_environment(command: &mut tokio::process::Command) {
         .env("GIT_PAGER", "cat");
 }
 
-async fn diagnostic_drain<R: AsyncRead + Unpin>(mut pipe: R) -> Result<(), ToolError> {
-    let mut chunk = [0u8; 8192];
+// Diagnostics are a bounded startup-failure aid, not a copy of tool stderr.
+const SANDBOX_DIAGNOSTIC_BYTES: usize = 8192;
+#[derive(Debug, PartialEq, Eq)]
+struct SandboxDiagnostic {
+    code: &'static str,
+    message: &'static str,
+}
+fn sandbox_diagnostic(bytes: &[u8]) -> Option<SandboxDiagnostic> {
+    let text = String::from_utf8_lossy(bytes);
+    text.split("\n\n")
+        .filter_map(|stanza| {
+            let mut kind = None;
+            let mut code = None;
+            let mut message = None;
+            for line in stanza.lines() {
+                let (name, value) = line.split_once('=')?;
+                match name {
+                    "kind" => kind = Some(value),
+                    "code" => code = Some(value),
+                    "message" => message = Some(value),
+                    _ => (),
+                }
+            }
+            if !matches!(kind, Some("internal" | "launch" | "usage")) {
+                return None;
+            }
+            let code = match code? {
+                "INTERNAL_ERROR" => "INTERNAL_ERROR",
+                "SANDBOX_SETUP_FAILED" => "SANDBOX_SETUP_FAILED",
+                "LAUNCH_FAILED" => "LAUNCH_FAILED",
+                "EXEC_FAILED" => "EXEC_FAILED",
+                "USAGE_ERROR" => "USAGE_ERROR",
+                _ => return None,
+            };
+            let message = match message.unwrap_or("") {
+                "unsupported guest exit" => "unsupported guest exit",
+                value if value.contains("/dev/kvm") => "KVM device unavailable",
+                value if value.to_ascii_lowercase().contains("namespace") => {
+                    "namespace setup failed"
+                }
+                value if value.to_ascii_lowercase().contains("landlock") => "Landlock setup failed",
+                value if value.to_ascii_lowercase().contains("seccomp") => "seccomp setup failed",
+                value if value.contains("Permission denied") => "permission denied",
+                _ => "sandbox backend setup failed",
+            };
+            Some(SandboxDiagnostic { code, message })
+        })
+        .last()
+}
+fn with_sandbox_diagnostic(
+    result: Result<(), ToolError>,
+    diagnostic: Option<SandboxDiagnostic>,
+) -> Result<(), ToolError> {
+    result.map_err(|mut failure| {
+        if !matches!(failure.kind, Kind::Cancelled | Kind::Timeout) {
+            if let Some(diagnostic) = diagnostic {
+                failure.message.push_str(&format!(
+                    "; sandbox {}: {}",
+                    diagnostic.code, diagnostic.message
+                ));
+            }
+        }
+        failure
+    })
+}
+async fn diagnostic_drain<R: AsyncRead + Unpin>(
+    mut pipe: R,
+) -> Result<Option<SandboxDiagnostic>, ToolError> {
+    let mut tail = Vec::new();
+    let mut chunk = [0u8; SANDBOX_DIAGNOSTIC_BYTES];
     loop {
         let count = pipe
             .read(&mut chunk)
             .await
             .map_err(|_| error(Kind::RunnerProtocolFailed, "runner diagnostics read failed"))?;
         if count == 0 {
-            return Ok(());
+            return Ok(sandbox_diagnostic(&tail));
         }
+        tail.extend_from_slice(&chunk[..count]);
+        if tail.len() > SANDBOX_DIAGNOSTIC_BYTES {
+            tail.drain(..tail.len() - SANDBOX_DIAGNOSTIC_BYTES);
+        }
+    }
+}
+
+#[cfg(test)]
+mod sandbox_diagnostics_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn diagnostic_capture_is_bounded_and_never_copies_arbitrary_messages() {
+        let mut input = vec![b'x'; SANDBOX_DIAGNOSTIC_BYTES * 3];
+        input.extend_from_slice(b"\n\nkind=launch\ncode=SANDBOX_SETUP_FAILED\nmessage=https://user:private@host/token?api_key=secret\n\n");
+        let diagnostic = diagnostic_drain(input.as_slice()).await.unwrap().unwrap();
+        assert_eq!(diagnostic.code, "SANDBOX_SETUP_FAILED");
+        assert_eq!(diagnostic.message, "sandbox backend setup failed");
+    }
+
+    #[test]
+    fn successful_results_and_policy_denials_are_not_reclassified() {
+        let diagnostic = sandbox_diagnostic(
+            b"kind=internal\ncode=INTERNAL_ERROR\nmessage=unsupported guest exit\n\n",
+        )
+        .unwrap();
+        assert!(with_sandbox_diagnostic(Ok(()), Some(diagnostic)).is_ok());
+        assert!(sandbox_diagnostic(
+            b"kind=filesystem\ncode=FILESYSTEM_DENIED\nmessage=Permission denied\n\n"
+        )
+        .is_none());
+        assert!(
+            sandbox_diagnostic(b"unstructured stderr contains deny and SECRET=private\n").is_none()
+        );
+        assert!(
+            sandbox_diagnostic(b"kind=internal\ncode=PRIVATE_SECRET\nmessage=private\n\n")
+                .is_none()
+        );
     }
 }
 
@@ -1543,18 +1649,16 @@ async fn supervisor_main(args: Vec<std::ffi::OsString>) -> i32 {
         sandbox.map_or(executable.as_os_str(), |(backend, _)| backend.as_os_str()),
     );
     if let Some((_, policy)) = sandbox {
-        command
-            .arg("run")
-            .arg("-p")
-            .arg(policy)
-            .arg("--")
-            .arg(&executable);
+        command.arg("run");
+        #[cfg(target_os = "linux")]
+        command.arg("--backend").arg("container");
+        command.arg("-p").arg(policy).arg("--").arg(&executable);
     }
     command.arg("--margatroid-tool-worker");
     command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
+        .stderr(Stdio::piped())
         .kill_on_drop(true);
     let mut output = tokio::io::stdout();
     let mut configuration: Option<ToolConfiguration> = None;
@@ -1565,6 +1669,9 @@ async fn supervisor_main(args: Vec<std::ffi::OsString>) -> i32 {
         )),
         Ok(mut worker) => {
             let mut worker_input = worker.stdin.take().expect("worker stdin piped");
+            let diagnostics = tokio::spawn(diagnostic_drain(
+                worker.stderr.take().expect("worker stderr piped"),
+            ));
             let mut worker_output =
                 BufReader::new(worker.stdout.take().expect("worker stdout piped"));
             let exchange = async {
@@ -1622,7 +1729,12 @@ async fn supervisor_main(args: Vec<std::ffi::OsString>) -> i32 {
             }
             let _ = worker.wait().await;
             let _ = tokio::io::copy(&mut worker_output, &mut tokio::io::sink()).await;
-            result
+            let diagnostic = diagnostics.await.ok().and_then(Result::ok).flatten();
+            if sandbox.is_some() && configuration.is_none() {
+                with_sandbox_diagnostic(result, diagnostic)
+            } else {
+                result
+            }
         }
     };
     while !cleanup_descendants().await {

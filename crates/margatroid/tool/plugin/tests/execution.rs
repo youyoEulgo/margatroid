@@ -1420,16 +1420,19 @@ fn accepted_batch_abort_returns_long_call_immediately_and_preserves_returned_bac
         "background-ready"
     );
     let deadline = Instant::now() + Duration::from_secs(5);
-    while !fixture.root.path().join("abort-child.pid").exists() {
+    let pid: i32 = loop {
+        if let Ok(text) = std::fs::read_to_string(fixture.root.path().join("abort-child.pid")) {
+            if let Ok(pid) = text.trim().parse::<i32>() {
+                break pid;
+            }
+        }
         fixture.app.tick();
-        assert!(Instant::now() < deadline, "long shell never started");
+        assert!(
+            Instant::now() < deadline,
+            "long shell never published its child PID"
+        );
         std::thread::sleep(Duration::from_millis(2));
-    }
-    let pid: i32 = std::fs::read_to_string(fixture.root.path().join("abort-child.pid"))
-        .unwrap()
-        .trim()
-        .parse()
-        .unwrap();
+    };
     assert_eq!(fixture.tasks().list().len(), 2);
     agent_core::WorldAgentExt::agent_set_turn(fixture.app.world_mut(), fixture.agent, None)
         .unwrap();

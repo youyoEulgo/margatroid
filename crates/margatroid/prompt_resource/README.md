@@ -1,21 +1,45 @@
 # Prompt Resource
 
-prompt_resource_core定义提示词路径集合、文件读取方法、导入事件和错误，只依赖mecs及通用库。prompt_resource_plugin负责异步校验和路径登记，不依赖其他领域plugin，也不让core依赖address或其他领域core。
+提示词资源将带角色的磁盘正文登记为实体上的 alias，供使用方读取并转换为消息。
+开发入口分为 [core](core/README.md) 的读取与集合接口，以及 [plugin](plugin/README.md) 的异步导入。
 
-## 导入与路径
+## 核心对象与文件结构
 
-调用方plugin校验资源种类、Driver依赖和跨类别alias冲突，通过address定位prompt.toml后发送ImportPrompt。本插件校验文件，成功只登记Prompts中的alias与规范路径，不保存来源定位字符串或正文。
+| 对象 | 用途 |
+| --- | --- |
+| `Prompts` | 保存 alias 到规范入口路径的映射 |
+| `PromptInput` | 一次读取的角色与正文 |
+| `PromptRole` | 明确表示 System、User、Assistant 三种角色 |
+| `PromptReadLimits` | 清单和正文各自的字节预算 |
+| `ImportPrompt` | 导入请求与唯一回复协议 |
 
-MCL对同一目标的IMPORT串行受理，跨类别alias唯一性由MCL入口协调；各资源core只管理自己的集合，不新增通用绑定表或资源注册表。取消、目标失效或校验失败保留旧路径；发布成功后才通过原oneshot回复，不发送导入结果观察事件。
+一个提示词目录包含：
 
-## 按次读取
+```text
+sample/
+  prompt.toml  # role = 'system'、'user' 或 'assistant'
+  content.md   # UTF-8 正文，含有效文本
+```
 
-每次使用从登记路径读取prompt.toml和content.md。校验role为system、user或assistant，正文为非空有界UTF-8；不按alias、scope或目标字段猜测角色。读取发生在blocking worker，使用方等待真实完成，不阻塞ECS线程。导入时校验不保证日后文件仍存在或合法；使用时重新校验，失败不退回旧副本。
+角色由清单中的 `role` 决定。core 返回独立 `PromptRole`，消息转换由调用方完成。
+`Prompts` 保存入口路径；每次使用调用 `read_prompt` 取得当前文件内容。
+已返回的 `PromptInput` 属于本次调用材料，后续文件编辑作用于下一次读取。
 
-GET或INJECT使用Prompt alias时重新读取。读取结果由使用方plugin转换为消息，保持System、User或Assistant角色；prompt core不依赖消息core。显式注入Block后的消息属于对话数据，文件变化不修改已写入消息。
+## 最小调用流程
 
-## 职责
+1. 调用入口完成资源地址解析、资源种类与跨类别 alias 检查。
+2. 安装运行时及 `PromptResourcePlugin`，准备 owner 与绝对入口路径。
+3. 发送 `ImportPrompt`，plugin 在 blocking worker 中调用 core 的同步读取器。
+4. 文件校验完成后，ECS 结果入口复核 owner 与取消状态，登记规范路径并回复。
+5. 使用方通过 `prompt_path` 取路径，再调用 `read_prompt` 获取角色与正文。
 
-本领域不写Block、不追加历史、不提交推理。集合只保存BTreeMap<String, PathBuf>，不使用ResourceID、LibraryComponent或通用ResourceSet；加载后的临时值不再携带资源身份。路径用于打开文件，不代替沙箱与文件访问检查。
+同 alias 成功导入会替换路径；校验失败保留旧路径。
+消息转换、Block 写入与推理由各使用领域承担。
+异步调用方将同步读取安排到 blocking worker，并等待实际读取结束。
 
-异步校验直接返回Result<ImportOutput, ImportError>，System只路由，Handler负责发布及oneshot回复。所有结果保留原owner Entity，迟到结果不写入复用index的新实体。文件读取失败报告alias、实际路径和底层原因，不回显文件正文。
+## 接口导航
+
+- [core 使用说明](core/README.md)：重要类型、读取例子与错误。
+- [plugin 使用说明](plugin/README.md)：安装、请求及发布流程。
+- [读取测试](core/tests/resources.rs)、[导入测试](plugin/tests/imports.rs)：真实文件和 ECS 用例。
+- [设计对应](DESIGN.md)：本领域结构及函数行为。

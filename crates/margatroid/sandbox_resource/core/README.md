@@ -1,15 +1,53 @@
 # sandbox_resource_core
 
-独立领域 core，只依赖 `core_plugin` 和通用库；不依赖 address、其他领域 core 或 plugin。
+本 crate 提供沙箱路径集合、当前选择、通用变化回调、同步策略读取及导入协议。
+依赖 `core_plugin` 与通用库；文件 I/O 由 `read_sandbox` 实际完成。
 
-`Sandboxes` 以私有 `BTreeMap<String, PathBuf>` 保存 alias 到真实入口文件路径，提供new(updates)、get、insert、remove、iter；updates是通用SandboxChanged回调，不是client_core探针。路径读取扩展 `WorldSandboxResourceExt::sandbox_path` 仅借用集合条目，校验完整 Entity 和 alias，不访问文件系统。各领域只检查自身 alias；跨类别冲突由调用入口协调。
+## 主要对象
 
-`read_sandbox(path, limits)` 是同步有界读取函数，供使用方在 blocking worker 调用。每次调用重新读取和解析；不缓存正文，已返回的临时材料不受之后文件变化影响。读取入口策略 JSON，要求非空 UTF-8 和 JSON 对象，具体后端 schema 留给执行方校验。`SelectedSandbox` 只记录 alias；`sandbox_select` 验证 owner 和集合条目，选择失败保留旧值，None 清空选择，不读取策略。
+| 对象 | 用途与入口 |
+| --- | --- |
+| `Sandboxes` | `new(updates)` 创建集合，`get`、`insert`、`remove`、`iter` 管理路径 |
+| `SelectedSandbox` | `new(alias, updates)` 创建选择，`set` 修改可选 alias |
+| `SandboxObserverFactory` | `for_owner` 生成列表与选择变化回调 |
+| `SandboxInput` | 本次读取的 JSON `policy` 与规范 `origin` |
+| `SandboxReadLimits` | 策略字节预算，默认 8 MiB |
+| `WorldSandboxResourceExt` | `sandbox_path` 查询路径，`sandbox_select` 验证并提交选择 |
+| `ImportSandbox` | 携带 owner、alias、路径、取消令牌和共享回复端的事件 |
 
-读取入口通过 canonicalize 定位真实普通文件。相邻依赖的真实路径必须仍在入口父目录内。文件大小在打开后及读取过程中检查；分别返回 FileMissing、InvalidPath、TooLarge、InvalidUtf8、InvalidDefinition、ReadFailed，错误携带实际路径，解析失败不回显文件正文。调用方负责文件使用权限及使用时路径策略。
+## 最小读取流程
 
-`ImportSandbox` 是携带完整 owner、alias、入口 path、CancellationToken 和共享 oneshot 回复的事件。core 只定义协议；异步校验和发布集合条目由 plugin 负责。同一请求的克隆共享一个可认领的回复端。
+准备 UTF-8 JSON 对象策略文件，然后调用同步入口：
 
-`SandboxResourceError` 公开 kind、path、message，提供 new 和 with_path；`SandboxReadLimits` 提供 Default，可按文件分别指定 usize 字节预算。临时输入类型与预算定义在 types 模块并于 crate 根导出。测试全部在 tests 目录，覆盖集合更新、Entity generation、回复唯一性、按次读取和边界校验。
+```rust
+use std::path::Path;
+use sandbox_resource_core::{read_sandbox, SandboxInput, SandboxReadLimits, SandboxResourceError};
 
-SandboxObserverFactory::new绑定Fn(Entity)->(SandboxChanged,SandboxSelectionChanged)，for_owner取得同一实际对象的通用回调。Sandboxes和SelectedSandbox只在真实值改变后通知；读取条目或策略不发送变化。core不解释实体地址或文件资源字符串，定位由调用方完成；运行版本与源码修改分别确认。
+fn load(entry: &Path) -> Result<SandboxInput, SandboxResourceError> {
+    read_sandbox(entry, &SandboxReadLimits::default())
+}
+```
+
+读取器规范化入口并确认普通文件，在打开后和读取过程中检查预算。
+超出预算返回 `TooLarge`，UTF-8、JSON 解析及对象类型错误由错误枚举表达。
+具体执行后端的策略字段校验由使用方完成。
+异步使用方将该同步调用安排到 blocking worker，并等待实际完成。
+
+## 集合、选择与回调
+
+`Sandboxes::insert` 返回旧路径，同 alias 可替换；路径实际变化或成功删除时发布当前列表。
+`SelectedSandbox::set` 在 alias 实际变化后发布当前选择。
+`publish_current` 可由装配方显式发布当前状态。
+工厂接收 `Entity`，返回 `SandboxChanged` 与 `SandboxSelectionChanged` 两个通用 Arc 回调。
+
+`sandbox_select` 要求 owner 存活且已装配 `SelectedSandbox`；`Some(alias)` 先验证集合条目，
+`None` 清空选择。`sandbox_path` 借用登记路径，`read_sandbox` 取得当前文件内容。
+两者分别承担集合查找与文件读取，便于调用方确定读取时机。
+
+## 接口参考
+
+- [crate 导出、读取器、World 扩展与观察工厂](src/lib.rs)。
+- [集合和选择组件](src/components.rs)、[输入与预算](src/types.rs)。
+- [导入事件](src/events.rs)、[错误类型](src/error.rs)：`kind`、`path`、`message`。
+- [真实文件与选择测试](tests/resources.rs)。
+- [异步导入方](../plugin/README.md)、[领域设计](../DESIGN.md)。

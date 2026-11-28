@@ -1,43 +1,58 @@
-# 后端装配与生命周期
+# compose
 
-`build_app` 装配后端，`shutdown_app` 等待实际任务、连接和网络服务收口。构建源码不会替换正在运行的 daemon，也不会迁移或改写已有用户数据。
+`compose` 把Margatroid各领域装配成完整后端。嵌入应用、开发新的启动入口或编写端到端测试时，可通过这个crate创建应用并管理退出。
 
-Compose 位于业务 plugin 之上，负责装配多个 plugin 和 core；领域不得反向依赖 Compose。配置读取归各领域，业务执行与文件操作不集中到装配层。中止控制固定在 PRE_UPDATE，MCL、推理和工具在 UPDATE 或 POST_UPDATE 受理，先清除失效 turn，再处理后续请求。
+## 创建后端
 
-## 创建和启动
+`ApplicationOptions` 提供两个路径：`data_root` 指向准备好的数据目录，`runner_path` 指向实际工具运行器。主程序将自身作为运行器，独立的 `tool_runner` 也实现相同的私有进程入口。
 
-Workspace 使用绝对节点路径，例如 `/demo`，管理目录为数据根下的 `workspaces/demo`。`workspace.create` 创建 `workspace.sqlite` 和 `agents/normal`、`temporary`、`archived` 三类目录，并挂载 Workspace 实体；`project_root` 是独立的实际项目目录，不可与管理目录互相包含。
+```rust,no_run
+use compose::{build_app, ApplicationOptions};
+use std::path::PathBuf;
 
-Agent 启动先调用 Driver 工具。`agent.start` 的 `new` 变体传入 Workspace、实际工具清单路径和完整参数；`existing` 变体只传 Workspace 和已登记节点名，从数据库读取工具路径及上次启动参数，再用当前登记node_name/alias整理本次参数；alias清空就移除旧参数。节点名、别名及工作目录参数由 Driver 使用，不另设宿主隐式参数通道。
-
-Driver 的 `margatroid.agent:create` 统一检查节点的 Driver 和父节点归属，取得节点操作凭证，准备文件并打开存储连接。随后提交登记，再把已连接的 `AgentStorage`、实际父实体和任务 ID 交给 Agent System。System 同步挂载 Agent、地址、MCL 队列、工具集合、任务集合、推理句柄和存储组件，将返回的关闭能力绑定到创建任务。
-
-普通 Agent 的节点名在同一 Workspace 中唯一；相同 Driver、相同父节点可复用未运行记录，其他 Driver 不能接管。临时 Agent 每次分配独立记录、目录及运行节点。
-
-## 关闭、归档和退出
-
-`agent.stop` 从目标 Agent 的 `parent` 和 `task_id` 定位创建任务。任务关闭要等待全部绑定 Agent，Agent 关闭又要等待自身 MCL、推理、子任务、来源监控和存储物理关闭。Agent 的关闭句柄不会反向关闭创建者任务。一个任务创建多个 Agent 时，停止该任务会关闭全部绑定实例。
-
-创建取消后仍由独立监督完成已受理的创建交接及补偿；关闭失败保留未完成清理能力，显式重试不重新执行 Driver 业务。
-
-`agent.archive` 与同节点创建互斥，先关闭实际创建任务，再移动整个数据目录并提交归档类别。数据库内的归档意图记录移动中断的原、目标位置，后续显式重试或启动加载继续完成；不会用未知目录覆盖已有数据，不进行旧结构自动迁移。
-
-正常应用退出关闭受理门，继续推进 World，等待初始化加载、已受理 Workspace 创建及 Agent 创建交接，再逐个关闭任务、实体和数据库。退出保留持久目录，不调用删除事件；已受理的显式删除继续使用原监督和回复完成。
-
-## 同步与监控
-
-组件变化和集合修改通过统一探针通知。Workspace 数据库只在确认提交后发布登记快照；历史、MCL 和日志用真实提交序号唤醒记录监控。UI 和配置监控观察实际来源，关闭或替换时等待在途读取完成。所有网络来源共享同一个 Clients 槽位，不增加同步中转事件或逐帧扫描。
-
-API 契约和信息流拓扑位于独立的 `doc/api` 仓库。实体地址采用绝对节点路径，文件资源标识继续使用 `type:scope/name:tag`。旧 Workspace YAML 和已删除的网络接口没有兼容入口。
-
-## 验证
-
-真实 Driver 进程测试需要先构建运行器：
-
-```bash
-cargo build -p margatroid
-cargo test --workspace
-cargo clippy --workspace --all-targets -- -D warnings
+fn create_backend(
+    data_root: PathBuf,
+    runner_path: PathBuf,
+) -> Result<core_plugin::App, compose::ComposeError> {
+    build_app(ApplicationOptions { data_root, runner_path })
+}
 ```
 
-测试可用 `MARGATROID_TEST_RUNNER` 指定已构建的同版本运行器。测试使用独立临时目录和临时端口，不更新或重启已部署服务。前端源码和构建产物由前端开发者适配，此实现不修改它们。
+装配读取 `config.toml` 和 `models.toml`，取得监听配置、工具预算及模型路由，再安装运行时、HTTP服务、领域插件和Web UI。数据目录中的资源根分别指向Driver、工具、提示词和沙箱目录。
+
+应用启动入口负责创建初始目录，安装器负责部署配置及资源。[主程序](../../../apps/margatroid/src/main.rs)展示了创建目录、运行应用、打印地址和响应退出信号的完整流程。
+
+## 运行与退出
+
+`build_app` 返回 `core_plugin::App`。宿主通过 `AppRunExt` 驱动运行，或在测试中调用 `App::tick` 推进调度。中止控制在PRE_UPDATE运行，MCL、工具和推理在后续调度受理。
+
+同步运行循环返回后，在启用time driver的Tokio运行时中等待关闭完成。同步宿主可使用以下函数：
+
+```rust,no_run
+fn close_backend(app: &mut core_plugin::App) -> Result<(), Box<dyn std::error::Error>> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    runtime.block_on(compose::shutdown_app(app))?;
+    Ok(())
+}
+```
+
+`shutdown_app` 关闭HTTP受理门，持续推进World，依次等待初始化加载、Workspace与Agent创建交接、工具和推理监督、来源监控及数据库关闭。返回的 `ComposeError` 包含领域、路径和错误说明，宿主可据此呈现退出状态并继续监督清理。
+
+## 装配中的对象关系
+
+一个Workspace关联项目目录，并通过数据库管理Agent登记。Driver任务创建Agent，Agent再持有自己的MCL队列、推理句柄、工具任务和存储。停止创建任务会等待它绑定的Agent完成关闭。
+
+同步绑定在领域插件安装前创建，随后将共享Clients集合交给状态探针和异步来源。记录监控使用存储的真实提交水位，配置及UI监控关联实际文件来源。
+
+这些关系在 [handler.rs](src/handler.rs) 的安装与退出流程中集中体现。各领域的行为入口分别见 [Workspace](../workspace/README.md)、[Agent](../agent/README.md)、[工具](../tool/README.md) 和 [DTO](../dto/README.md)。
+
+## 示例与参考
+
+- [公开创建和关闭接口](src/lib.rs)
+- [装配参数](src/types.rs)、[错误类型](src/error.rs)
+- [应用生命周期测试](tests/lifecycle.rs)
+- [WebSocket集成示例](tests/dto_websocket.rs)
+- [MCL集成示例](tests/mcl_commands.rs)
+- [实现设计](DESIGN.md)

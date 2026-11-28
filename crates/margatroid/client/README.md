@@ -1,17 +1,46 @@
 # Client
 
-共享槽位与直接同步已实现，当前工作树尚未提交；具体字段、方法和生命周期见[DESIGN.md](DESIGN.md)。
+Client 领域把传输连接、已登记身份和出站消息交付连接起来。
+World、网络适配与异步领域观察共享同一个 `Clients` 槽位，
+业务生产者按当前注册身份选择接收者，再通过连接自己的出站队列发送。
 
-Client改为同一个`Arc<ClientSlots>`共享槽位：World Resource、DTO提供给Axum的State、异步监控和同步领域统一更新入口都持有这一个Arc。槽位保存未注册连接、已确认的注册身份、发送器、取消能力及在途请求集合，替代当前DTO ConnState与Client身份分别保存的两套可变登记。
+## 核心概念
 
-Client组件保留完整Entity/Address寻址职责，但只引用同一份不可变ClientIdentity。注册和断连通过统一入口提交：注册在同一共享写锁复检连接、名称和身份，失败回滚本次Entity；断连先从共享槽位移除并取消，再通过原ClientDisconnected清理World身份。注册事件、请求原oneshot和连接生命周期事件继续存在，均不承担sync中转。
+- `ConnectionId` 标识一次传输连接；`Client` 组件提供 World 中的身份与实体寻址。
+- `Clients` 保存连接发送器、注册身份、在途请求与状态来源，clone 共享同一实例。
+- `ClientIdentity` 保存登记后的实体、地址、类型和名称。
+- `ClientSelector` 按类型、名称或广播选择当前接收者。
+- `ClientSender` / `ClientReceiver` 为传输 writer 提供有界出站队列。
+- `SyncContext` 为当前状态提供快照准备、编码、revision 发布与来源关闭能力。
 
-同步生产者每次发布都遍历当前槽位，按Type、Name或Broadcast筛选，不长期固定sender列表。注册表锁仅用于取得接收者快照，释放后才能编码和投递。身份标签保持原自报含义，不增加认证承诺。
+## 一次连接的生命周期
 
-所有sync直接进入每连接原有的有界出站队列，不建立sync总线、额外分发任务或ECS同步事件。Axum保留每连接唯一writer，领域线程不直接操作socket。
+网络入口先调用 `Clients::allocate`，取得连接标识、接收器和取消令牌。
+登记请求经 `RegisterClient` 提交给 ClientPlugin；系统校验类型和名称、创建实体，
+再把同一身份写入共享槽位。成功登记后初始化符合选择条件的当前状态来源。
 
-当前状态使用StateKey：队列内部pending表合并同对象尚未发送的更新，writer读取该来源的最新owned快照；连续输出不把多份完整大窗口挤进队列。日志、MCL、持久消息和推理chunk使用具体有序帧，不按状态覆盖。Full/Closed明确取消慢连接，不悄悄丢掉某条增量后继续发送。
+业务更新通过同一 Clients 选择身份并入队；writer 从 receiver 取出消息后写入传输。
+传输结束时移除槽位并提交 `ClientDisconnected`，插件清理对应 World 实体。
+完整登记与断连的可运行调用见 [注册测试](plugin/tests/registration.rs)。
 
-注册成功时初始化符合条件的当前状态源；持久记录及流片段不自动重放，历史查询仍显式进行。来源epoch和单调revision仅在后端用于丢弃旧实例和迟到快照，不新增wire字段。来源prepare只捕获Weak领域数据，关闭来源时释放索引，避免Client槽位、领域上下文及读取回调形成强引用环。
+## 选择交付方式
 
-验收覆盖：相同Arc身份、注册与断连竞争、重复名称、失败回滚、后加入连接、当前目标筛选、旧实例迟到更新、状态合并与初始快照竞争、有序帧顺序、慢连接退出、真实快照worker收口。保留9种既有sync及45种协议消息；Agent日志仍由实际数据库提交后按当前槽位直投。
+| 数据 | 入口与行为 |
+| --- | --- |
+| 当前对象状态 | SyncContext 发布 revision，队列合并同来源更新，准备最新快照 |
+| 持久记录、日志、流片段 | `send_ordered` 按具体帧顺序交付 |
+| 带作用域的增量 | `send_scoped` 在作用域活跃时交付 |
+
+队列达到容量或关闭时，发送返回 Full/Closed 并取消连接。
+receiver 的异步关闭等待在途状态准备 worker 完成。
+状态来源替换以 epoch 区分实例，revision 表达该来源的单调变化。
+
+## 开发导航
+
+- [client_core](core/README.md)：共享连接、队列和同步来源的使用入口。
+- [client_plugin](plugin/README.md)：登记与断连系统的安装和调用。
+- [DTO](../dto/README.md)：协议请求与领域对象的适配。
+- [Axum](../axum_plugin/README.md)：WebSocket 连接和 writer 生命周期。
+- [设计](DESIGN.md)：连接共享状态与消息交付结构。
+
+运行 `cargo test -p client_core -p client_plugin` 验证交付和身份生命周期。

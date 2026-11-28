@@ -1,91 +1,55 @@
-# RuntimePlugin
+# app_runtime_plugin
 
-## 介绍
+`app_runtime_plugin` 为 mecs App 提供阻塞式运行循环。默认事件驱动模式根据事件队列推进帧，并在等待期间接收跨线程唤醒；固定帧模式按指定帧率推进应用。
 
-`RuntimePlugin` 在不扩大 ECS Core 职责的前提下提供阻塞式应用运行循环。
-
-Runtime 只决定何时推进 App，不接管事件、异步任务或业务生命周期。唤醒通知只是“重新检查”
-的提示，可以合并；真正决定是否继续工作的始终是事件快照和阀状态。
-
-安装 Runtime 后应优先使用 `send_event`，让事件入队后自动唤醒运行循环。固定帧模式按时间
-等待，事件驱动模式可以快进延迟事件；关阀会阻止下一帧开始，重新开阀后继续。
-
-## 使用说明
-
-```rust
-use app_runtime_plugin::{AppRunExt, RuntimePlugin};
-use core_plugin::App;
-
-let mut app = App::new();
-app.add_plugin(RuntimePlugin::default()).run();
-```
-
-安装后会按照执行顺序注册四个 Schedule：
-
-- `RuntimePlugin::STARTUP` 在第一次 tick 时执行一次。
-- `RuntimePlugin::PRE_UPDATE`、`RuntimePlugin::UPDATE` 和
-  `RuntimePlugin::POST_UPDATE` 在每次 tick 时执行。
-
-事件驱动模式在停止条件为false且开阀时执行第一个 tick，因此即使初始事件队列为空，`STARTUP` 和
-第一帧循环 Schedule 也会运行。后续帧由事件快照和阀状态驱动。
-同一 Schedule 内按 System 注册顺序串行执行；`PRE_UPDATE` 的同步状态修改在本帧 `UPDATE` 前生效，
-但在 `PRE_UPDATE` 新发送的事件仍须下一帧才可读。应用需要提前处理取消等控制请求时，必须显式
-把相应处理 System 挂到 `PRE_UPDATE`，Runtime 不自动解释或取消业务任务。
-
-`run()` 持续运行，等价于 `run_until(|| false)`。`run_until(&mut self, should_stop: impl Fn() -> bool)`
-在初始帧前、每轮循环前及唤醒后检查停止条件；首次检查已为true时，不执行STARTUP。
-外部线程停止事件驱动循环时，先设置共享AtomicBool，再调用现有`RuntimeHandle::wake()`：
+## 发送事件并运行到完成
 
 ```rust
 use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
-use app_runtime_plugin::{AppRunExt, RuntimeHandle, RuntimePlugin};
-use core_plugin::App;
+use app_runtime_plugin::{AppRunExt, RuntimePlugin, WorldEventExt};
+use core_plugin::{App, Event, World};
 
-let mut app = App::new();
-app.add_plugin(RuntimePlugin::default());
-let stopped = Arc::new(AtomicBool::new(false));
-let stop_signal = Arc::clone(&stopped);
-let handle = app.world().get_resource::<RuntimeHandle>().unwrap().clone();
-let signal_thread = std::thread::spawn(move || {
-    stop_signal.store(true, Ordering::Release);
-    handle.wake();
-});
-app.run_until(|| stopped.load(Ordering::Acquire));
-signal_thread.join().unwrap();
+struct Notice;
+impl Event for Notice {}
+
+fn main() {
+    let mut app = App::new();
+    app.add_plugin(RuntimePlugin::default());
+    let done = Arc::new(AtomicBool::new(false));
+    let observed = Arc::clone(&done);
+    app.add_system(RuntimePlugin::UPDATE, move |world: &mut World| {
+        for _ in world.event_reader::<Notice>() {
+            observed.store(true, Ordering::Release);
+        }
+    });
+    app.world().send_event(Notice);
+    app.run_until(|| done.load(Ordering::Acquire));
+}
 ```
 
-停止检查不需要开阀，也不改变阻塞计数。事件驱动等待继续阻塞读取现有通知通道，不定时轮询；
-固定帧保留原帧间sleep，停止最多额外等待一个帧间隔（60fps时约16.7ms）。
-正常返回前会恢复通知接收端和World中的RuntimeControl，原有RuntimeHandle、RuntimeEventSender
-及AsyncContext仍可唤醒，调用方可以继续`app.tick()`完成清理，也可以再次调用`run_until`。
-这不会自动关闭异步任务或完成pending事件。World销毁后的旧句柄策略不变。
+`send_event` 将事件入队并唤醒循环。`event_sender()` 返回可克隆的 `RuntimeEventSender`，适合交给外部线程；`send_event_after(event, frames)` 按帧设置延迟。
 
-## 公开 API
+## 入口与默认阶段
 
-- `RuntimePlugin::default()`：事件驱动模式
-- `RuntimePlugin::fixed(frame_rate)`：固定帧模式
-- `RuntimePlugin::STARTUP` / `PRE_UPDATE` / `UPDATE` / `POST_UPDATE`：默认 Schedule
-- `AppRunExt::run` / `run_until`
-- `RuntimeHandle::wake` / `open_gate` / `close_gate`
-- `RuntimeEventSender::send_event` / `send_event_after`
-- `WorldEventExt::event_sender` / `send_event` / `send_event_after`
-- `RuntimeMode` 与 `RuntimeState`
+- `RuntimePlugin::default()`：事件驱动循环，可快进至延迟事件的目标帧。
+- `RuntimePlugin::fixed(frame_rate)`：固定帧循环。
+- `AppRunExt`：`run()` 持续运行，`run_until(predicate)` 在谓词成立时返回。
+- `WorldEventExt`：取得发送器，或发送普通、延迟事件。
+- `RuntimeEventSender`：跨线程发送事件并唤醒所属 World 的运行循环。
+- `RuntimeHandle`：调用 `wake()` 唤醒，或通过 `close_gate()` / `open_gate()` 管理帧推进阀。
 
-## 职责
+安装时按顺序创建 `STARTUP`、`PRE_UPDATE`、`UPDATE`、`POST_UPDATE`。`STARTUP` 在首次 tick 执行一次，其余阶段每帧执行。阶段内按 System 注册顺序执行，事件按 Core 的帧边界分发。
 
-- 在固定帧模式下驱动 `App::tick()`。
-- 在事件驱动模式下快进延迟事件并驱动 `App::fast_forward_tick()`。
-- 只剩 pending 事件或阻塞计数非零时进入等待。
-- 提供可克隆、可跨线程使用的唤醒与阻塞句柄。
-- 通过 Runtime 拓展 API 发送事件时唤醒运行循环。
+## 停止与句柄生命周期
 
-它不执行异步任务，也不负责完成 pending 事件。
+`run_until` 在初始帧前、循环前及唤醒后检查谓词。外部线程请求停止时，先写入共享状态，再调用 `RuntimeHandle::wake()`，让事件驱动等待及时重新检查。固定帧模式的停止延迟受当前帧间隔影响。
 
-Core 的 `World::emit_event` 只将事件写入队列；Runtime 提供的
-`WorldEventExt::send_event` 和 `send_event_after` 会在写入后额外唤醒运行循环。
-`event_sender()` 返回的 `RuntimeEventSender` 可以克隆并交给其他线程，行为相同。
-这些句柄绑定创建它们的 World 事件队列与 Runtime 通知通道；调用方应在对应 Runtime 销毁前停止
-生产者并释放克隆，不能将旧句柄用于另一个 App。通知接收端销毁后调用 `wake` 会报告通道断开。
-`RuntimeState::Closed` 当前是占位状态；`run_until` 通过调用方谓词退出，不设置Closed。
-安装 Runtime 后应优先使用 `send_event`；`emit_event` 只保留为不依赖 Runtime 的底层能力。
-事件类型由 Core 在首次到期时自动建立读取存储，不需要预先注册。
+运行阀使用阻塞计数，所有关闭操作各自配对一次开启操作。停止谓词在关阀期间同样参与检查。循环返回后会恢复 World 中的运行控制资源，应用可以继续 `tick()` 或再次调用 `run_until`。
+
+业务任务的停止与清理由应用组织。发送器和唤醒句柄绑定创建它们的 World；在销毁对应 Runtime 前，先停止生产者并释放外部克隆。
+
+## 继续阅读
+
+- [扩展 trait 与循环实现](src/plugin.rs)、[跨线程句柄](src/resource.rs)。
+- [运行到停止条件的测试](tests/run_until.rs)：外部唤醒、关阀停止、延迟事件及再次运行。
+- [设计与接口](DESIGN.md)。

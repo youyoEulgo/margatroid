@@ -26,12 +26,24 @@ fn main() {
     }
 }
 fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let home = std::env::var_os("HOME").ok_or("HOME is not set")?;
+    let home_variable = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
+    let home =
+        std::env::var_os(home_variable).ok_or_else(|| format!("{home_variable} is not set"))?;
     let options = ApplicationOptions {
         data_root: PathBuf::from(home).join(".margatroid"),
         runner_path: std::env::current_exe()?,
     };
     let data_root = options.data_root.clone();
+    for directory in [
+        "",
+        "workspaces",
+        "agent-drivers",
+        "prompts",
+        "sandboxes",
+        "tools",
+    ] {
+        std::fs::create_dir_all(data_root.join(directory))?;
+    }
     let mut app = build_app(options)?;
     tracing::info!(
         "margatroid: starting (data directory: {})",

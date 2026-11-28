@@ -1,106 +1,49 @@
-# SignalPlugin
+# signal_plugin
 
-## 介绍
+`signal_plugin` 将配置的操作系统进程信号转换为类型化 ECS 事件，并唤醒运行循环。应用的 System 读取信号后执行关闭、重载或暂停流程。
 
-`SignalPlugin` 监听配置的操作系统进程信号，将其转换为类型化 ECS 事件并唤醒 Runtime。
-它是输入桥接，不是关闭管理器；关闭、重载、暂停或忽略由读取事件的 System 决定。句柄可以
-显式停止监听，未显式停止时由 RAII 完成回收。
-
-## 使用说明
+## 安装并读取信号
 
 ```rust
-use app_runtime_plugin::RuntimePlugin;
-use core_plugin::App;
-use signal_plugin::{ProcessSignal, SignalOptions, SignalPlugin};
+use app_runtime_plugin::{AppRunExt, RuntimePlugin};
+use core_plugin::{App, World};
+use signal_plugin::{
+    ProcessSignalReceived, SignalListenerFailed, SignalPlugin,
+};
 
-let mut app = App::new();
-app.add_plugin(RuntimePlugin::default())
-    .add_plugin(SignalPlugin::with_options(
-        SignalOptions::new().with_signals([ProcessSignal::Interrupt, ProcessSignal::Terminate]),
-    ));
-```
-
-`RuntimePlugin` 必须先安装。默认配置监听 `Interrupt` 与 `Terminate`，通常分别对应
-`Ctrl+C/SIGINT` 和服务管理器发送的 `SIGTERM`。监听线程通过 `RuntimeEventSender` 直接
-发送事件并唤醒事件驱动 Runtime。
-
-## 处理信号事件
-
-SignalPlugin 只通知，不执行关闭策略。业务或生命周期 Plugin 自行读取事件：
-
-```rust
-use app_runtime_plugin::RuntimePlugin;
-use core_plugin::World;
-use signal_plugin::{ProcessSignal, ProcessSignalReceived};
-
-app.add_system(RuntimePlugin::UPDATE, |world: &mut World| {
-    for event in world.event_reader::<ProcessSignalReceived>() {
-        match event.signal {
-            ProcessSignal::Interrupt | ProcessSignal::Terminate => {
-                tracing::info!(?event.signal, "收到停止信号");
-                // 在这里调用应用自己的优雅关闭策略。
+fn main() {
+    let mut app = App::new();
+    app.add_plugin(RuntimePlugin::default())
+        .add_plugin(SignalPlugin::new())
+        .add_system(RuntimePlugin::UPDATE, |world: &mut World| {
+            for event in world.event_reader::<ProcessSignalReceived>() {
+                println!("received {:?}", event.signal);
             }
-            ProcessSignal::Hangup => {
-                // 可用于触发配置重载。
+            for failure in world.event_reader::<SignalListenerFailed>() {
+                eprintln!("signal listener: {}", failure.message);
             }
-            _ => {}
-        }
-    }
-});
+        });
+    app.run();
+}
 ```
 
-## 自定义监听信号
+默认监听 `Interrupt` 与 `Terminate`。终端通常将 Ctrl+C 转换为 SIGINT；应用可在接收 System 中将信号接入自己的生命周期控制。
 
-```rust
-use signal_plugin::{ProcessSignal, SignalOptions, SignalPlugin};
+## 配置与公开对象
 
-let options = SignalOptions::new().with_signals([
-    ProcessSignal::Interrupt,
-    ProcessSignal::Terminate,
-    ProcessSignal::Hangup,
-    ProcessSignal::User1,
-]);
-app.add_plugin(SignalPlugin::with_options(options));
-```
+- `SignalPlugin`：安装资源并注册 STARTUP 监听启动 System。
+- `SignalOptions`：通过 `with_signals` 选择信号，按输入顺序去重。
+- `ProcessSignal`：命名信号枚举；Unix 还提供 `Raw(number)`。
+- `ProcessSignalReceived`：包含捕获信号的 ECS 事件。
+- `SignalListenerFailed`：包含监听器启动失败信息的 ECS 事件。
+- `SignalHandle`：通过 `is_running()` 查询，通过 `shutdown()` 提前停止。
 
-重复信号会按输入顺序去重，空列表会立即终止配置。Unix 可以使用
-`ProcessSignal::Raw(number)`，但 `SIGKILL`、`SIGSTOP` 和非正数无法注册。非 Unix 平台
-当前只保证 `Interrupt` 与 `Terminate`。
+自定义配置使用 `SignalPlugin::with_options(SignalOptions::new().with_signals([...]))`。信号列表至少包含一项。Unix 的 Raw 值通过 signal-hook 注册规则校验；具体平台映射见[监听资源实现](src/resource.rs)。
 
-## 生命周期与错误
+## 监听生命周期
 
-第一次执行 `RuntimePlugin::STARTUP` 时才会注册操作系统监听器并创建
-`mecs-signal-listener` 线程。启动失败会产生 `SignalListenerFailed` 事件，Plugin 不会自动
-重试或关闭 Runtime。
+先安装 `RuntimePlugin`，再安装信号插件。首次 tick 的 STARTUP 阶段注册操作系统监听并启动 `mecs-signal-listener` 线程；启动错误通过 `SignalListenerFailed` 交给后续帧处理。
 
-可以通过 World 中的 `SignalHandle` 查询或提前停止监听：
+`SignalHandle::shutdown()` 关闭监听并回收线程，可重复调用。最后一个句柄释放时同样执行回收，外部克隆会延长监听生命周期。应用在销毁 Runtime 前完成监听停止。signal-hook 可合并同类信号，事件适合表达控制意图。
 
-```rust
-use signal_plugin::SignalHandle;
-
-// SignalPlugin 在第一次 tick 的 STARTUP 阶段启动监听线程。
-app.tick();
-let handle = app.world().get_resource::<SignalHandle>().unwrap().clone();
-// 启动失败时is_running为false，应由System读取SignalListenerFailed。
-let _running = handle.is_running();
-handle.shutdown();
-assert!(!handle.is_running());
-```
-
-`shutdown` 可以重复调用。最后一个 `SignalHandle` 释放时自动关闭 signal-hook
-迭代器并回收监听线程；外部保留的克隆会延长监听生命周期。生产者应在对应 Runtime 销毁前
-停止，避免向已断开的唤醒通道发送。signal-hook 可能合并同类信号，事件不代表每次原始投递的可靠计数。
-
-## 公开 API
-
-- `SignalPlugin`：插入 Handle 并添加 STARTUP System。
-- `SignalOptions`：选择需要监听的进程信号。
-- `ProcessSignal`：跨平台稳定信号枚举。
-- `ProcessSignalReceived`：成功捕获信号时产生的事件。
-- `SignalListenerFailed`：监听器启动失败事件。
-- `SignalHandle`：查询或提前停止监听线程。
-
-SignalPlugin 不处理终端按键；`Ctrl+C` 生效是因为终端通常把它转换为 `SIGINT`。它也不
-直接关闭 Runtime、Server 或 Workspace。
-
-完整伪代码与平台边界见 [DESIGN.md](DESIGN.md)。
+[信号转换测试](src/plugin.rs) 展示 Unix User1 信号到事件的完整路径；[选项实现与测试](src/options.rs) 展示信号选择；完整接口与平台映射见 [DESIGN.md](DESIGN.md)。
